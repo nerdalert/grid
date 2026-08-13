@@ -4298,6 +4298,7 @@ mod tests {
                     network: "net".to_owned(),
                     local_site: "site".to_owned(),
                     candidates: Vec::new(),
+                    selection_policy: None,
                     generated_at: Some("2026-07-29T01:00:00Z".to_owned()),
                 },
             },
