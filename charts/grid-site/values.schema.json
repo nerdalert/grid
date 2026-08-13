@@ -49,25 +49,14 @@
             }
           }
         },
-        "admissionPolicy": {
+        "selectionPolicy": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["mode", "pressure", "missingMetrics"],
+          "required": ["mode"],
           "properties": {
-            "mode": { "type": "string", "enum": ["instantaneous", "stabilized"] },
-            "missingMetrics": { "type": "string", "enum": ["existingOnly", "excluded"] },
-            "pressure": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["enterThreshold", "exitThreshold", "failureThreshold", "successThreshold", "minimumStateDuration", "recoveryHoldDown"],
-              "properties": {
-                "enterThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
-                "exitThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
-                "failureThreshold": { "type": "integer", "minimum": 1, "maximum": 100 },
-                "successThreshold": { "type": "integer", "minimum": 1, "maximum": 100 },
-                "minimumStateDuration": { "type": "string", "pattern": "^[1-9][0-9]*s$" },
-                "recoveryHoldDown": { "type": "string", "pattern": "^[1-9][0-9]*s$" }
-              }
+            "mode": {
+              "type": "string",
+              "enum": ["deterministic", "roundRobin", "random"]
             }
           }
         },
