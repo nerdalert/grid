@@ -928,6 +928,7 @@ fn build_admission_map(
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
+    precomputed: Option<&HashMap<String, AdmissionState>>,
 ) -> HashMap<String, AdmissionState> {
     let mut map = HashMap::new();
     for provider in providers {
@@ -936,7 +937,12 @@ fn build_admission_map(
         }
         if let Some(key) = routing_identity(provider) {
             let m = metrics.and_then(|mmap| mmap.get(key));
-            map.insert(key.to_owned(), super::geography::derive_admission_state(m));
+            map.insert(
+                key.to_owned(),
+                precomputed
+                    .and_then(|states| states.get(key).copied())
+                    .unwrap_or_else(|| super::geography::derive_admission_state(m)),
+            );
         }
     }
     for provider in remote_crdt_providers {
@@ -1091,10 +1097,6 @@ fn locality_sort_key(tier: Option<LocalityTier>) -> u8 {
     clippy::too_many_arguments,
     reason = "seven parameters represent distinct overlay inputs; a wrapper struct would obscure the data flow"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential render steps: ordering, collect, enrich, filter, sort, dedup, rank; splitting would hide the pipeline"
-)]
 pub fn render_routing_overlay(
     network: &GridNetwork,
     sites: &[GridSite],
@@ -1104,6 +1106,46 @@ pub fn render_routing_overlay(
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
     generated_at: Option<&str>,
     weights: &scoring::ScoringWeights,
+) -> Result<RoutingOverlay, String> {
+    render_routing_overlay_with_admission(
+        network,
+        sites,
+        providers,
+        remote_crdt_providers,
+        local_site,
+        metrics,
+        generated_at,
+        weights,
+        None,
+    )
+}
+
+/// Render an overlay using controller-owned admission states for local
+/// providers. The compatibility wrapper above retains the pure renderer API
+/// used by callers and tests that do not have reconcile memory.
+///
+/// # Errors
+///
+/// Returns an error when the network or an eligible provider lacks the
+/// metadata required to construct a valid routing candidate.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "admission states are a distinct control-plane input"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential render steps: ordering, collect, enrich, filter, sort, dedup, rank; splitting would hide the pipeline"
+)]
+pub fn render_routing_overlay_with_admission(
+    network: &GridNetwork,
+    sites: &[GridSite],
+    providers: &[InferenceProvider],
+    remote_crdt_providers: &[crdt::ProviderState],
+    local_site: &str,
+    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
+    generated_at: Option<&str>,
+    weights: &scoring::ScoringWeights,
+    precomputed_admission: Option<&HashMap<String, AdmissionState>>,
 ) -> Result<RoutingOverlay, String> {
     let network_name = network
         .metadata
@@ -1120,7 +1162,13 @@ pub fn render_routing_overlay(
         weights,
     );
 
-    let admission_map = build_admission_map(network_name, providers, remote_crdt_providers, metrics);
+    let admission_map = build_admission_map(
+        network_name,
+        providers,
+        remote_crdt_providers,
+        metrics,
+        precomputed_admission,
+    );
 
     // Find the consumer site to get its labels for access policy evaluation
     let consumer_site_labels = sites
