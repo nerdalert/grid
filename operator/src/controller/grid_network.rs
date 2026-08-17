@@ -35,7 +35,7 @@ use crate::{
     error::OperatorError,
     resources::{
         consumer_config::{self, ConsumerConfigError},
-        overlay_envelope, provider_metrics, routing_overlay, secret,
+        overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
         trust_bundle::{self, CertPemStatus},
     },
     swim::{MemberStatus, MembershipSnapshot},
@@ -75,6 +75,12 @@ pub struct OperatorCtx {
     /// wrapping `Arc`; the inner [`Mutex`] ensures safe concurrent access.
     pub(crate) metrics_cache: Mutex<provider_metrics::MetricsCache>,
 
+    /// Stateful admission memory keyed by provider routing identity.
+    ///
+    /// Admission is evaluated in the control plane and the resulting wire
+    /// state is copied into the overlay. It is never consulted by a request.
+    pub(crate) admission_memory: Mutex<provider_admission::AdmissionMemory>,
+
     /// Tracks the seed set announced on the last reconcile per `GridNetwork`.
     ///
     /// Keyed by `GridNetwork` name.  On each reconcile, the new seed set is
@@ -98,6 +104,7 @@ impl OperatorCtx {
             client,
             swim,
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
+            admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -267,9 +274,79 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let requeue_interval = requeue_interval_for_network(&network, &providers)?;
-    let raw_metrics =
-        provider_metrics::collect_provider_metrics(name, &providers, &ctx.metrics_cache, Instant::now(), Some(client))
-            .await;
+    let collected = provider_metrics::collect_provider_metrics_with_refresh_interval(
+        name,
+        &providers,
+        &ctx.metrics_cache,
+        Instant::now(),
+        requeue_interval,
+        Some(client),
+    )
+    .await;
+    let raw_metrics = collected.metrics;
+
+    let scoring_strategy = network
+        .spec
+        .scoring_policy
+        .as_ref()
+        .map_or(crate::crd::grid_network::ScoringStrategy::NoMetrics, |policy| {
+            policy.strategy
+        });
+    let admission_policy =
+        provider_admission::Policy::from_config(network.spec.admission_policy.as_ref(), scoring_strategy.into())
+            .map_err(OperatorError::InvalidResource)?;
+    let now = Instant::now();
+    let mut admission_states = HashMap::new();
+    let mut admission_keys = Vec::new();
+    {
+        let mut memory = ctx.admission_memory.lock().await;
+        for provider in providers
+            .iter()
+            .filter(|provider| provider.spec.grid_network_ref == name)
+        {
+            let Some(identity) = routing_overlay::routing_identity(provider) else {
+                continue;
+            };
+            let identity = identity.to_owned();
+            let memory_key = format!(
+                "{name}/{}/{}",
+                provider.metadata.uid.as_deref().map_or(identity.as_str(), |uid| uid),
+                identity
+            );
+            let signal_configured = match scoring_strategy {
+                crate::crd::grid_network::ScoringStrategy::QueueDepth => provider
+                    .spec
+                    .metrics_config
+                    .as_ref()
+                    .and_then(|config| config.signal_names.queue_depth.as_ref())
+                    .is_some(),
+                crate::crd::grid_network::ScoringStrategy::KvCachePressure => provider
+                    .spec
+                    .metrics_config
+                    .as_ref()
+                    .and_then(|config| config.signal_names.kv_cache_utilization.as_ref())
+                    .is_some(),
+                crate::crd::grid_network::ScoringStrategy::NoMetrics => false,
+            };
+            let observation = if signal_configured {
+                raw_metrics
+                    .get(&identity)
+                    .copied()
+                    .map_or(provider_admission::Observation::Missing, |metrics| {
+                        provider_admission::Observation::Fresh {
+                            revision: collected.generations.get(&identity).copied().unwrap_or(0),
+                            metrics,
+                        }
+                    })
+            } else {
+                provider_admission::Observation::NotConfigured
+            };
+            let state = memory.evaluate(&memory_key, observation, admission_policy, now);
+            admission_keys.push(memory_key);
+            admission_states.insert(identity, state);
+        }
+        memory.retain_network_keys(name, admission_keys.iter().cloned());
+    }
 
     let remote_crdt_providers: Vec<crdt::ProviderState> = ctx
         .swim
@@ -304,6 +381,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &remote_crdt_providers,
         &raw_metrics,
         &scoring_weights,
+        &admission_states,
     )
     .await?;
 
@@ -727,6 +805,7 @@ async fn reconcile_routing_overlay_inner(
     remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
     scoring_weights: &scoring::ScoringWeights,
+    admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
 ) -> Result<(Vec<ConsumerConfigStatus>, Vec<OverlayRevisionStatus>), OperatorError> {
     let network_name = grid_network_name(network)?;
 
@@ -770,7 +849,7 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let overlay = match routing_overlay::render_routing_overlay(
+        let overlay = match routing_overlay::render_routing_overlay_with_admission(
             network,
             &sites,
             providers,
@@ -779,6 +858,7 @@ async fn reconcile_routing_overlay_inner(
             metrics_arg,
             timestamp.as_deref(),
             scoring_weights,
+            Some(admission_states),
         ) {
             Ok(overlay) => overlay,
             Err(error) => {
