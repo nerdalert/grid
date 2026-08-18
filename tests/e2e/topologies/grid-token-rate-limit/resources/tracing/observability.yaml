@@ -1,0 +1,210 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: praxis-tracing
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: token-rate-limit-demo-credentials
+  namespace: praxis-tracing
+type: Opaque
+stringData:
+  password: alice-secret
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: praxis-otel-collector
+  namespace: praxis-tracing
+data:
+  collector.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 20
+      batch:
+        timeout: 2s
+        send_batch_size: 128
+    exporters:
+      otlp/jaeger:
+        endpoint: jaeger-collector.praxis-tracing.svc.cluster.local:4317
+        tls:
+          insecure: true
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 10s
+          max_elapsed_time: 2m
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+    service:
+      extensions: [health_check]
+      telemetry:
+        metrics:
+          address: 0.0.0.0:8888
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlp/jaeger]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: praxis-tracing
+  labels: {app.kubernetes.io/name: jaeger}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: jaeger}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: jaeger}}
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one@sha256:4fd2d70fa347d6a47e79fcb06b1c177e6079f92cba88b083153d56263082135e
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: COLLECTOR_OTLP_ENABLED, value: "true"}
+          ports:
+            - {name: query, containerPort: 16686}
+            - {name: otlp-grpc, containerPort: 4317}
+            - {name: otlp-http, containerPort: 4318}
+            - {name: admin, containerPort: 14269}
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+          readinessProbe: {httpGet: {path: /, port: 14269}, periodSeconds: 5}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-query
+  namespace: praxis-tracing
+spec:
+  selector: {app.kubernetes.io/name: jaeger}
+  ports:
+    - {name: query, port: 16686, targetPort: 16686}
+    - {name: admin, port: 14269, targetPort: 14269}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-collector
+  namespace: praxis-tracing
+spec:
+  selector: {app.kubernetes.io/name: jaeger}
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: 4317}
+    - {name: otlp-http, port: 4318, targetPort: 4318}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: praxis-otel-collector
+  namespace: praxis-tracing
+  labels: {app.kubernetes.io/name: praxis-otel-collector}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: praxis-otel-collector}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: praxis-otel-collector}}
+    spec:
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector@sha256:6cba83e64eb40b54dbf442e3a9356dbf8ecb3681e1e9d0008577141b7ca656a8
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/collector.yaml"]
+          ports:
+            - {name: otlp-grpc, containerPort: 4317}
+            - {name: otlp-http, containerPort: 4318}
+            - {name: health, containerPort: 13133}
+            - {name: metrics, containerPort: 8888}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts: [{name: config, mountPath: /conf, readOnly: true}]
+          readinessProbe: {httpGet: {path: /, port: 13133}, periodSeconds: 5}
+      volumes: [{name: config, configMap: {name: praxis-otel-collector}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: praxis-otel-collector
+  namespace: praxis-tracing
+spec:
+  selector: {app.kubernetes.io/name: praxis-otel-collector}
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: 4317}
+    - {name: otlp-http, port: 4318, targetPort: 4318}
+    - {name: metrics, port: 8888, targetPort: 8888}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: praxis-tracing-ui
+  namespace: praxis-tracing
+  labels: {app.kubernetes.io/name: praxis-tracing-ui}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: praxis-tracing-ui}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: praxis-tracing-ui}}
+    spec:
+      containers:
+        - name: ui
+          image: ghcr.io/nerdalert/praxis-tracing:token-rate-limit-demo-20260818
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: PORT, value: "8080"}
+            - {name: JAEGER_URL, value: http://jaeger-query.praxis-tracing.svc.cluster.local:16686}
+            - {name: JAEGER_UI_URL, value: /jaeger}
+            - {name: TRACING_UI_PROFILE, value: llmd}
+            - {name: VCR_LIVE, value: "false"}
+            - {name: ALLOW_SIMULATION, value: "false"}
+            - {name: TRACING_UI_TOKEN_RATE_LIMIT, value: "true"}
+            - {name: TRACING_UI_TOKEN_CONSUMER_A_URL, value: "http://consumer-gateway-a.grid-system.svc.cluster.local:8080"}
+            - {name: TRACING_UI_TOKEN_CONSUMER_B_URL, value: "http://consumer-gateway-b.grid-system.svc.cluster.local:8080"}
+            - {name: TRACING_UI_TOKEN_USERNAME, value: alice}
+            - {name: TRACING_UI_TOKEN_MODEL, value: Qwen/Qwen3-0.6B}
+            - {name: TRACING_UI_TOKEN_LIMIT, value: "60"}
+            - {name: TRACING_UI_TOKEN_WINDOW_SECONDS, value: "60"}
+            - name: TRACING_UI_TOKEN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: token-rate-limit-demo-credentials
+                  key: password
+          ports: [{name: http, containerPort: 8080}]
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+          readinessProbe: {httpGet: {path: /api/status, port: http}, periodSeconds: 5}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: praxis-tracing-ui
+  namespace: praxis-tracing
+spec:
+  selector: {app.kubernetes.io/name: praxis-tracing-ui}
+  ports: [{name: http, port: 8080, targetPort: http}]

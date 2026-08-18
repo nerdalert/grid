@@ -100,6 +100,24 @@
       "items": { "type": "string" },
       "description": "Container arguments."
     },
+    "env": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "value": { "type": "string" },
+          "valueFrom": { "type": "object" }
+        },
+        "oneOf": [
+          { "required": ["value"] },
+          { "required": ["valueFrom"] }
+        ]
+      },
+      "description": "Environment variables passed to the Praxis container."
+    },
     "config": {
       "type": "object",
       "additionalProperties": false,

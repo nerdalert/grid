@@ -21,6 +21,10 @@
         "zone": {
           "type": "string"
         },
+        "seeds": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
         "swim": {
           "type": "object",
           "additionalProperties": true,

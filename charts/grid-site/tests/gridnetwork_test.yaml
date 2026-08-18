@@ -42,6 +42,20 @@ tests:
             capUsd: 100
           - tenantId: tenant-b
             capUsd: 250
+
+  - it: renders SWIM seeds when configured
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.seeds:
+        - 10.0.0.1:7946
+        - 10.0.0.2:7946
+    asserts:
+      - equal:
+          path: spec.seeds
+          value:
+            - 10.0.0.1:7946
+            - 10.0.0.2:7946
     asserts:
       - equal:
           path: spec.budgetPolicy.tenants

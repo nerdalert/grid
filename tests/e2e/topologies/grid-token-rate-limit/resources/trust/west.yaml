@@ -1,0 +1,35 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridSite
+metadata:
+  name: grid-token-rate-limit-central
+  labels:
+    grid.praxis-proxy.io/network: grid-token-rate-limit
+    grid.praxis-proxy.io/auto-discovered: "true"
+spec:
+  gridNetworkRef: grid-token-rate-limit
+  egress:
+    address: "{{ captures.central.swim-lb-ip }}:8443"
+    tls:
+      mode: Mutual
+      serverName: central.grid.internal
+  trust:
+    canonicalFingerprints:
+      - c9f910677d3506369dd797b996124aa78fb307e7f8155801ff9ad20f4da3a3c5
+---
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridSite
+metadata:
+  name: grid-token-rate-limit-east
+  labels:
+    grid.praxis-proxy.io/network: grid-token-rate-limit
+    grid.praxis-proxy.io/auto-discovered: "true"
+spec:
+  gridNetworkRef: grid-token-rate-limit
+  egress:
+    address: "{{ captures.east.swim-lb-ip }}:8443"
+    tls:
+      mode: Mutual
+      serverName: east.grid.internal
+  trust:
+    canonicalFingerprints:
+      - 74134cc34ac5b89e0f2b620fe6a340827f954f2eceaddbd6c6b0d06b6a878296
