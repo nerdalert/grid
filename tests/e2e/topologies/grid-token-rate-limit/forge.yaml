@@ -249,8 +249,12 @@ spec:
             - bash
             - -c
             - >-
-              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }}
-              apply -f tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml
+              set -euo pipefail;
+              runtime=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml;
+              central=$(kubectl --context kind-grid-token-rate-limit-central -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              east=$(kubectl --context kind-grid-token-rate-limit-east -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              sed -i "s/PEER_CENTRAL_FINGERPRINT/${central}/g; s/PEER_EAST_FINGERPRINT/${east}/g" "$runtime";
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f "$runtime"
 
     central-trust-bootstrap:
       description: Pre-provision verified remote GridSite trust pins for central
@@ -263,8 +267,12 @@ spec:
             - bash
             - -c
             - >-
-              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }}
-              apply -f tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml
+              set -euo pipefail;
+              runtime=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml;
+              west=$(kubectl --context kind-grid-token-rate-limit-west -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              east=$(kubectl --context kind-grid-token-rate-limit-east -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              sed -i "s/PEER_WEST_FINGERPRINT/${west}/g; s/PEER_EAST_FINGERPRINT/${east}/g" "$runtime";
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f "$runtime"
 
     east-trust-bootstrap:
       description: Pre-provision verified remote GridSite trust pins for east
@@ -277,8 +285,12 @@ spec:
             - bash
             - -c
             - >-
-              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }}
-              apply -f tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml
+              set -euo pipefail;
+              runtime=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml;
+              west=$(kubectl --context kind-grid-token-rate-limit-west -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              central=$(kubectl --context kind-grid-token-rate-limit-central -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              sed -i "s/PEER_WEST_FINGERPRINT/${west}/g; s/PEER_CENTRAL_FINGERPRINT/${central}/g" "$runtime";
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f "$runtime"
 
     west-site:
       description: West combined site with Grid CRs via grid-site chart
@@ -384,7 +396,10 @@ spec:
                 siteSecretRef:
                   name: consumer-gateway-tls
                   namespace: grid-system
-              gatewayRefs: []
+              gatewayRefs:
+                - name: provider-gateway
+                  namespace: grid-system
+                  localSiteName: central
             gridSite:
               name: central
               region: central
@@ -447,7 +462,10 @@ spec:
                 siteSecretRef:
                   name: consumer-gateway-tls
                   namespace: grid-system
-              gatewayRefs: []
+              gatewayRefs:
+                - name: provider-gateway
+                  namespace: grid-system
+                  localSiteName: east
             gridSite:
               name: east
               region: east

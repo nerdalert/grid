@@ -14,7 +14,7 @@ spec:
       serverName: west.grid.internal
   trust:
     canonicalFingerprints:
-      - 88d7ea00ba85f12483207cf66b2f4a4f99970da47ac84c4bad3974f25a5012e0
+      - PEER_WEST_FINGERPRINT
 ---
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: GridSite
@@ -32,4 +32,4 @@ spec:
       serverName: central.grid.internal
   trust:
     canonicalFingerprints:
-      - c9f910677d3506369dd797b996124aa78fb307e7f8155801ff9ad20f4da3a3c5
+      - PEER_CENTRAL_FINGERPRINT
