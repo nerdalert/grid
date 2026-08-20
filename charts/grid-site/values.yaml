@@ -3,6 +3,7 @@ gridNetwork:
   gridId: ""
   region: ""
   zone: ""
+  seeds: []
   swim: {}
   tls: {}
   gatewayRefs: []
