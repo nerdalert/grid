@@ -7414,6 +7414,15 @@ mod tests {
             1,
             "the translated cloud route must remain present"
         );
+        assert_eq!(
+            overlay
+                .candidates
+                .iter()
+                .find(|candidate| candidate.provider_model.as_deref() == Some("Qwen/Qwen2.5-3B-Instruct"))
+                .and_then(|candidate| candidate.selection_group),
+            Some(0),
+            "the local route must be the preferred group"
+        );
         assert_ne!(
             overlay.candidates[0].stable_id, overlay.candidates[1].stable_id,
             "provider-route identities must differ for local and translated routes"
