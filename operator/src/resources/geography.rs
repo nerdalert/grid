@@ -148,6 +148,27 @@ pub(crate) fn compute_stable_id(kind: &str, name: &str, site: &str, cluster: &st
     super::routing_overlay::fnv1a_hex8(&format!("{kind}/{name}/{site}/{cluster}"))
 }
 
+/// Compute a candidate ID while preserving the legacy ID when no physical
+/// model translation is present.
+///
+/// Two routes may intentionally share the same logical model, site, and
+/// provider gateway while targeting different physical models (for example a
+/// local vLLM route and an OpenAI overflow route).  The physical model is part
+/// of that route identity in the translated case; otherwise existing IDs stay
+/// stable for compatibility with already-published provider-route maps.
+pub(crate) fn compute_candidate_stable_id(
+    kind: &str,
+    name: &str,
+    site: &str,
+    cluster: &str,
+    provider_model: Option<&str>,
+) -> String {
+    match provider_model {
+        Some(physical) => super::routing_overlay::fnv1a_hex8(&format!("{kind}/{name}/{site}/{cluster}/{physical}")),
+        None => compute_stable_id(kind, name, site, cluster),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

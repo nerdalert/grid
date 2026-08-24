@@ -322,7 +322,7 @@ Candidate fields:
 | `cluster` | Praxis load-balancer cluster identity used for upstream routing. |
 | `fresh` | Whether provider status is considered fresh enough for normal routing. |
 | `credential` | Optional. Secret reference for upstream authentication. Present only for `api_provider` or authenticated `cloud_managed` candidates. **Never contains the token value** — only the Kubernetes Secret locating information. |
-| `stable_id` | Optional. Deterministic FNV-1a hash of `{kind}/{name}/{site}/{cluster}`. Used as `candidate_id` in provider gateway `provider_route` configuration. This is distinct from the InferenceProvider CR `.metadata.name`. Also suitable for consumer-side session binding keys. |
+| `stable_id` | Optional. Deterministic FNV-1a hash of `{kind}/{name}/{site}/{cluster}`. When a candidate translates a logical model to a distinct physical `provider_model`, that physical model is appended to the hash input so co-located local and cloud routes remain distinct. Used as `candidate_id` in provider gateway `provider_route` configuration. This is distinct from the InferenceProvider CR `.metadata.name` and is suitable for consumer-side session binding keys. |
 | `admission_state` | Optional. Bounded admission state: `"new_and_existing"`, `"existing_only"`, or `"none"` (excluded). Derived from provider health and capacity metrics. |
 | `selection_tier` | Optional. Locality tier between consumer gateway and provider: `"same_site"`, `"same_zone"`, `"same_region"`, `"cross_region"`, or `"unknown"`. Derived from `GridSite` region and zone. |
 | `rank` | Optional. Zero-based position in the final sorted overlay. |
