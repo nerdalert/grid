@@ -301,8 +301,10 @@ mod tests {
             network: "test-net".to_owned(),
             local_site: "site-a".to_owned(),
             candidates: vec![RoutingCandidate {
+                backend_kind: None,
                 kind: "inference_model".to_owned(),
                 name: "model-a".to_owned(),
+                provider_model: None,
                 site: "site-a".to_owned(),
                 cluster: "cluster-a".to_owned(),
                 fresh: true,
@@ -314,6 +316,9 @@ mod tests {
                 score_breakdown: None,
                 rank: Some(0),
                 selection_group: None,
+                traffic_weight: None,
+                capacity_weight: None,
+                queue_capacity: None,
             }],
             selection_policy: None,
             generated_at: Some("2026-07-29T00:00:00Z".to_owned()),
@@ -330,8 +335,10 @@ mod tests {
             local_site: "east-edge".to_owned(),
             candidates: vec![
                 RoutingCandidate {
+                    backend_kind: None,
                     kind: "inference_model".to_owned(),
                     name: "model-east".to_owned(),
+                    provider_model: None,
                     site: "east-provider".to_owned(),
                     cluster: "sim-east-provider".to_owned(),
                     fresh: true,
@@ -350,10 +357,15 @@ mod tests {
                     score_breakdown: None,
                     rank: Some(0),
                     selection_group: None,
+                    traffic_weight: None,
+                    capacity_weight: None,
+                    queue_capacity: None,
                 },
                 RoutingCandidate {
+                    backend_kind: None,
                     kind: "inference_model".to_owned(),
                     name: "model-west".to_owned(),
+                    provider_model: None,
                     site: "west-provider".to_owned(),
                     cluster: "sim-west-provider".to_owned(),
                     fresh: true,
@@ -365,6 +377,9 @@ mod tests {
                     score_breakdown: None,
                     rank: Some(1),
                     selection_group: None,
+                    traffic_weight: None,
+                    capacity_weight: None,
+                    queue_capacity: None,
                 },
             ],
             selection_policy: None,
@@ -438,6 +453,18 @@ mod tests {
             compute_semantic_digest(&o1).unwrap(),
             compute_semantic_digest(&o2).unwrap(),
             "every routing-relevant field must affect the digest"
+        );
+    }
+
+    #[test]
+    fn semantic_digest_changes_on_provider_model_mapping() {
+        let o1 = minimal_overlay();
+        let mut o2 = minimal_overlay();
+        o2.candidates[0].provider_model = Some("physical-model".to_owned());
+        assert_ne!(
+            compute_semantic_digest(&o1).unwrap(),
+            compute_semantic_digest(&o2).unwrap(),
+            "provider model mapping must affect the semantic digest"
         );
     }
 

@@ -3,6 +3,27 @@ gridNetwork:
   gridId: ""
   region: ""
   zone: ""
+  # Candidate ordering and hard priority-group policy.
+  routingPolicy: geographyFirst
+  # Optional provider scoring. Omit this for the noMetrics strategy.
+  # scoringPolicy:
+  #   strategy: noMetrics
+  # Request-time selection inside the first viable group. New installations
+  # default to roundRobin in the rendered GridNetwork template; upgrades
+  # preserve an existing omitted field.
+  # selectionPolicy:
+  #   mode: roundRobin
+  # Optional explicit traffic placement. This is required only when
+  # selectionPolicy.mode is weightedRandom.
+  # placementPolicy:
+  #   strategy: pressureWeighted
+  #   pressureWeighted:
+  #     signal: queueDepth
+  #     minimumWeight: 1
+  #     maximumWeight: 1000
+  #     availabilityFloorPercent: 5
+  #     smoothingFactor: 0.35
+  #     changeThresholdPercent: 5
   swim: {}
   tls: {}
   gatewayRefs: []
@@ -25,6 +46,9 @@ gridSite:
   zone: ""
   providerSiteLabel: ""
 
+# Each provider may set capacityWeight (1..1000) when static weighted
+# placement is enabled on gridNetwork. Omission preserves equal/default
+# provider behavior.
 inferenceProviders: []
 
 nameOverride: ""

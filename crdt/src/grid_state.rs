@@ -144,6 +144,17 @@ pub struct ProviderState {
     /// Models served by this provider.
     pub models: Vec<String>,
 
+    /// Optional provider-wide capacity weight for static placement.
+    #[serde(default)]
+    pub capacity_weight: Option<u32>,
+
+    /// Optional queue capacity used to normalize queue-depth pressure.
+    ///
+    /// This is advertised with the provider so consumers can apply the same
+    /// pressure-weighted policy to local and remote providers.
+    #[serde(default)]
+    pub queue_capacity: Option<u32>,
+
     /// Backend locality kind (`local`, `remote`, `cloud_managed`, `api_provider`).
     pub backend_kind: String,
 
@@ -389,6 +400,8 @@ mod tests {
                 queue_depth: Some(queue_depth),
                 ..ProviderMetricsSnapshot::default()
             },
+            capacity_weight: None,
+            queue_capacity: None,
             access_policy: ProviderAccessPolicy::default(), // Empty policy = allow all
             revision,
             writer_id: site.to_owned(),

@@ -357,6 +357,7 @@ mod tests {
                 queue_depth: Some(queue),
                 ..Default::default()
             },
+            capacity_weight: None,
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site.to_owned(),

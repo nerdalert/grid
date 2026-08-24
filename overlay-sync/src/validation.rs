@@ -133,6 +133,7 @@ pub(crate) fn validate_envelope(
 
     validate_schema_version(&envelope.schema_version)?;
     validate_scope(&envelope.scope, expected_scope)?;
+    validate_selection_contract(&envelope)?;
     validate_revision_digest_agreement(&envelope)?;
     validate_content_digest(&raw_value, &envelope)?;
 
@@ -151,6 +152,38 @@ pub(crate) fn validate_envelope(
         revision,
         raw_bytes: raw.to_vec(),
     })
+}
+
+/// Validate the cross-field contract between selection mode and weights.
+fn validate_selection_contract(envelope: &OverlayEnvelope) -> Result<(), ValidationError> {
+    let weighted = envelope
+        .overlay
+        .selection_policy
+        .as_ref()
+        .is_some_and(|policy| matches!(policy.mode, crate::types::SelectionMode::WeightedRandom));
+    for (index, candidate) in envelope.overlay.candidates.iter().enumerate() {
+        if let Some(weight) = candidate.traffic_weight
+            && !(1..=1000).contains(&weight)
+        {
+            return Err(ValidationError {
+                reason: RejectionReason::Malformed,
+                detail: format!("candidate {index} traffic_weight must be between 1 and 1000"),
+            });
+        }
+        if !weighted && candidate.traffic_weight.is_some() {
+            return Err(ValidationError {
+                reason: RejectionReason::Malformed,
+                detail: format!("candidate {index} traffic_weight requires weightedRandom selection"),
+            });
+        }
+        if weighted && (candidate.selection_group.is_none() || candidate.traffic_weight.is_none()) {
+            return Err(ValidationError {
+                reason: RejectionReason::Malformed,
+                detail: format!("candidate {index} is missing weighted selection metadata"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Parse the raw envelope while converting both parser failures into the
@@ -373,6 +406,7 @@ mod tests {
                 score_breakdown: None,
                 rank: Some(0),
                 selection_group: None,
+                traffic_weight: None,
             }],
             selection_policy: None,
             generated_at: Some("2026-07-29T00:00:00Z".to_owned()),
@@ -576,6 +610,52 @@ mod tests {
         let raw = serde_json::to_vec(&value).unwrap();
         let result = validate_envelope(&raw, &test_scope(), 1_048_576, None);
         assert!(matches!(result.unwrap_err().reason, RejectionReason::Malformed));
+    }
+
+    #[test]
+    fn traffic_weight_requires_weighted_selection() {
+        for mode in ["deterministic", "roundRobin", "random"] {
+            let env = valid_envelope();
+            let mut value = serde_json::to_value(env).unwrap();
+            value["overlay"]["selection_policy"] = serde_json::json!({"mode": mode});
+            value["overlay"]["candidates"][0]["selection_group"] = serde_json::json!(0);
+            value["overlay"]["candidates"][0]["traffic_weight"] = serde_json::json!(10);
+            let digest = compute_raw_semantic_digest(&value["overlay"]).unwrap();
+            value["revision"]["value"] = serde_json::Value::String(digest.clone());
+            value["content_digest"]["value"] = serde_json::Value::String(digest);
+
+            let raw = serde_json::to_vec(&value).unwrap();
+            let result = validate_envelope(&raw, &test_scope(), 1_048_576, None);
+            assert!(
+                matches!(result.unwrap_err().reason, RejectionReason::Malformed),
+                "traffic_weight must be rejected for {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_selection_requires_valid_weight_and_group() {
+        for (group, weight) in [
+            (Some(0), Some(0)),
+            (Some(0), Some(1001)),
+            (None, Some(10)),
+            (Some(0), None),
+        ] {
+            let env = valid_envelope();
+            let mut value = serde_json::to_value(env).unwrap();
+            value["overlay"]["selection_policy"] = serde_json::json!({"mode": "weightedRandom"});
+            value["overlay"]["candidates"][0]["selection_group"] =
+                group.map_or(serde_json::Value::Null, serde_json::Value::from);
+            value["overlay"]["candidates"][0]["traffic_weight"] =
+                weight.map_or(serde_json::Value::Null, serde_json::Value::from);
+            let digest = compute_raw_semantic_digest(&value["overlay"]).unwrap();
+            value["revision"]["value"] = serde_json::Value::String(digest.clone());
+            value["content_digest"]["value"] = serde_json::Value::String(digest);
+
+            let raw = serde_json::to_vec(&value).unwrap();
+            let result = validate_envelope(&raw, &test_scope(), 1_048_576, None);
+            assert!(matches!(result.unwrap_err().reason, RejectionReason::Malformed));
+        }
     }
 
     #[test]

@@ -997,6 +997,9 @@ pub(crate) enum Action {
         /// of the default queue-depth signal.
         #[arg(long)]
         kv_cache: bool,
+        /// Use pressureWeighted placement with weightedRandom selection.
+        #[arg(long)]
+        pressure_weighted: bool,
     },
 
     /// Create the focused provider-gateway traffic demo, then prove equal
@@ -1047,6 +1050,28 @@ mod llmd_pool_metrics_demo_cli_tests {
     #[test]
     fn kv_cache_flag_parses_when_passed() {
         assert!(parsed_kv_cache_flag(&["--kv-cache"]));
+    }
+
+    #[test]
+    fn pressure_weighted_flag_parses() {
+        let mut args = vec!["xtask", "env", "run-grid-llmd-pool-metrics-demo", "--pressure-weighted"];
+        let cli = Cli::try_parse_from(&args).expect("valid CLI invocation must parse");
+        let Command::Env { action } = cli.command;
+        match action {
+            Action::RunGridLlmdPoolMetricsDemo { pressure_weighted, .. } => assert!(pressure_weighted),
+            other => panic!("expected RunGridLlmdPoolMetricsDemo, got {other:?}"),
+        }
+        args.push("--kv-cache");
+        let cli = Cli::try_parse_from(args).expect("combined pressure mode must parse");
+        let Command::Env { action } = cli.command;
+        assert!(matches!(
+            action,
+            Action::RunGridLlmdPoolMetricsDemo {
+                pressure_weighted: true,
+                kv_cache: true,
+                ..
+            }
+        ));
     }
 }
 
@@ -1135,7 +1160,18 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             options,
             metrics_mtls,
             kv_cache,
-        } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
+            pressure_weighted,
+        } => llmd_pool_metrics_demo::run(
+            forge_config,
+            options,
+            *metrics_mtls,
+            *kv_cache,
+            if *pressure_weighted {
+                llmd_pool_metrics_demo::PlacementMode::PressureWeighted
+            } else {
+                llmd_pool_metrics_demo::PlacementMode::ScorePreference
+            },
+        ),
         Action::RunGridProviderTrafficDemo { forge_config, options } => {
             provider_traffic_demo::run(forge_config, options)
         },

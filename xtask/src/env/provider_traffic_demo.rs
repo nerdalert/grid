@@ -1,9 +1,10 @@
 //! Narrated, evidence-backed provider-traffic demo scenarios.
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    env, fs,
+    net::TcpStream,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
@@ -64,6 +65,11 @@ const SETUP_PHASES: usize = 14;
 /// Makes retry probe names unique while retaining a recognizable prefix.
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Read the request-selection mode used by the provider-traffic proof.
+fn provider_traffic_mode() -> String {
+    env::var("GRID_XTASK_PROVIDER_TRAFFIC_MODE").unwrap_or_else(|_| "roundRobin".to_owned())
+}
+
 // -----------------------------------------------------------------------------
 // Context
 // -----------------------------------------------------------------------------
@@ -118,6 +124,8 @@ struct OverlayCandidate {
     admission_state: Option<String>,
     /// Explicit priority group emitted by the operator, when present.
     selection_group: Option<u32>,
+    /// Explicit traffic weight emitted for weighted selection.
+    traffic_weight: Option<u32>,
 }
 
 /// Pre- and post-SWIM overlay snapshots for evidence.
@@ -423,6 +431,97 @@ fn run_curl_probe(context: &str, pod_name: &str, curl_args: &[&str]) -> Result<s
             "--restart=Never",
             "--overrides",
             &overrides,
+        ])
+        .output()
+}
+
+/// Start a local port-forward for the single consumer used by the measured
+/// weighted proof. A persistent forward avoids creating one Kubernetes pod per
+/// request and keeps the completed harness fast enough to run unattended.
+fn consumer_gateway_pod() -> Result<String, std::io::Error> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            "kind-grid-provider-traffic-provider-a",
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/instance=consumer-gateway",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+    let pod = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if pod.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "consumer gateway pod was not found",
+        ));
+    }
+    Ok(pod)
+}
+
+/// Forward the consumer gateway pod's HTTP listener to a local port.
+fn start_consumer_port_forward(local_port: u16) -> Result<Child, std::io::Error> {
+    let port_mapping = format!("{local_port}:8080");
+    let pod = consumer_gateway_pod()?;
+    let mut child = Command::new("kubectl")
+        .args([
+            "port-forward",
+            &format!("pod/{pod}"),
+            &port_mapping,
+            "--context",
+            "kind-grid-provider-traffic-provider-a",
+            "-n",
+            GRID_SYSTEM_NS,
+            "--address",
+            "127.0.0.1",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", local_port)).is_ok() {
+            return Ok(child);
+        }
+        std::thread::park_timeout(Duration::from_millis(100));
+    }
+    drop(child.kill());
+    drop(child.try_wait());
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "consumer port-forward did not become ready",
+    ))
+}
+
+/// Send one measured request through the persistent consumer port-forward.
+fn run_local_weighted_probe(local_port: u16, request_number: usize) -> Result<std::process::Output, std::io::Error> {
+    let request_id = format!("weighted-{request_number}");
+    let url = format!("http://127.0.0.1:{local_port}/v1/chat/completions");
+    Command::new("curl")
+        .args([
+            "--fail-with-body",
+            "--include",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "10",
+            "--header",
+            "Content-Type: application/json",
+            "--header",
+            "Authorization: Bearer consumer-token",
+            "--header",
+            &format!("X-Request-ID: {request_id}"),
+            "--data",
+            r#"{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"weighted provider proof"}],"max_tokens":8}"#,
+            &url,
         ])
         .output()
 }
@@ -967,8 +1066,8 @@ fn assert_overlay_acceptance() -> AssertionResult {
 fn require_local_image(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     let status = Command::new("docker")
         .args(["image", "inspect", image])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()?;
     if status.success() {
         return Ok(());
@@ -990,16 +1089,15 @@ fn require_local_image(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     reason = "Image loading is one bounded setup operation across the three clusters."
 )]
 fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
+    let pull_policy = env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
     if pull_policy != "Never" {
         eprintln!("  skipping Kind image loading (pull policy is {pull_policy})");
         return Ok(());
     }
 
-    let gateway =
-        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "praxis-ai:provider-traffic-demo".to_owned());
+    let gateway = env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "praxis-ai:provider-traffic-demo".to_owned());
     let operator =
-        std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
+        env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
     let overlay_sync = crate::env::image_overrides::overlay_sync_image();
     let vcr = crate::env::image_overrides::vcr_image();
 
@@ -1207,6 +1305,10 @@ fn read_cluster_overlay(cluster: &str) -> Result<OverlayData, Box<dyn std::error
             .get("selection_group")
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| u32::try_from(value).ok());
+        let traffic_weight = c
+            .get("traffic_weight")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
 
         if !cluster_field.is_empty() && !stable_id.is_empty() {
             stable_ids.insert(cluster_field.clone(), stable_id.clone());
@@ -1221,6 +1323,7 @@ fn read_cluster_overlay(cluster: &str) -> Result<OverlayData, Box<dyn std::error
             fresh,
             admission_state,
             selection_group,
+            traffic_weight,
         });
     }
 
@@ -1291,8 +1394,9 @@ fn wait_for_round_robin_readiness() -> Result<BTreeMap<String, serde_json::Value
             .pointer("/selection_policy/mode")
             .and_then(serde_json::Value::as_str)
             .ok_or("overlay does not publish selection_policy.mode")?;
-        if mode != "roundRobin" {
-            return Err(format!("overlay selection mode is {mode}, expected roundRobin").into());
+        let expected_mode = provider_traffic_mode();
+        if mode != expected_mode {
+            return Err(format!("overlay selection mode is {mode}, expected {expected_mode}").into());
         }
 
         let mut candidate_signature = Vec::new();
@@ -1317,6 +1421,9 @@ fn wait_for_round_robin_readiness() -> Result<BTreeMap<String, serde_json::Value
                     candidate.cluster, candidate.admission_state
                 )
                 .into());
+            }
+            if expected_mode == "weightedRandom" && candidate.traffic_weight.is_none() {
+                return Err(format!("candidate {} has no traffic_weight", candidate.cluster).into());
             }
             candidate_signature.push(format!(
                 "{}:{}:{:?}:{:?}",
@@ -1351,7 +1458,10 @@ fn wait_for_round_robin_readiness() -> Result<BTreeMap<String, serde_json::Value
     facts.insert("consumer_gateway_replicas".to_owned(), serde_json::json!(replica_text));
     facts.insert("semantic_revision".to_owned(), serde_json::json!(stable_revision));
     facts.insert("candidate_signature".to_owned(), serde_json::json!(stable_signature));
-    facts.insert("selection_policy".to_owned(), serde_json::json!("roundRobin"));
+    facts.insert(
+        "selection_policy".to_owned(),
+        serde_json::json!(provider_traffic_mode()),
+    );
     facts.insert("candidate_count".to_owned(), serde_json::json!(3));
     facts.insert(
         "praxis_serving_revision".to_owned(),
@@ -1929,12 +2039,12 @@ fn materialize_config(source: &Path) -> Result<PathBuf, Box<dyn std::error::Erro
 )]
 fn apply_image_overrides(config: &mut serde_yaml::Value) {
     let gateway_image =
-        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "praxis-ai:provider-traffic-demo".to_owned());
+        env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "praxis-ai:provider-traffic-demo".to_owned());
     let operator_image =
-        std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
+        env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
     let overlay_sync_image = crate::env::image_overrides::overlay_sync_image();
     let vcr_image = crate::env::image_overrides::vcr_image();
-    let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
+    let image_pull_policy = env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
 
     let (gateway_repo, gateway_tag) = parse_image_ref(&gateway_image);
     let (operator_repo, operator_tag) = parse_image_ref(&operator_image);
@@ -2304,10 +2414,12 @@ fn run_quick_scenarios() -> BTreeMap<String, ProofResult> {
 /// the request itself is the only source of the attribution counts.
 #[expect(
     clippy::too_many_lines,
-    clippy::unnecessary_wraps,
-    reason = "The assertion framework requires a fallible, named traffic proof boundary."
+    reason = "The focused demo presents its proof phases in one ordered function."
 )]
 fn assert_provider_gateway_round_robin() -> AssertionResult {
+    if provider_traffic_mode() == "weightedRandom" {
+        return assert_provider_gateway_weighted();
+    }
     let start = Instant::now();
     let context = "kind-grid-provider-traffic-provider-a";
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -2337,7 +2449,8 @@ fn assert_provider_gateway_round_robin() -> AssertionResult {
     };
 
     for request_number in 1..=60 {
-        if let Ok(current_overlay) = read_cluster_overlay("provider-a")
+        if (request_number == 1 || request_number % 25 == 0)
+            && let Ok(current_overlay) = read_cluster_overlay("provider-a")
             && (current_overlay.resource_version != baseline_overlay.resource_version
                 || current_overlay.semantic_revision != baseline_overlay.semantic_revision)
         {
@@ -2449,6 +2562,142 @@ fn assert_provider_gateway_round_robin() -> AssertionResult {
     }
 }
 
+/// Send unbound requests through the weighted static-placement proof.
+///
+/// This remains a statistical proof: weighted random selection has no exact
+/// sequence guarantee. The overlay and serving revision are still held stable
+/// for the complete measured window.
+#[expect(
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    reason = "The assertion framework requires a fallible, named traffic proof boundary."
+)]
+fn assert_provider_gateway_weighted() -> AssertionResult {
+    let start = Instant::now();
+    let readiness = match wait_for_round_robin_readiness() {
+        Ok(facts) => facts,
+        Err(error) => {
+            return Ok(proof_failure(
+                &format!("weighted readiness gate failed: {error}"),
+                BTreeMap::from([(String::from("readiness_error"), serde_json::json!(error.to_string()))]),
+                start.elapsed(),
+            ));
+        },
+    };
+    let baseline_overlay = match read_cluster_overlay("provider-a") {
+        Ok(overlay) => overlay,
+        Err(error) => {
+            return Ok(proof_failure(
+                &format!("could not capture weighted baseline overlay: {error}"),
+                BTreeMap::new(),
+                start.elapsed(),
+            ));
+        },
+    };
+
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut failures = Vec::new();
+    let mut overlay_changes = Vec::new();
+    let local_port = 18081;
+    let mut port_forward = match start_consumer_port_forward(local_port) {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(proof_failure(
+                &format!("weighted consumer port-forward failed: {error}"),
+                BTreeMap::new(),
+                start.elapsed(),
+            ));
+        },
+    };
+    for request_number in 1..=1000 {
+        if let Ok(Some(status)) = port_forward.try_wait() {
+            failures.push(format!(
+                "weighted-{request_number}: consumer port-forward exited with {status}"
+            ));
+            break;
+        }
+        if (request_number == 1 || request_number % 25 == 0)
+            && let Ok(current_overlay) = read_cluster_overlay("provider-a")
+            && (current_overlay.resource_version != baseline_overlay.resource_version
+                || current_overlay.semantic_revision != baseline_overlay.semantic_revision)
+        {
+            overlay_changes.push(serde_json::json!({
+                "request": request_number,
+                "resource_version": current_overlay.resource_version,
+                "semantic_revision": current_overlay.semantic_revision,
+            }));
+        }
+        let output = run_local_weighted_probe(local_port, request_number);
+        match output {
+            Ok(output) if output.status.success() => {
+                let provider = response_header(&output.stdout, "x-grid-combined-provider-gateway")
+                    .or_else(|| response_header(&output.stdout, "x-grid-provider-traffic-provider-gateway"))
+                    .or_else(|| response_header(&output.stdout, "x-grid-provider-gateway"));
+                if let Some(provider) = provider {
+                    *counts.entry(provider).or_default() += 1;
+                } else {
+                    failures.push(format!(
+                        "weighted-{request_number}: provider attribution header missing"
+                    ));
+                }
+            },
+            Ok(output) => failures.push(format!(
+                "weighted-{request_number}: HTTP probe failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => failures.push(format!("weighted-{request_number}: probe execution failed: {error}")),
+        }
+    }
+    drop(port_forward.kill());
+    drop(port_forward.try_wait());
+
+    let observed = [
+        counts.get("provider-a").copied().unwrap_or(0),
+        counts.get("provider-b").copied().unwrap_or(0),
+        counts.get("provider-c").copied().unwrap_or(0),
+    ];
+    let expected = [600_usize, 300, 100];
+    let tolerance = [60_usize, 45, 25];
+    let within_tolerance = observed
+        .iter()
+        .zip(expected.iter().zip(tolerance.iter()))
+        .all(|(actual, (target, margin))| actual.abs_diff(*target) <= *margin);
+    let mut facts = BTreeMap::new();
+    facts.insert(
+        "request_count".to_owned(),
+        serde_json::json!(observed.iter().sum::<usize>()),
+    );
+    facts.insert("provider_counts".to_owned(), serde_json::json!(counts));
+    facts.insert("expected_counts".to_owned(), serde_json::json!(expected));
+    facts.insert("tolerance".to_owned(), serde_json::json!(tolerance));
+    facts.insert(
+        "within_statistical_tolerance".to_owned(),
+        serde_json::json!(within_tolerance),
+    );
+    facts.insert("failures".to_owned(), serde_json::json!(failures));
+    facts.insert("selection_policy".to_owned(), serde_json::json!("weightedRandom"));
+    facts.insert("placement_strategy".to_owned(), serde_json::json!("static"));
+    facts.insert("readiness".to_owned(), serde_json::json!(readiness));
+    facts.insert(
+        "overlay_changes_during_requests".to_owned(),
+        serde_json::json!(overlay_changes),
+    );
+    let stable = overlay_changes.is_empty();
+    if within_tolerance && failures.is_empty() && stable {
+        Ok(proof_success(
+            "1000 requests followed static 60/30/10 weighted placement",
+            facts,
+            start.elapsed(),
+        ))
+    } else {
+        Ok(proof_failure(
+            &format!("weighted distribution failed: observed={observed:?}, failures={failures:?}"),
+            facts,
+            start.elapsed(),
+        ))
+    }
+}
+
 /// Run one proof assertion and retain failures as structured evidence.
 fn run_and_insert(results: &mut BTreeMap<String, ProofResult>, name: &str, assertion_fn: fn() -> AssertionResult) {
     match run_assertion(name, assertion_fn) {
@@ -2545,8 +2794,8 @@ fn update_operator_swim_config(
     let context = format!("kind-grid-provider-traffic-{cluster}");
 
     let operator_image =
-        std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
-    let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
+        env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
+    let image_pull_policy = env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
     let (operator_repo, operator_tag) = parse_image_ref(&operator_image);
 
     let seeds_escaped = seeds.replace(',', "\\,");

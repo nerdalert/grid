@@ -1,0 +1,32 @@
+# Example values for explicit provider-gateway weighting.
+# This is not the chart default. It requires selectionPolicy.mode=weightedRandom
+# and a placementPolicy; providers without capacityWeight default to 1.
+gridNetwork:
+  name: provider-grid
+  routingPolicy: scoreFirst
+  scoringPolicy:
+    strategy: noMetrics
+  placementPolicy:
+    strategy: static
+  selectionPolicy:
+    mode: weightedRandom
+
+inferenceProviders:
+  - name: provider-a
+    gridNetworkRef: provider-grid
+    providerKind: gateway
+    backendKind: vcr
+    endpoint: https://provider-a.example.invalid
+    capacityWeight: 60
+  - name: provider-b
+    gridNetworkRef: provider-grid
+    providerKind: gateway
+    backendKind: vcr
+    endpoint: https://provider-b.example.invalid
+    capacityWeight: 30
+  - name: provider-c
+    gridNetworkRef: provider-grid
+    providerKind: gateway
+    backendKind: vcr
+    endpoint: https://provider-c.example.invalid
+    capacityWeight: 10

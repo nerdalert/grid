@@ -52,6 +52,7 @@ goal:
 | Send new traffic to the highest-ranked provider | `geographyFirst` or `scoreFirst` | Any | `deterministic` |
 | Share traffic across sites without inference metrics | `scoreFirst` | `noMetrics` | `roundRobin` |
 | Randomize selection inside the preferred provider group | Either | Any | `random` |
+| Distribute by explicit provider capacity | `scoreFirst` | `noMetrics` | `weightedRandom` |
 
 The three policy fields answer different questions:
 
@@ -79,7 +80,8 @@ Session-affinity lookup
                           apply the configured selection mode
                               +-- deterministic mode
                               +-- roundRobin mode
-                              `-- random mode
+                              +-- random mode
+                              `-- weightedRandom mode
 ```
 
 Scores contribute to candidate ordering. They do not create groups. The
@@ -200,6 +202,14 @@ Selects uniformly from viable candidates in the active group. It follows the
 same admission, group, and affinity rules as round-robin. Random state is local
 to the gateway process and is not a global coordinator.
 
+### `weightedRandom`
+
+Selects from viable candidates using explicit overlay weights. It requires a
+placement policy and is the only current mode that turns provider capacity
+configuration into unequal selection probability. The weights are bounded and
+precomputed when Praxis loads the snapshot; no request-time metrics lookup is
+performed.
+
 ## Policy matrix
 
 | Routing policy | Selection policy | Effective behavior |
@@ -210,6 +220,7 @@ to the gateway process and is not a global coordinator.
 | `scoreFirst` | `deterministic` | Strict preference for the highest-ranked fresh admitted provider across sites |
 | `scoreFirst` | `roundRobin` | Equal selection across fresh admitted providers in the active group |
 | `scoreFirst` | `random` | Uniform selection across fresh admitted providers in the active group |
+| `scoreFirst` | `weightedRandom` | Explicit weighted selection across fresh admitted providers in the active group |
 
 The scoring strategy changes ordering, not the selection mode:
 
@@ -293,6 +304,27 @@ spec:
 Random selection is uniform within the active group. It is useful when an
 equal probabilistic distribution is sufficient and a repeating sequence is not
 required.
+
+### Explicit weighted selection
+
+```yaml
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridNetwork
+metadata:
+  name: weighted-provider-grid
+spec:
+  routingPolicy: scoreFirst
+  scoringPolicy:
+    strategy: noMetrics
+  placementPolicy:
+    strategy: static
+  selectionPolicy:
+    mode: weightedRandom
+```
+
+Set `capacityWeight` to values such as `60`, `30`, and `10` on the matching
+`InferenceProvider` resources. The placement policy is explicit; weighted
+selection is never inferred from scores or metric availability.
 
 ## Request-time behavior and affinity
 
@@ -403,7 +435,7 @@ call to Grid. A request already sent upstream can fail before a newer snapshot
 is accepted; do not assume automatic retry unless the gateway configuration
 explicitly provides it.
 
-## Overlay contract and future weighting
+## Overlay contract and weighted placement
 
 `selectionPolicy` is optional in both the Grid API and the overlay. An omitted
 field remains omitted, and Praxis interprets it as deterministic selection.
@@ -416,19 +448,28 @@ present. Group numbers are zero-based and contiguous per capability. Unknown
 mode values and malformed policy structures are rejected. Overlays without
 the optional selection fields remain valid and use deterministic selection.
 
-Weighted selection is a future extension, not part of the current API. A
-future mode such as `weightedRandom` would need an explicit overlay weight,
-normalization, capacity semantics, missing-metric behavior, bounds, and
-stability controls. It must not be inferred from score, rank, metric presence,
-or candidate count, and it must not change admission, locality,
-authorization, freshness, or group boundaries.
+`weightedRandom` is an explicit selection mode. It requires a placement policy
+and an explicit provider weight in the overlay. The supported static placement
+strategy derives those weights from each `InferenceProvider.spec.capacityWeight`
+value, bounded to 1 through 1000; omission defaults to a weight of 1. An equal
+placement strategy assigns the same weight to each eligible provider.
+
+Weighted selection changes distribution inside the first viable group only. It
+does not make lower-priority groups active, bypass admission or freshness, or
+turn score values into weights. `queueDepth` and `kvCachePressure` remain
+preference signals and do not implicitly enable weighted selection.
+
+Metric-derived weighting remains a future extension. It would need explicit
+normalization, missing-metric behavior, bounds, and stability controls, and it
+must not change admission, locality, authorization, freshness, or group
+boundaries.
 
 ## Demonstration reference
 
 The [Grid provider-selection research spike](https://github.com/praxis-proxy/grid/issues/31)
-describes the focused provider-traffic demonstration: one consumer gateway,
-three provider gateways, one active group, `noMetrics`, `roundRobin`, 60
-successful requests, exact 20/20/20 attribution, and a stable overlay during
-the measured window. That proof demonstrates equal selection, not weighted
-routing, coordinated round-robin across multiple consumers, retry behavior,
-or fallback groups unless separate evidence is provided.
+describes the focused provider-traffic demonstrations: one consumer gateway,
+three provider gateways, and an active selection group. The equal-selection
+variant uses `noMetrics` and `roundRobin`; the weighted variant uses explicit
+static capacity weights and `weightedRandom`. These proofs demonstrate local
+provider selection, not coordinated round-robin across multiple consumers,
+retry behavior, or fallback groups unless separate evidence is provided.

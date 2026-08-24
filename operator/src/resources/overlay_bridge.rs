@@ -46,25 +46,39 @@ use crate::resources::routing_overlay::{RoutingCandidate, RoutingOverlay};
 pub fn to_intelligent_route_value(overlay: &RoutingOverlay, model_header: &str) -> serde_json::Value {
     let candidates: Vec<serde_json::Value> = overlay.candidates.iter().map(candidate_to_value).collect();
 
-    serde_json::json!({
+    let mut filter = serde_json::json!({
         "filter": "intelligent_route",
         "local_site": overlay.local_site,
         "model_header": model_header,
         "candidates": candidates
-    })
+    });
+    if let Some(policy) = &overlay.selection_policy {
+        filter["selection_policy"] = serde_json::to_value(policy).unwrap_or(serde_json::Value::Null);
+    }
+    filter
 }
 
 /// Serialise one [`RoutingCandidate`] to a `serde_json::Value`.
 ///
 /// [`RoutingCandidate`]: crate::resources::routing_overlay::RoutingCandidate
 fn candidate_to_value(c: &RoutingCandidate) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "kind": c.kind,
         "name": c.name,
         "site": c.site,
         "cluster": c.cluster,
         "fresh": c.fresh
-    })
+    });
+    if let Some(provider_model) = &c.provider_model {
+        value["provider_model"] = serde_json::json!(provider_model);
+    }
+    if let Some(group) = c.selection_group {
+        value["selection_group"] = serde_json::json!(group);
+    }
+    if let Some(weight) = c.traffic_weight {
+        value["traffic_weight"] = serde_json::json!(weight);
+    }
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -83,8 +97,10 @@ mod tests {
             candidates: candidates
                 .into_iter()
                 .map(|(name, site, cluster)| RoutingCandidate {
+                    backend_kind: None,
                     kind: "inference_model".to_owned(),
                     name: name.to_owned(),
+                    provider_model: None,
                     site: site.to_owned(),
                     cluster: cluster.to_owned(),
                     fresh: true,
@@ -96,6 +112,9 @@ mod tests {
                     score_breakdown: None,
                     rank: None,
                     selection_group: None,
+                    traffic_weight: None,
+                    capacity_weight: None,
+                    queue_capacity: None,
                 })
                 .collect(),
             selection_policy: None,

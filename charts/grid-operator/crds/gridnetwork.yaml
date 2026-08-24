@@ -334,6 +334,68 @@ spec:
                   nullable: true
                   pattern: ^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$
                   type: string
+                placementPolicy:
+                  description: Optional explicit traffic-placement policy for weighted selection.
+                  nullable: true
+                  properties:
+                    pressureWeighted:
+                      description: Parameters required by `pressureWeighted`; absent for other strategies.
+                      nullable: true
+                      properties:
+                        availabilityFloorPercent:
+                          default: 5
+                          description: Minimum inverse-pressure availability as a percentage.
+                          format: uint32
+                          maximum: 100.0
+                          minimum: 1.0
+                          type: integer
+                        changeThresholdPercent:
+                          default: 5
+                          description: Minimum percentage change before a new effective weight is published.
+                          format: uint32
+                          maximum: 100.0
+                          minimum: 0.0
+                          type: integer
+                        maximumWeight:
+                          default: 1000
+                          description: Highest published weight.
+                          format: uint32
+                          maximum: 1000.0
+                          minimum: 1.0
+                          type: integer
+                        minimumWeight:
+                          default: 1
+                          description: Lowest positive published weight.
+                          format: uint32
+                          maximum: 1000.0
+                          minimum: 1.0
+                          type: integer
+                        signal:
+                          description: The single typed pressure signal to consume.
+                          enum:
+                            - queueDepth
+                            - kvCachePressure
+                          type: string
+                        smoothingFactor:
+                          default: 0.35
+                          description: EWMA factor in the inclusive range `(0, 1]`.
+                          format: double
+                          maximum: 1.0
+                          minimum: 0.000001
+                          type: number
+                      required:
+                        - signal
+                      type: object
+                    strategy:
+                      description: Strategy used to produce traffic weights.
+                      enum:
+                        - equal
+                        - static
+                        - pressureWeighted
+                      type: string
+                  required:
+                    - strategy
+                  type: object
                 region:
                   description: Region where this site is deployed.
                   nullable: true
@@ -395,6 +457,7 @@ spec:
                         - deterministic
                         - roundRobin
                         - random
+                        - weightedRandom
                       type: string
                   required:
                     - mode
@@ -544,6 +607,17 @@ spec:
                   nullable: true
                   type: string
               type: object
+              x-kubernetes-validations:
+                - message: placementPolicy requires selectionPolicy.mode=weightedRandom
+                  rule: '!has(self.placementPolicy) || (has(self.selectionPolicy) && self.selectionPolicy.mode == ''weightedRandom'')'
+                - message: selectionPolicy.mode=weightedRandom requires placementPolicy
+                  rule: '!has(self.selectionPolicy) || self.selectionPolicy.mode != ''weightedRandom'' || has(self.placementPolicy)'
+                - message: pressureWeighted requires pressureWeighted configuration
+                  rule: '!has(self.placementPolicy) || self.placementPolicy.strategy != ''pressureWeighted'' || has(self.placementPolicy.pressureWeighted)'
+                - message: pressureWeighted configuration is only valid with pressureWeighted strategy
+                  rule: '!has(self.placementPolicy) || self.placementPolicy.strategy == ''pressureWeighted'' || !has(self.placementPolicy.pressureWeighted)'
+                - message: pressureWeighted signal must match scoringPolicy.strategy
+                  rule: '!has(self.placementPolicy) || self.placementPolicy.strategy != ''pressureWeighted'' || (has(self.scoringPolicy) && self.placementPolicy.pressureWeighted.signal == self.scoringPolicy.strategy)'
             status:
               description: Observed status of a [`GridNetwork`].
               nullable: true
