@@ -399,6 +399,19 @@ prove that a Praxis gateway has loaded the latest routing config or authorized
 provider-side traffic. Data-plane readiness is verified separately at request
 time by provider gateway filters.
 
+**Single-site / combined-site deployments:** Site discovery is driven by *remote*
+SWIM peers - the `Pending -> Discovered` transition above requires a remote peer
+observed Alive. A single or combined cluster has no peers, so its own `GridSite`
+stays `Pending` with reason `AwaitingDiscovery`. **This is expected and does not
+block local serving:** local `InferenceProvider`s are eligible regardless of
+`GridSite.status.phase`; only *remote* CRDT provider records are phase-gated (see
+"Routing eligibility" above). Do not add SWIM seeds or extra operator replicas to
+try to force the site `Active` - there is no second site to discover, and a lone
+operator legitimately runs a single-node mesh with zero peers. The `Active` phase
+and its mTLS gateway probe (`spec.egress` + `spec.trust`) apply to reaching
+*remote* sites, or a manually-configured peer gateway endpoint. See
+[Architecture Overview -> Single-Site and Combined Deployments](overview.md#single-site-and-combined-deployments).
+
 See [Routing eligibility](routing.md#routing-eligibility) for the full gating rule.
 
 Example status — Mutual TLS verified:
