@@ -1063,6 +1063,19 @@ fn locality_sort_key(tier: Option<LocalityTier>) -> u8 {
     }
 }
 
+/// Keep preferred local backends ahead of overflow backends when all other
+/// routing dimensions tie. This ordering is also what makes the backend-kind
+/// group boundary a preference boundary rather than merely a classification.
+fn backend_kind_sort_key(kind: Option<&str>) -> u8 {
+    match kind {
+        Some("local") => 0,
+        Some("remote") => 1,
+        Some("cloud_managed") => 2,
+        Some("api_provider") => 3,
+        _ => 4,
+    }
+}
+
 /// Assign deterministic priority groups after the existing candidate sort.
 ///
 /// Groups are hard eligibility/priority boundaries, not score buckets. The
@@ -1454,6 +1467,10 @@ pub(crate) fn render_routing_overlay_with_placement_state(
                     .cmp(&admission_sort_key(b.admission_state))
                     .then(locality_sort_key(a.selection_tier).cmp(&locality_sort_key(b.selection_tier)))
                     .then(b.fresh.cmp(&a.fresh))
+                    .then(
+                        backend_kind_sort_key(a.backend_kind.as_deref())
+                            .cmp(&backend_kind_sort_key(b.backend_kind.as_deref())),
+                    )
                     .then_with(|| score_of(&b.cluster).total_cmp(&score_of(&a.cluster)))
                     .then(a.site.cmp(&b.site))
                     .then(a.name.cmp(&b.name))
@@ -1465,6 +1482,10 @@ pub(crate) fn render_routing_overlay_with_placement_state(
                 admission_sort_key(a.admission_state)
                     .cmp(&admission_sort_key(b.admission_state))
                     .then(b.fresh.cmp(&a.fresh))
+                    .then(
+                        backend_kind_sort_key(a.backend_kind.as_deref())
+                            .cmp(&backend_kind_sort_key(b.backend_kind.as_deref())),
+                    )
                     .then_with(|| score_of(&b.cluster).total_cmp(&score_of(&a.cluster)))
                     .then(locality_sort_key(a.selection_tier).cmp(&locality_sort_key(b.selection_tier)))
                     .then(a.site.cmp(&b.site))
