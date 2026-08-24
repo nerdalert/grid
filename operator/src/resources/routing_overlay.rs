@@ -54,7 +54,10 @@ use crate::{
         grid_site::GridSite,
         inference_provider::{InferenceProvider, ProviderPhase},
     },
-    resources::geography::{AdmissionState, LocalityTier},
+    resources::{
+        geography::{AdmissionState, LocalityTier},
+        placement::{self, PlacementState, PressureInput},
+    },
     swim::{MemberStatus, MembershipSnapshot},
 };
 
@@ -259,8 +262,10 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
         .map(|model| RoutingCandidate {
             kind: CANDIDATE_KIND.to_owned(),
             name: model.clone(),
+            provider_model: None,
             site: provider.site_id.clone(),
             cluster: provider.routing_cluster.clone(),
+            backend_kind: Some(provider.backend_kind.clone()),
             fresh,
             credential: None,
             stable_id: None,
@@ -270,6 +275,9 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
             score_breakdown: None,
             rank: None,
             selection_group: None,
+            traffic_weight: None,
+            capacity_weight: provider.capacity_weight,
+            queue_capacity: provider.queue_capacity,
         })
         .collect()
 }
@@ -816,6 +824,11 @@ pub struct RoutingCandidate {
     /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
     pub name: String,
 
+    /// Provider-facing physical model. When absent, `name` is also the
+    /// physical model for backward-compatible candidates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_model: Option<String>,
+
     /// Site name where this model is hosted.
     ///
     /// Resolved via `spec.siteSelector.matchLabels` against [`GridSite`]
@@ -833,6 +846,11 @@ pub struct RoutingCandidate {
     ///
     /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
     pub cluster: String,
+
+    /// Internal backend class used to keep API/cloud candidates in overflow
+    /// groups. This is not serialized into the consumer wire contract.
+    #[serde(skip)]
+    pub backend_kind: Option<String>,
 
     /// Whether this candidate should be treated as fresh by the data plane.
     ///
@@ -884,6 +902,18 @@ pub struct RoutingCandidate {
     /// routing behavior until the data plane explicitly enables it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_group: Option<u32>,
+
+    /// Explicit traffic weight used only by weighted selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traffic_weight: Option<u32>,
+
+    /// Provider-wide static placement input, not serialized to the overlay.
+    #[serde(skip)]
+    pub capacity_weight: Option<u32>,
+
+    /// Queue capacity used to normalize the raw EPP queue signal.
+    #[serde(skip)]
+    pub queue_capacity: Option<u32>,
 }
 
 /// The full routing overlay for a single [`GridNetwork`].
@@ -1040,7 +1070,7 @@ fn locality_sort_key(tier: Option<LocalityTier>) -> u8 {
 /// Score-first keeps admission and freshness as boundaries. Scores are
 /// therefore never used to split a group, and floating-point equality is not
 /// part of the grouping contract.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct GroupState {
     /// Admission boundary for the previous candidate.
     admission: AdmissionState,
@@ -1048,6 +1078,8 @@ struct GroupState {
     fresh: bool,
     /// Locality boundary for the previous candidate.
     tier: LocalityTier,
+    /// Backend class boundary for preferred versus overflow providers.
+    backend_kind: Option<String>,
     /// Group assigned to the previous candidate.
     group: u32,
 }
@@ -1063,14 +1095,20 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
         let key = (candidate.kind.clone(), candidate.name.clone());
         let admission = candidate.admission_state.unwrap_or(AdmissionState::NewAndExisting);
         let tier = candidate.selection_tier.unwrap_or(LocalityTier::Unknown);
+        let backend_kind = candidate.backend_kind.clone();
         let next = match last_by_capability.get(&key) {
             Some(last) => {
                 let boundary = match policy {
                     crate::crd::grid_network::RoutingPolicy::GeographyFirst => {
-                        admission != last.admission || tier != last.tier || candidate.fresh != last.fresh
+                        admission != last.admission
+                            || tier != last.tier
+                            || candidate.fresh != last.fresh
+                            || backend_kind != last.backend_kind
                     },
                     crate::crd::grid_network::RoutingPolicy::ScoreFirst => {
-                        admission != last.admission || candidate.fresh != last.fresh
+                        admission != last.admission
+                            || candidate.fresh != last.fresh
+                            || backend_kind != last.backend_kind
                     },
                 };
                 if boundary {
@@ -1089,9 +1127,127 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
                 fresh: candidate.fresh,
                 tier,
                 group: next,
+                backend_kind,
             },
         );
     }
+}
+
+/// Derive explicit weights after eligibility, ordering, and group assignment.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "this boundary receives the independently computed routing inputs and preserves the render pipeline"
+)]
+fn apply_traffic_weights(
+    candidates: &mut [RoutingCandidate],
+    selection_policy: Option<&crate::crd::grid_network::SelectionPolicyConfig>,
+    placement_policy: Option<&crate::crd::grid_network::PlacementPolicyConfig>,
+    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
+    remote_crdt_providers: &[crdt::ProviderState],
+    scoring_strategy: Option<crate::crd::grid_network::ScoringStrategy>,
+    placement_state: &mut PlacementState,
+) -> Result<(), String> {
+    let weighted =
+        selection_policy.is_some_and(|policy| policy.mode == crate::crd::grid_network::SelectionMode::WeightedRandom);
+    if weighted != placement_policy.is_some() {
+        return Err(if weighted {
+            "weightedRandom selection requires placementPolicy".to_owned()
+        } else {
+            "placementPolicy requires selectionPolicy.mode weightedRandom".to_owned()
+        });
+    }
+    if !weighted {
+        return Ok(());
+    }
+    let Some(placement_policy) = placement_policy else {
+        return Err("weightedRandom selection requires placementPolicy".to_owned());
+    };
+    if placement_policy.strategy != crate::crd::grid_network::PlacementStrategy::PressureWeighted
+        && placement_policy.pressure_weighted.is_some()
+    {
+        return Err("pressureWeighted configuration requires pressureWeighted strategy".to_owned());
+    }
+    match placement_policy.strategy {
+        crate::crd::grid_network::PlacementStrategy::Equal => {
+            for candidate in candidates {
+                candidate.traffic_weight = Some(1);
+            }
+        },
+        crate::crd::grid_network::PlacementStrategy::Static => {
+            for candidate in candidates {
+                let weight = candidate.capacity_weight.unwrap_or(1);
+                if !(1..=1000).contains(&weight) {
+                    return Err("provider capacityWeight must be between 1 and 1000".to_owned());
+                }
+                candidate.traffic_weight = Some(weight);
+            }
+        },
+        crate::crd::grid_network::PlacementStrategy::PressureWeighted => {
+            let Some(config) = placement_policy.pressure_weighted.as_ref() else {
+                return Err("pressureWeighted requires pressureWeighted configuration".to_owned());
+            };
+            let expected = match config.signal {
+                crate::crd::grid_network::PressureSignal::QueueDepth => {
+                    crate::crd::grid_network::ScoringStrategy::QueueDepth
+                },
+                crate::crd::grid_network::PressureSignal::KvCachePressure => {
+                    crate::crd::grid_network::ScoringStrategy::KvCachePressure
+                },
+            };
+            if scoring_strategy != Some(expected) {
+                return Err(format!(
+                    "pressureWeighted signal {:?} requires matching scoringPolicy strategy {:?}",
+                    config.signal, expected
+                ));
+            }
+            let inputs: Vec<PressureInput<'_>> = candidates
+                .iter()
+                .map(|candidate| {
+                    let pressure = metrics
+                        .and_then(|values| values.get(candidate.cluster.as_str()))
+                        .map(|value| match config.signal {
+                            crate::crd::grid_network::PressureSignal::QueueDepth => value.queue_depth,
+                            crate::crd::grid_network::PressureSignal::KvCachePressure => value.kv_cache_utilization,
+                        })
+                        .or_else(|| {
+                            remote_crdt_providers
+                                .iter()
+                                .find(|provider| provider.routing_cluster == candidate.cluster)
+                                .map(|provider| {
+                                    let value = crdt_metrics_to_backend(&provider.metrics);
+                                    match config.signal {
+                                        crate::crd::grid_network::PressureSignal::QueueDepth => value.queue_depth,
+                                        crate::crd::grid_network::PressureSignal::KvCachePressure => {
+                                            value.kv_cache_utilization
+                                        },
+                                    }
+                                })
+                        });
+                    if config.signal == crate::crd::grid_network::PressureSignal::QueueDepth
+                        && candidate.queue_capacity.is_none()
+                    {
+                        return Err(format!(
+                            "provider {} requires positive metrics.queueCapacity",
+                            candidate.cluster
+                        ));
+                    }
+                    Ok(PressureInput {
+                        stable_id: candidate.stable_id.as_deref().unwrap_or(&candidate.cluster),
+                        selection_group: candidate.selection_group.unwrap_or(0),
+                        capacity_weight: candidate.capacity_weight.unwrap_or(1),
+                        pressure,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            let weights = placement::pressure_weights(&inputs, config, placement_state)?;
+            for candidate in candidates {
+                let stable_id = candidate.stable_id.as_deref().unwrap_or(&candidate.cluster);
+                candidate.traffic_weight = weights.get(stable_id).copied();
+            }
+        },
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,7 +1344,7 @@ pub fn render_routing_overlay(
     generated_at: Option<&str>,
     weights: &scoring::ScoringWeights,
 ) -> Result<RoutingOverlay, String> {
-    render_routing_overlay_with_admission(
+    render_routing_overlay_with_placement_state(
         network,
         sites,
         providers,
@@ -1197,27 +1353,17 @@ pub fn render_routing_overlay(
         metrics,
         generated_at,
         weights,
-        None,
+        &mut PlacementState::default(),
     )
 }
 
-/// Render an overlay using controller-owned admission states for local
-/// providers. The compatibility wrapper above retains the pure renderer API
-/// used by callers and tests that do not have reconcile memory.
-///
-/// # Errors
-///
-/// Returns an error when the network or an eligible provider lacks the
-/// metadata required to construct a valid routing candidate.
+/// Render an overlay while retaining pressure-placement damping state.
 #[expect(
     clippy::too_many_arguments,
-    reason = "admission states are a distinct control-plane input"
-)]
-#[expect(
     clippy::too_many_lines,
-    reason = "sequential render steps: ordering, collect, enrich, filter, sort, dedup, rank; splitting would hide the pipeline"
+    reason = "sequential render steps: ordering, collect, enrich, filter, sort, dedup, rank, placement"
 )]
-pub fn render_routing_overlay_with_admission(
+pub(crate) fn render_routing_overlay_with_placement_state(
     network: &GridNetwork,
     sites: &[GridSite],
     providers: &[InferenceProvider],
@@ -1226,7 +1372,7 @@ pub fn render_routing_overlay_with_admission(
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
     generated_at: Option<&str>,
     weights: &scoring::ScoringWeights,
-    precomputed_admission: Option<&HashMap<String, AdmissionState>>,
+    placement_state: &mut PlacementState,
 ) -> Result<RoutingOverlay, String> {
     let network_name = network
         .metadata
@@ -1344,6 +1490,15 @@ pub fn render_routing_overlay_with_admission(
     // an upgraded resource without this field must retain deterministic
     // Praxis compatibility behavior.
     let selection_policy = network.spec.selection_policy.clone();
+    apply_traffic_weights(
+        &mut candidates,
+        selection_policy.as_ref(),
+        network.spec.placement_policy.as_ref(),
+        metrics,
+        remote_crdt_providers,
+        network.spec.scoring_policy.as_ref().map(|policy| policy.strategy),
+        placement_state,
+    )?;
 
     Ok(RoutingOverlay {
         network: network_name.to_owned(),
@@ -1510,6 +1665,13 @@ fn candidates_from_provider(
         if model.name.trim().is_empty() {
             return Err(format!("provider {provider_name} has a blank model name"));
         }
+        if model
+            .logical_name
+            .as_deref()
+            .is_some_and(|logical| logical.trim().is_empty())
+        {
+            return Err(format!("provider {provider_name} has a blank logical model name"));
+        }
     }
 
     // Use routing_identity for cluster (and site in Phase 1 fallback).
@@ -1534,9 +1696,12 @@ fn candidates_from_provider(
         for site in &sites {
             candidates.push(RoutingCandidate {
                 kind: CANDIDATE_KIND.to_owned(),
-                name: model.name.clone(),
+                name: model.logical_name.clone().unwrap_or_else(|| model.name.clone()),
+                provider_model: Some(model.name.clone())
+                    .filter(|physical| model.logical_name.as_deref().is_some_and(|logical| logical != physical)),
                 site: (*site).to_owned(),
                 cluster: cluster.to_owned(),
+                backend_kind: Some(provider.spec.backend_kind.clone()),
                 fresh,
                 credential: credential.clone(),
                 stable_id: None,
@@ -1546,6 +1711,13 @@ fn candidates_from_provider(
                 score_breakdown: None,
                 rank: None,
                 selection_group: None,
+                traffic_weight: None,
+                capacity_weight: provider.spec.capacity_weight,
+                queue_capacity: provider
+                    .spec
+                    .metrics_config
+                    .as_ref()
+                    .and_then(|metrics| metrics.queue_capacity),
             });
         }
     }
@@ -1777,8 +1949,10 @@ mod tests {
         RoutingCandidate {
             kind: CANDIDATE_KIND.to_owned(),
             name: name.to_owned(),
+            provider_model: None,
             site: site.to_owned(),
             cluster: cluster.to_owned(),
+            backend_kind: None,
             fresh,
             credential: None,
             stable_id: None,
@@ -1788,6 +1962,9 @@ mod tests {
             score_breakdown: None,
             rank: None,
             selection_group: None,
+            traffic_weight: None,
+            capacity_weight: None,
+            queue_capacity: None,
         }
     }
 
@@ -1816,6 +1993,97 @@ mod tests {
         assign_selection_groups(&mut candidates, crate::crd::grid_network::RoutingPolicy::GeographyFirst);
         assert_eq!(candidates[0].selection_group, Some(0));
         assert_eq!(candidates[1].selection_group, Some(0));
+    }
+
+    #[test]
+    fn static_weighted_placement_publishes_provider_capacity_weights() {
+        let mut candidates = vec![
+            group_candidate(
+                "model",
+                "site-a",
+                "cluster-a",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                1.0,
+            ),
+            group_candidate(
+                "model",
+                "site-b",
+                "cluster-b",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                1.0,
+            ),
+            group_candidate(
+                "model",
+                "site-c",
+                "cluster-c",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                1.0,
+            ),
+        ];
+        candidates[0].capacity_weight = Some(60);
+        candidates[1].capacity_weight = Some(30);
+        candidates[2].capacity_weight = Some(10);
+        for candidate in &mut candidates {
+            candidate.selection_group = Some(0);
+        }
+        let selection = crate::crd::grid_network::SelectionPolicyConfig {
+            mode: crate::crd::grid_network::SelectionMode::WeightedRandom,
+        };
+        let placement = crate::crd::grid_network::PlacementPolicyConfig {
+            strategy: crate::crd::grid_network::PlacementStrategy::Static,
+            pressure_weighted: None,
+        };
+        apply_traffic_weights(
+            &mut candidates,
+            Some(&selection),
+            Some(&placement),
+            None,
+            &[],
+            None,
+            &mut PlacementState::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.traffic_weight)
+                .collect::<Vec<_>>(),
+            [Some(60), Some(30), Some(10)]
+        );
+    }
+
+    #[test]
+    fn placement_policy_cannot_enable_weighting_without_weighted_mode() {
+        let mut candidates = vec![group_candidate(
+            "model",
+            "site-a",
+            "cluster-a",
+            AdmissionState::NewAndExisting,
+            LocalityTier::SameSite,
+            true,
+            1.0,
+        )];
+        let placement = crate::crd::grid_network::PlacementPolicyConfig {
+            strategy: crate::crd::grid_network::PlacementStrategy::Equal,
+            pressure_weighted: None,
+        };
+        let error = apply_traffic_weights(
+            &mut candidates,
+            None,
+            Some(&placement),
+            None,
+            &[],
+            None,
+            &mut PlacementState::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("requires selectionPolicy.mode weightedRandom"));
     }
 
     #[test]
@@ -5145,6 +5413,8 @@ mod tests {
             provider_id: "prov-1".to_owned(),
             routing_cluster: routing_cluster.to_owned(),
             models: models.iter().map(|m| (*m).to_owned()).collect(),
+            capacity_weight: None,
+            queue_capacity: None,
             backend_kind: "local".to_owned(),
             phase,
             metrics: crdt::ProviderMetricsSnapshot::default(),
@@ -5783,6 +6053,8 @@ mod tests {
             provider_id: "prov".to_owned(),
             routing_cluster: site_id.to_owned(),
             models: vec!["model".to_owned()],
+            capacity_weight: None,
+            queue_capacity: None,
             backend_kind: "remote".to_owned(),
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
@@ -6042,6 +6314,8 @@ mod tests {
             provider_id: provider_id.to_owned(),
             routing_cluster: provider_id.to_owned(),
             models: vec!["model-remote".to_owned()],
+            capacity_weight: None,
+            queue_capacity: None,
             backend_kind: "remote".to_owned(),
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
@@ -7042,6 +7316,28 @@ mod tests {
             "selection_tier must be present"
         );
         assert!(candidate.contains_key("rank"), "rank must be present");
+    }
+
+    #[test]
+    fn logical_model_name_emits_provider_model_mapping() {
+        let network = test_network("net");
+        let mut provider = test_provider_with_phase("prov-a", "net", &["qwen2.5-3b"], "Available");
+        provider.spec.models[0].logical_name = Some("chat-default".to_owned());
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "prov-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(overlay.candidates[0].name, "chat-default");
+        assert_eq!(overlay.candidates[0].provider_model.as_deref(), Some("qwen2.5-3b"));
     }
 
     #[test]

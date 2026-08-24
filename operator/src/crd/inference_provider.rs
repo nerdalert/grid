@@ -60,6 +60,11 @@ pub struct InferenceProviderSpec {
     #[serde(default)]
     pub models: Vec<ModelInfo>,
 
+    /// Provider-wide relative capacity used by static weighted placement.
+    #[schemars(range(min = 1, max = 1000))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_weight: Option<u32>,
+
     /// Inference provider type.
     pub provider_kind: String,
 
@@ -346,8 +351,13 @@ pub struct CostConfig {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
-    /// Model name.
+    /// Physical model name understood by this provider.
     pub name: String,
+
+    /// Optional logical service name exposed to clients and routing policy.
+    /// When omitted, the logical name is the same as `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_name: Option<String>,
 
     /// Supported capabilities.
     #[serde(default)]

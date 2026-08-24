@@ -101,6 +101,13 @@ spec:
                 backendKind:
                   description: Backend deployment category.
                   type: string
+                capacityWeight:
+                  description: Provider-wide relative capacity used by static weighted placement.
+                  format: uint32
+                  maximum: 1000.0
+                  minimum: 1.0
+                  nullable: true
+                  type: integer
                 cost:
                   description: Cost information.
                   nullable: true
@@ -480,6 +487,9 @@ spec:
                         type: integer
                       name:
                         description: Model name.
+                        type: string
+                      logicalName:
+                        description: Optional logical service name exposed to clients and routing policy.
                         type: string
                     required:
                       - name

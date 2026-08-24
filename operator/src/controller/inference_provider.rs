@@ -2550,9 +2550,11 @@ mod tests {
             health_check,
             models: vec![crate::crd::inference_provider::ModelInfo {
                 name: "model-a".to_owned(),
+                logical_name: None,
                 capabilities: Vec::new(),
                 context_window: None,
             }],
+            capacity_weight: None,
             provider_kind: "self_hosted".to_owned(),
             routing_cluster_ref: None,
             metrics_config: None,

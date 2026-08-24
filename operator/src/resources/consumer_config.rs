@@ -241,6 +241,7 @@ fn render_selection_policy(policy: Option<&crate::crd::grid_network::SelectionPo
         SelectionMode::Deterministic => "deterministic",
         SelectionMode::RoundRobin => "roundRobin",
         SelectionMode::Random => "random",
+        SelectionMode::WeightedRandom => "weightedRandom",
     };
     format!("         selection_policy:\n           mode: {mode}\n")
 }
@@ -278,6 +279,9 @@ fn render_candidate(c: &RoutingCandidate) -> String {
     }
     if let Some(group) = c.selection_group {
         lines.push(format!("           selection_group: {group}"));
+    }
+    if let Some(weight) = c.traffic_weight {
+        lines.push(format!("           traffic_weight: {weight}"));
     }
     if let Some(cred) = &c.credential {
         lines.extend(render_credential_reference(cred));
@@ -541,8 +545,10 @@ mod tests {
 
     fn plain_candidate(kind: &str, name: &str, site: &str, cluster: &str, fresh: bool) -> RoutingCandidate {
         RoutingCandidate {
+            backend_kind: None,
             kind: kind.to_owned(),
             name: name.to_owned(),
+            provider_model: None,
             site: site.to_owned(),
             cluster: cluster.to_owned(),
             fresh,
@@ -554,6 +560,9 @@ mod tests {
             score_breakdown: None,
             rank: None,
             selection_group: None,
+            traffic_weight: None,
+            capacity_weight: None,
+            queue_capacity: None,
         }
     }
 
@@ -567,8 +576,10 @@ mod tests {
         secret_key: &str,
     ) -> RoutingCandidate {
         RoutingCandidate {
+            backend_kind: None,
             kind: kind.to_owned(),
             name: name.to_owned(),
+            provider_model: None,
             site: site.to_owned(),
             cluster: cluster.to_owned(),
             fresh: true,
@@ -587,6 +598,9 @@ mod tests {
             score_breakdown: None,
             rank: None,
             selection_group: None,
+            traffic_weight: None,
+            capacity_weight: None,
+            queue_capacity: None,
         }
     }
 

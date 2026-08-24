@@ -35,7 +35,9 @@ use crate::{
     error::OperatorError,
     resources::{
         consumer_config::{self, ConsumerConfigError},
-        overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
+        overlay_envelope,
+        placement::PlacementState,
+        provider_metrics, routing_overlay, secret,
         trust_bundle::{self, CertPemStatus},
     },
     swim::{MemberStatus, MembershipSnapshot},
@@ -79,11 +81,8 @@ pub struct OperatorCtx {
     /// wrapping `Arc`; the inner [`Mutex`] ensures safe concurrent access.
     pub(crate) metrics_cache: Mutex<provider_metrics::MetricsCache>,
 
-    /// Stateful admission memory keyed by provider routing identity.
-    ///
-    /// Admission is evaluated in the control plane and the resulting wire
-    /// state is copied into the overlay. It is never consulted by a request.
-    pub(crate) admission_memory: Mutex<provider_admission::AdmissionMemory>,
+    /// Cross-reconcile pressure-placement state, keyed by `GridNetwork` name.
+    pub(crate) placement_states: std::sync::Mutex<HashMap<String, PlacementState>>,
 
     /// Tracks the seed set announced on the last reconcile per `GridNetwork`.
     ///
@@ -108,7 +107,7 @@ impl OperatorCtx {
             client,
             swim,
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
-            admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
+            placement_states: std::sync::Mutex::new(HashMap::new()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -386,7 +385,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &remote_crdt_providers,
         &raw_metrics,
         &scoring_weights,
-        &admission_states,
+        &ctx.placement_states,
     )
     .await?;
 
@@ -810,7 +809,7 @@ async fn reconcile_routing_overlay_inner(
     remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
     scoring_weights: &scoring::ScoringWeights,
-    admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
+    placement_states: &std::sync::Mutex<HashMap<String, PlacementState>>,
 ) -> Result<(Vec<ConsumerConfigStatus>, Vec<OverlayRevisionStatus>), OperatorError> {
     let network_name = grid_network_name(network)?;
 
@@ -854,17 +853,23 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let overlay = match routing_overlay::render_routing_overlay_with_admission(
-            network,
-            &sites,
-            providers,
-            &eligible_remote_owned,
-            local_site,
-            metrics_arg,
-            timestamp.as_deref(),
-            scoring_weights,
-            Some(admission_states),
-        ) {
+        let render_result = {
+            let mut placement_guard = placement_states
+                .lock()
+                .map_err(|error| OperatorError::InvalidResource(format!("placement state lock poisoned: {error}")))?;
+            routing_overlay::render_routing_overlay_with_placement_state(
+                network,
+                &sites,
+                providers,
+                &eligible_remote_owned,
+                local_site,
+                metrics_arg,
+                timestamp.as_deref(),
+                scoring_weights,
+                placement_guard.entry(network_name.to_owned()).or_default(),
+            )
+        };
+        let overlay = match render_result {
             Ok(overlay) => overlay,
             Err(error) => {
                 tracing::warn!(
@@ -1430,12 +1435,22 @@ fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&Mem
     {
         return hint;
     }
-    // Existing static phase logic (no live membership yet).
+    // No live phase hint. `phase_hint` returns `Some` only when at least one
+    // Alive/Degraded peer exists, so we reach here when the network has no peers
+    // yet — either the SWIM runtime is not up (`membership` is `None`) or it is
+    // up but no peers have joined (`Some`, empty snapshot).
     let has_tls = network.spec.tls.ca_secret_ref.is_some();
-    if has_tls {
-        GridNetworkPhase::Initializing
+    if !has_tls {
+        return GridNetworkPhase::Pending;
+    }
+    // A single-site / combined deployment legitimately has zero SWIM peers.
+    // When no seeds are configured, a running SWIM runtime with TLS trust
+    // material is locally operational and reports Active. Peer connectivity is
+    // reported separately in status.connectedSites.
+    if membership.is_some() && network.spec.seeds.is_empty() {
+        GridNetworkPhase::Active
     } else {
-        GridNetworkPhase::Pending
+        GridNetworkPhase::Initializing
     }
 }
 
@@ -1514,6 +1529,12 @@ fn provider_state_from_kube(
         provider_id: provider_id.to_owned(),
         routing_cluster,
         models,
+        capacity_weight: provider.spec.capacity_weight,
+        queue_capacity: provider
+            .spec
+            .metrics_config
+            .as_ref()
+            .and_then(|metrics| metrics.queue_capacity),
         backend_kind: provider.spec.backend_kind.clone(),
         phase,
         metrics: metrics_to_crdt(metrics),
@@ -2654,14 +2675,43 @@ mod tests {
 
     #[test]
     fn determine_phase_empty_snapshot_preserves_tls_logic() {
-        let network = base_network();
+        let mut network = base_network();
+        network.spec.tls.ca_secret_ref = Some(crate::crd::grid_network::SecretRef {
+            name: "ca".to_owned(),
+            namespace: "default".to_owned(),
+            key: None,
+        });
         let empty = MembershipSnapshot::default();
         let phase = determine_phase(&network, "some-id", Some(&empty));
-        assert_eq!(
-            phase,
-            GridNetworkPhase::Pending,
-            "empty snapshot must fall through to existing phase logic"
-        );
+        assert_eq!(phase, GridNetworkPhase::Active);
+    }
+
+    #[test]
+    fn determine_phase_standalone_single_site_reaches_active() {
+        let mut network = base_network();
+        network.spec.tls.ca_secret_ref = Some(crate::crd::grid_network::SecretRef {
+            name: "ca".to_owned(),
+            namespace: "default".to_owned(),
+            key: None,
+        });
+        network.spec.seeds.clear();
+        let empty = MembershipSnapshot::default();
+        let phase = determine_phase(&network, "some-id", Some(&empty));
+        assert_eq!(phase, GridNetworkPhase::Active);
+    }
+
+    #[test]
+    fn determine_phase_seeded_but_peerless_stays_initializing() {
+        let mut network = base_network();
+        network.spec.tls.ca_secret_ref = Some(crate::crd::grid_network::SecretRef {
+            name: "ca".to_owned(),
+            namespace: "default".to_owned(),
+            key: None,
+        });
+        network.spec.seeds = vec!["grid.peer:7946".to_owned()];
+        let empty = MembershipSnapshot::default();
+        let phase = determine_phase(&network, "some-id", Some(&empty));
+        assert_eq!(phase, GridNetworkPhase::Initializing);
     }
 
     #[test]
@@ -2730,6 +2780,8 @@ mod tests {
             provider_id: provider_id.to_owned(),
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
+            capacity_weight: None,
+            queue_capacity: None,
             backend_kind: "local".to_owned(),
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
@@ -2750,6 +2802,8 @@ mod tests {
             provider_id: provider_id.to_owned(),
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
+            capacity_weight: None,
+            queue_capacity: None,
             backend_kind: "local".to_owned(),
             phase,
             metrics: crdt::ProviderMetricsSnapshot::default(),
@@ -3100,6 +3154,8 @@ mod tests {
             provider_id: "prov-1".to_owned(),
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
+            capacity_weight: None,
+            queue_capacity: None,
             backend_kind: "remote".to_owned(),
             phase,
             metrics: crdt::ProviderMetricsSnapshot::default(),
@@ -4763,6 +4819,8 @@ mod tests {
             provider_id: "prov".to_owned(),
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
+            capacity_weight: None,
+            queue_capacity: None,
             backend_kind: "local".to_owned(),
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),

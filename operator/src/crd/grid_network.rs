@@ -154,6 +154,8 @@ pub enum SelectionMode {
     RoundRobin,
     /// Distribute new requests randomly in the active group.
     Random,
+    /// Select according to explicit provider placement weights.
+    WeightedRandom,
 }
 
 /// Request selection policy published in the routing overlay.
@@ -163,6 +165,97 @@ pub enum SelectionMode {
 pub struct SelectionPolicyConfig {
     /// Local selection mode used by the data-plane gateway.
     pub mode: SelectionMode,
+}
+
+/// Strategy used to produce explicit traffic weights within eligible groups.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlacementStrategy {
+    /// Give every eligible provider the same weight.
+    #[default]
+    Equal,
+    /// Use each provider's configured capacity weight.
+    Static,
+    /// Convert one fresh llm-d pressure signal into bounded weights.
+    PressureWeighted,
+}
+
+/// llm-d pressure signal used by pressure-weighted placement.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PressureSignal {
+    /// Normalized queue depth from the provider EPP metrics endpoint.
+    QueueDepth,
+    /// Normalized KV-cache utilization from the provider EPP metrics endpoint.
+    KvCachePressure,
+}
+
+/// Parameters for pressure-weighted placement.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PressureWeightedConfig {
+    /// The single typed pressure signal to consume.
+    pub signal: PressureSignal,
+
+    /// Lowest positive published weight.
+    #[schemars(range(min = 1, max = 1000))]
+    #[serde(default = "default_minimum_weight")]
+    pub minimum_weight: u32,
+
+    /// Highest published weight.
+    #[schemars(range(min = 1, max = 1000))]
+    #[serde(default = "default_maximum_weight")]
+    pub maximum_weight: u32,
+
+    /// Minimum inverse-pressure availability as a percentage.
+    #[schemars(range(min = 1, max = 100))]
+    #[serde(default = "default_availability_floor_percent")]
+    pub availability_floor_percent: u32,
+
+    /// EWMA factor in the inclusive range `(0, 1]`.
+    #[schemars(range(min = 0.000_001, max = 1.0))]
+    #[serde(default = "default_smoothing_factor")]
+    pub smoothing_factor: f64,
+
+    /// Minimum percentage change before a new effective weight is published.
+    #[schemars(range(min = 0, max = 100))]
+    #[serde(default = "default_change_threshold_percent")]
+    pub change_threshold_percent: u32,
+}
+
+/// Default lower bound for published weights.
+fn default_minimum_weight() -> u32 {
+    1
+}
+/// Default upper bound for published weights.
+fn default_maximum_weight() -> u32 {
+    1000
+}
+/// Default minimum inverse-pressure availability.
+fn default_availability_floor_percent() -> u32 {
+    5
+}
+/// Default EWMA smoothing factor.
+fn default_smoothing_factor() -> f64 {
+    0.35
+}
+/// Default minimum material change threshold.
+fn default_change_threshold_percent() -> u32 {
+    5
+}
+
+/// Explicit provider placement configuration.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PlacementPolicyConfig {
+    /// Strategy used to produce traffic weights.
+    pub strategy: PlacementStrategy,
+
+    /// Parameters required by `pressureWeighted`; absent for other strategies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_weighted: Option<PressureWeightedConfig>,
 }
 
 /// Resolve the effective [`scoring::ScoringWeights`] from a scoring policy.
@@ -560,6 +653,10 @@ pub struct GridNetworkSpec {
     /// selection override and Praxis uses deterministic selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_policy: Option<SelectionPolicyConfig>,
+
+    /// Optional explicit traffic-placement policy for weighted selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_policy: Option<PlacementPolicyConfig>,
 
     /// Maximum time between metric refreshes and score/ranking recalculation.
     ///
@@ -1966,9 +2063,19 @@ mod tests {
             Some(SelectionMode::RoundRobin)
         );
 
-        let result = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
+        let weighted: GridNetworkSpec = serde_json::from_value(serde_json::json!({
             "seeds": [],
             "selectionPolicy": { "mode": "weightedRandom" }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            weighted.selection_policy.map(|policy| policy.mode),
+            Some(SelectionMode::WeightedRandom)
+        );
+
+        let result = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
+            "seeds": [],
+            "selectionPolicy": { "mode": "not-a-mode" }
         }));
         let Err(error) = result else {
             std::process::abort();

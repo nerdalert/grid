@@ -3,7 +3,9 @@
 For the complete relationship between scoring, routing groups, and request-time
 selection, see [Provider Selection and Load Balancing](provider-selection-and-load-balancing.md).
 Scores influence candidate ordering; they are not traffic weights and do not
-split selection groups.
+split selection groups. Unequal provider distribution requires the explicit
+`weightedRandom` selection mode and placement policy documented in the provider
+selection guide; it is never inferred from a score.
 
 Grid scores provider pools when the operator renders a Praxis routing overlay.
 Praxis reads that overlay from memory at request time; it does not call Grid,

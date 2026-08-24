@@ -56,7 +56,31 @@
           "properties": {
             "mode": {
               "type": "string",
-              "enum": ["deterministic", "roundRobin", "random"]
+              "enum": ["deterministic", "roundRobin", "random", "weightedRandom"]
+            }
+          }
+        },
+        "placementPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy"],
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": ["equal", "static", "pressureWeighted"]
+            },
+            "pressureWeighted": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["signal"],
+              "properties": {
+                "signal": { "type": "string", "enum": ["queueDepth", "kvCachePressure"] },
+                "minimumWeight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                "maximumWeight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                "availabilityFloorPercent": { "type": "integer", "minimum": 1, "maximum": 100 },
+                "smoothingFactor": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+                "changeThresholdPercent": { "type": "integer", "minimum": 0, "maximum": 100 }
+              }
             }
           }
         },
@@ -95,7 +119,117 @@
             }
           }
         }
-      }
+      },
+      "allOf": [
+          {
+            "if": {
+              "required": ["selectionPolicy"],
+              "properties": {
+                "selectionPolicy": {
+                  "properties": {
+                    "mode": { "const": "weightedRandom" }
+                  },
+                  "required": ["mode"]
+                }
+              }
+            },
+            "then": { "required": ["placementPolicy"] }
+          },
+          {
+            "if": { "required": ["placementPolicy"] },
+            "then": {
+              "properties": {
+                "selectionPolicy": {
+                  "required": ["mode"],
+                  "properties": { "mode": { "const": "weightedRandom" } }
+                }
+              },
+              "required": ["selectionPolicy"]
+            }
+          },
+          {
+            "if": {
+              "required": ["placementPolicy"],
+              "properties": {
+                "placementPolicy": {
+                  "properties": { "strategy": { "const": "pressureWeighted" } }
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "placementPolicy": { "required": ["pressureWeighted"] }
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["placementPolicy"],
+              "properties": {
+                "placementPolicy": {
+                  "properties": {
+                    "strategy": { "enum": ["equal", "static"] }
+                  }
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "placementPolicy": {
+                  "not": { "required": ["pressureWeighted"] }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["placementPolicy"],
+              "properties": {
+                "placementPolicy": {
+                  "properties": {
+                    "strategy": { "const": "pressureWeighted" },
+                    "pressureWeighted": {
+                      "properties": { "signal": { "const": "queueDepth" } }
+                    }
+                  }
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "scoringPolicy": {
+                  "required": ["strategy"],
+                  "properties": { "strategy": { "const": "queueDepth" } }
+                }
+              },
+              "required": ["scoringPolicy"]
+            }
+          },
+          {
+            "if": {
+              "required": ["placementPolicy"],
+              "properties": {
+                "placementPolicy": {
+                  "properties": {
+                    "strategy": { "const": "pressureWeighted" },
+                    "pressureWeighted": {
+                      "properties": { "signal": { "const": "kvCachePressure" } }
+                    }
+                  }
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "scoringPolicy": {
+                  "required": ["strategy"],
+                  "properties": { "strategy": { "const": "kvCachePressure" } }
+                }
+              },
+              "required": ["scoringPolicy"]
+            }
+          }
+        ]
     },
     "gridSite": {
       "type": "object",
@@ -121,7 +255,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": ["name", "gridNetworkRef", "providerKind", "backendKind", "endpoint"],
         "properties": {
           "name": { "type": "string", "minLength": 1 },
@@ -129,7 +263,15 @@
           "providerKind": { "type": "string", "minLength": 1 },
           "backendKind": { "type": "string", "minLength": 1 },
           "endpoint": { "type": "string", "minLength": 1 },
-          "routingClusterRef": { "type": "string" }
+          "routingClusterRef": { "type": "string" },
+          "capacityWeight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+          "siteSelector": { "type": "object", "additionalProperties": true },
+          "accessPolicy": { "type": "object", "additionalProperties": true },
+          "models": { "type": "array" },
+          "auth": { "type": "object", "additionalProperties": true },
+          "cost": { "type": "object", "additionalProperties": true },
+          "healthCheck": { "type": "object", "additionalProperties": true },
+          "metricsConfig": { "type": "object", "additionalProperties": true }
         }
       }
     },

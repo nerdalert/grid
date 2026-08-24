@@ -3,12 +3,20 @@
 {{- $configuredSelectionPolicy := .Values.gridNetwork.selectionPolicy }}
 {{- $existingSelectionPolicy := dig "spec" "selectionPolicy" nil $existing }}
 {{- $selectionPolicy := $configuredSelectionPolicy }}
+{{- $placementPolicy := .Values.gridNetwork.placementPolicy }}
 {{- if not $selectionPolicy }}
   {{- if $existingSelectionPolicy }}
     {{- $selectionPolicy = $existingSelectionPolicy }}
   {{- else if not $existing }}
     {{- $selectionPolicy = dict "mode" "roundRobin" }}
   {{- end }}
+{{- end }}
+{{- $selectionMode := dig "mode" "" $selectionPolicy }}
+{{- if and $placementPolicy (ne $selectionMode "weightedRandom") }}
+{{- fail "gridNetwork.placementPolicy requires gridNetwork.selectionPolicy.mode=weightedRandom" }}
+{{- end }}
+{{- if and (eq $selectionMode "weightedRandom") (not $placementPolicy) }}
+{{- fail "gridNetwork.selectionPolicy.mode=weightedRandom requires gridNetwork.placementPolicy" }}
 {{- end }}
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: GridNetwork
@@ -44,6 +52,16 @@ spec:
   {{- if .mode }}
   selectionPolicy:
     mode: {{ .mode | quote }}
+  {{- end }}
+  {{- with $placementPolicy }}
+  {{- if .strategy }}
+  placementPolicy:
+    strategy: {{ .strategy | quote }}
+    {{- with .pressureWeighted }}
+    pressureWeighted:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  {{- end }}
   {{- end }}
   {{- end }}
   {{- with .Values.gridNetwork.metricsRefreshInterval }}

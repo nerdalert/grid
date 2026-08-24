@@ -34,6 +34,9 @@ spec:
   cost:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with .capacityWeight }}
+  capacityWeight: {{ . }}
+  {{- end }}
   {{- with .healthCheck }}
   healthCheck:
     {{- toYaml . | nindent 4 }}

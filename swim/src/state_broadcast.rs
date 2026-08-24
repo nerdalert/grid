@@ -753,6 +753,7 @@ mod tests {
                 queue_depth: Some(queue_depth),
                 ..ProviderMetricsSnapshot::default()
             },
+            capacity_weight: None,
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision,
             writer_id: site.to_owned(),

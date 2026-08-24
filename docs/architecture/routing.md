@@ -33,7 +33,7 @@ llm-d / EPP / inference backend
 Grid does not proxy traffic. It writes the overlay used by Praxis filters.
 
 For the complete provider-selection model, including selection groups and the
-`deterministic`, `roundRobin`, and `random` modes, see [Provider Selection
+`deterministic`, `roundRobin`, `random`, and explicit `weightedRandom` modes, see [Provider Selection
 and Load Balancing](provider-selection-and-load-balancing.md). Routing policy
 defines candidate ordering and hard group boundaries; selection policy controls
 request distribution within the first viable group.
