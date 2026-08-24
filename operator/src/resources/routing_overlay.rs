@@ -1013,8 +1013,12 @@ fn enrich_candidates(
     admission_map: &HashMap<String, AdmissionState>,
 ) {
     for c in candidates.iter_mut() {
-        c.stable_id = Some(super::geography::compute_stable_id(
-            &c.kind, &c.name, &c.site, &c.cluster,
+        c.stable_id = Some(super::geography::compute_candidate_stable_id(
+            &c.kind,
+            &c.name,
+            &c.site,
+            &c.cluster,
+            c.provider_model.as_deref(),
         ));
         c.selection_tier = Some(super::geography::derive_locality_tier(
             local_site,
@@ -1318,9 +1322,10 @@ fn apply_traffic_weights(
 /// without `metricsConfig` are omitted from the map and score on static
 /// signals only.
 ///
-/// Exact duplicates — same `(kind, name, site, cluster)` — are removed.
-/// Two providers that serve the same model on the same site but with
-/// different cluster identifiers are **not** deduplicated.
+/// Exact duplicates — the same route stable ID — are removed. A translated
+/// provider model contributes to the stable ID, so a local and cloud route
+/// may share a logical model, site, and provider gateway without one
+/// replacing the other.
 ///
 /// # Errors
 ///
@@ -1468,7 +1473,7 @@ pub(crate) fn render_routing_overlay_with_placement_state(
             });
         },
     }
-    candidates.dedup_by(|a, b| a.kind == b.kind && a.name == b.name && a.site == b.site && a.cluster == b.cluster);
+    candidates.dedup_by(|a, b| a.stable_id == b.stable_id);
 
     for (i, candidate) in candidates.iter_mut().enumerate() {
         #[expect(
@@ -7338,6 +7343,64 @@ mod tests {
 
         assert_eq!(overlay.candidates[0].name, "chat-default");
         assert_eq!(overlay.candidates[0].provider_model.as_deref(), Some("qwen2.5-3b"));
+    }
+
+    #[test]
+    fn translated_route_same_logical_model_keeps_local_candidate() {
+        let network = test_network("net");
+        let mut local = test_provider_with_backend_kind_and_phase("provider-a", "net", "local", "Available");
+        local.spec.routing_cluster_ref = Some("provider-a".to_owned());
+        local.spec.models[0].name = "Qwen/Qwen2.5-3B-Instruct".to_owned();
+        local.spec.models[0].logical_name = Some("chat-default".to_owned());
+
+        let mut cloud = test_provider_with_backend_kind_and_phase("openai-a", "net", "api_provider", "Available");
+        cloud.spec.routing_cluster_ref = Some("provider-a".to_owned());
+        cloud.spec.models[0].name = "gpt-4o-mini".to_owned();
+        cloud.spec.models[0].logical_name = Some("chat-default".to_owned());
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[local, cloud],
+            &[],
+            "provider-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            overlay.candidates.len(),
+            2,
+            "local and translated cloud routes must coexist"
+        );
+        assert_eq!(
+            overlay
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.provider_model.as_deref() == Some("Qwen/Qwen2.5-3B-Instruct"))
+                .count(),
+            1,
+            "the local route must remain present"
+        );
+        assert_eq!(
+            overlay
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.provider_model.as_deref() == Some("gpt-4o-mini"))
+                .count(),
+            1,
+            "the translated cloud route must remain present"
+        );
+        assert_ne!(
+            overlay.candidates[0].stable_id, overlay.candidates[1].stable_id,
+            "provider-route identities must differ for local and translated routes"
+        );
+        assert_ne!(
+            overlay.candidates[0].selection_group, overlay.candidates[1].selection_group,
+            "local and cloud routes must remain separate preference groups"
+        );
     }
 
     #[test]
