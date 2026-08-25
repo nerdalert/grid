@@ -54,11 +54,14 @@ goal:
 | Randomize selection inside the preferred provider group | Either | Any | `random` |
 | Distribute by explicit provider capacity | `scoreFirst` | `noMetrics` | `weightedRandom` |
 
-The three policy fields answer different questions:
+The policy fields answer different questions:
 
-- `routingPolicy`: Which providers belong in the same active or fallback group?
+- `routingPolicy`: How are candidates ordered and how are active/fallback
+  priority groups formed by default?
 - `scoringPolicy`: How should providers be ranked using available metrics?
-- `selectionPolicy`: How should Praxis choose within the active group?
+- `selectionPolicy.grouping`: Which eligible locality tiers may participate in
+  one active group?
+- `selectionPolicy.mode`: How should Praxis choose within the active group?
 
 ## The decision sequence
 
@@ -107,7 +110,9 @@ selected. Neither scoring nor a selection mode can override these states.
 ## Routing policy and groups
 
 `spec.routingPolicy` controls candidate ordering and hard priority boundaries.
-The supported values are `geographyFirst` and `scoreFirst`.
+The supported values are `geographyFirst` and `scoreFirst`. An optional
+`selectionPolicy.grouping.localityScope` can deliberately widen the locality
+bucket used for active-set membership without changing site identity.
 
 ### `geographyFirst`
 
@@ -134,6 +139,44 @@ share one active group. Score differences affect order, not group membership.
 
 In plain language: allow fresh admitted providers across sites to participate
 in the same active traffic group.
+
+### Explicit locality grouping
+
+Use `selectionPolicy.grouping.localityScope` when distinct provider sites are
+intended to share active traffic. This is separate from the selection mode and
+from provider scoring:
+
+```yaml
+spec:
+  routingPolicy: geographyFirst
+  scoringPolicy:
+    strategy: noMetrics
+  selectionPolicy:
+    mode: weightedRandom
+    grouping:
+      localityScope: sameRegion
+```
+
+Supported scopes are:
+
+| Scope | Active locality bucket |
+|---|---|
+| `sameSite` | Preserve the legacy same-site boundary |
+| `sameZone` | Same-site and same-zone candidates may share a group |
+| `sameRegion` | Same-site, same-zone, and same-region candidates may share a group |
+| `anyEligible` | Locality does not split eligible candidates |
+
+The grouping policy is applied after capability matching, authorization,
+health, freshness, and admission. It never re-admits an `existingOnly`
+candidate, and it never merges different capabilities. Backend-class
+boundaries remain independent: local/remote candidates can share the selected
+locality bucket while `api_provider` and `cloud_managed` candidates remain in
+later overflow groups.
+
+Sites, stable IDs, provider gateways, metrics, and admission state remain
+distinct. The policy changes only active-set membership. Traffic weights then
+control distribution inside the resulting group, and Praxis still selects from
+the accepted immutable overlay without a request-time Grid call.
 
 ## Scoring policy
 
@@ -176,6 +219,7 @@ For detailed metric input and normalization, see [Provider Scoring](scoring.md).
 
 ## Selection policy
 
+`spec.selectionPolicy.grouping` controls active-set membership and
 `spec.selectionPolicy.mode` controls request-time selection inside the first
 viable group. The selection mode is applied from an accepted in-memory
 snapshot by Praxis; Grid is not called for each request.
@@ -437,8 +481,10 @@ explicitly provides it.
 
 ## Overlay contract and weighted placement
 
-`selectionPolicy` is optional in both the Grid API and the overlay. An omitted
-field remains omitted, and Praxis interprets it as deterministic selection.
+`selectionPolicy` and its nested `grouping` policy are optional in both the
+Grid API and the overlay. An omitted grouping field preserves legacy grouping
+exactly. An omitted selection policy remains omitted, and Praxis interprets it
+as deterministic selection.
 The Helm chart explicitly renders `roundRobin` by default. Users applying a
 `GridNetwork` directly can either set the selection mode explicitly or omit the policy
 to select `deterministic`.

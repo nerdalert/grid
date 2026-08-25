@@ -399,6 +399,27 @@ capability, access policy, freshness, phase filters). It does not override
 data-residency or sovereignty constraints; those must be enforced separately
 before candidates reach the ordering phase.
 
+After ordering, Grid assigns contiguous `selection_group` values. By default,
+`geographyFirst` keeps each locality tier as a hard group boundary and
+`scoreFirst` omits locality from that boundary. An optional
+`spec.selectionPolicy.grouping.localityScope` can explicitly widen the active
+set while retaining truthful site identity:
+
+```yaml
+selectionPolicy:
+  mode: weightedRandom
+  grouping:
+    localityScope: sameRegion
+```
+
+`sameSite`, `sameZone`, `sameRegion`, and `anyEligible` are supported. The
+grouping scope affects only locality bucket membership. Admission, capability,
+authorization, freshness, and backend-class boundaries remain independent;
+`existing_only` providers cannot receive new weighted traffic, and API/cloud
+providers remain in overflow groups. `traffic_weight` and the selection mode
+apply only inside the selected active group. Omitting `grouping` preserves the
+legacy grouping behavior exactly.
+
 ### Admission state derivation
 
 When `spec.admissionPolicy` is omitted, admission preserves the legacy

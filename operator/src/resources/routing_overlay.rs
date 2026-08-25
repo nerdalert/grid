@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     crd::{
         auth::{AccessPolicy, AuthStrategy},
-        grid_network::GridNetwork,
+        grid_network::{GridNetwork, LocalityGroupingScope},
         grid_site::GridSite,
         inference_provider::{InferenceProvider, ProviderPhase},
     },
@@ -1026,12 +1026,20 @@ fn enrich_candidates(
             sites,
             network_name,
         ));
-        c.admission_state = Some(
+        // Queue-pressure admission describes capacity of the local serving
+        // backend. A translated/elastic candidate (for example an OpenAI
+        // route with provider_model) must not inherit the local gateway's
+        // pressure state through routingClusterRef; it is the fallback that
+        // receives new traffic when the local candidate is saturated.
+        let elastic_overflow = matches!(c.backend_kind.as_deref(), Some("api_provider" | "cloud_managed"));
+        c.admission_state = Some(if elastic_overflow {
+            AdmissionState::NewAndExisting
+        } else {
             admission_map
                 .get(c.cluster.as_str())
                 .copied()
-                .unwrap_or(AdmissionState::NewAndExisting),
-        );
+                .unwrap_or(AdmissionState::NewAndExisting)
+        });
     }
 }
 
@@ -1094,11 +1102,30 @@ struct GroupState {
     /// Freshness boundary for the previous candidate.
     fresh: bool,
     /// Locality boundary for the previous candidate.
-    tier: LocalityTier,
+    tier: Option<LocalityTier>,
     /// Backend class boundary for preferred versus overflow providers.
     backend_kind: Option<String>,
     /// Group assigned to the previous candidate.
     group: u32,
+}
+
+/// Collapse locality tiers according to the explicitly requested grouping
+/// scope. `None` is the legacy identity mapping; `AnyEligible` removes the
+/// locality boundary entirely. The returned bucket remains monotonic so the
+/// existing single sorted pass stays deterministic and transitive.
+fn locality_group_bucket(tier: LocalityTier, scope: Option<LocalityGroupingScope>) -> Option<LocalityTier> {
+    match scope {
+        None | Some(LocalityGroupingScope::SameSite) => Some(tier),
+        Some(LocalityGroupingScope::SameZone) => Some(match tier {
+            LocalityTier::SameSite | LocalityTier::SameZone => LocalityTier::SameZone,
+            other => other,
+        }),
+        Some(LocalityGroupingScope::SameRegion) => Some(match tier {
+            LocalityTier::SameSite | LocalityTier::SameZone | LocalityTier::SameRegion => LocalityTier::SameRegion,
+            other => other,
+        }),
+        Some(LocalityGroupingScope::AnyEligible) => None,
+    }
 }
 
 /// Assign zero-based contiguous groups for each capability.
@@ -1106,12 +1133,19 @@ struct GroupState {
     clippy::too_many_lines,
     reason = "The two routing policies are explicit at this contract boundary."
 )]
-fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::crd::grid_network::RoutingPolicy) {
+fn assign_selection_groups(
+    candidates: &mut [RoutingCandidate],
+    policy: crate::crd::grid_network::RoutingPolicy,
+    grouping_scope: Option<LocalityGroupingScope>,
+) {
     let mut last_by_capability: HashMap<(String, String), GroupState> = HashMap::new();
     for candidate in candidates {
         let key = (candidate.kind.clone(), candidate.name.clone());
         let admission = candidate.admission_state.unwrap_or(AdmissionState::NewAndExisting);
-        let tier = candidate.selection_tier.unwrap_or(LocalityTier::Unknown);
+        let tier = locality_group_bucket(
+            candidate.selection_tier.unwrap_or(LocalityTier::Unknown),
+            grouping_scope,
+        );
         let backend_kind = candidate.backend_kind.clone();
         let next = match last_by_capability.get(&key) {
             Some(last) => {
@@ -1509,13 +1543,16 @@ pub(crate) fn render_routing_overlay_with_placement_state(
         }
     }
 
-    assign_selection_groups(&mut candidates, policy);
-
     // Preserve omission for existing GridNetwork resources. New Helm
     // installations resolve their round-robin default in chart values, while
     // an upgraded resource without this field must retain deterministic
     // Praxis compatibility behavior.
     let selection_policy = network.spec.selection_policy.clone();
+    let grouping_scope = selection_policy
+        .as_ref()
+        .and_then(|selection| selection.grouping.as_ref())
+        .map(|grouping| grouping.locality_scope);
+    assign_selection_groups(&mut candidates, policy, grouping_scope);
     apply_traffic_weights(
         &mut candidates,
         selection_policy.as_ref(),
@@ -2016,7 +2053,11 @@ mod tests {
                 0.8,
             ),
         ];
-        assign_selection_groups(&mut candidates, crate::crd::grid_network::RoutingPolicy::GeographyFirst);
+        assign_selection_groups(
+            &mut candidates,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            None,
+        );
         assert_eq!(candidates[0].selection_group, Some(0));
         assert_eq!(candidates[1].selection_group, Some(0));
     }
@@ -2060,6 +2101,7 @@ mod tests {
         }
         let selection = crate::crd::grid_network::SelectionPolicyConfig {
             mode: crate::crd::grid_network::SelectionMode::WeightedRandom,
+            grouping: None,
         };
         let placement = crate::crd::grid_network::PlacementPolicyConfig {
             strategy: crate::crd::grid_network::PlacementStrategy::Static,
@@ -2143,7 +2185,11 @@ mod tests {
                 0.2,
             ),
         ];
-        assign_selection_groups(&mut candidates, crate::crd::grid_network::RoutingPolicy::GeographyFirst);
+        assign_selection_groups(
+            &mut candidates,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            None,
+        );
         assert_eq!(
             candidates.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
             vec![Some(0), Some(1), Some(2)]
@@ -2172,7 +2218,11 @@ mod tests {
                 0.1,
             ),
         ];
-        assign_selection_groups(&mut geography, crate::crd::grid_network::RoutingPolicy::GeographyFirst);
+        assign_selection_groups(
+            &mut geography,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            None,
+        );
         assert_eq!(
             geography.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
             vec![Some(0), Some(0)]
@@ -2198,11 +2248,246 @@ mod tests {
                 0.1,
             ),
         ];
-        assign_selection_groups(&mut score_first, crate::crd::grid_network::RoutingPolicy::ScoreFirst);
+        assign_selection_groups(
+            &mut score_first,
+            crate::crd::grid_network::RoutingPolicy::ScoreFirst,
+            None,
+        );
         assert_eq!(
             score_first.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
             vec![Some(0), Some(0)]
         );
+    }
+
+    #[test]
+    fn explicit_locality_scopes_collapse_only_the_requested_tiers() {
+        use crate::crd::grid_network::LocalityGroupingScope;
+
+        let base = || {
+            vec![
+                group_candidate(
+                    "model-a",
+                    "site-a",
+                    "cluster-a",
+                    AdmissionState::NewAndExisting,
+                    LocalityTier::SameSite,
+                    true,
+                    0.8,
+                ),
+                group_candidate(
+                    "model-a",
+                    "site-b",
+                    "cluster-b",
+                    AdmissionState::NewAndExisting,
+                    LocalityTier::SameZone,
+                    true,
+                    0.7,
+                ),
+                group_candidate(
+                    "model-a",
+                    "site-c",
+                    "cluster-c",
+                    AdmissionState::NewAndExisting,
+                    LocalityTier::SameRegion,
+                    true,
+                    0.6,
+                ),
+                group_candidate(
+                    "model-a",
+                    "site-d",
+                    "cluster-d",
+                    AdmissionState::NewAndExisting,
+                    LocalityTier::CrossRegion,
+                    true,
+                    0.5,
+                ),
+            ]
+        };
+
+        let mut same_site = base();
+        assign_selection_groups(
+            &mut same_site,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            Some(LocalityGroupingScope::SameSite),
+        );
+        assert_eq!(
+            same_site.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2), Some(3)]
+        );
+
+        let mut same_zone = base();
+        assign_selection_groups(
+            &mut same_zone,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            Some(LocalityGroupingScope::SameZone),
+        );
+        assert_eq!(
+            same_zone.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
+            [Some(0), Some(0), Some(1), Some(2)]
+        );
+
+        let mut same_region = base();
+        assign_selection_groups(
+            &mut same_region,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            Some(LocalityGroupingScope::SameRegion),
+        );
+        assert_eq!(
+            same_region.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
+            [Some(0), Some(0), Some(0), Some(1)]
+        );
+
+        let mut any = base();
+        assign_selection_groups(
+            &mut any,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            Some(LocalityGroupingScope::AnyEligible),
+        );
+        assert_eq!(
+            any.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
+            [Some(0), Some(0), Some(0), Some(0)]
+        );
+    }
+
+    #[test]
+    fn omitted_grouping_preserves_geography_first_and_score_first_contracts() {
+        use crate::crd::grid_network::LocalityGroupingScope;
+
+        let mut legacy = vec![
+            group_candidate(
+                "model-a",
+                "site-a",
+                "cluster-a",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                0.8,
+            ),
+            group_candidate(
+                "model-a",
+                "site-b",
+                "cluster-b",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameZone,
+                true,
+                0.7,
+            ),
+        ];
+        let mut explicit_same_site = legacy.clone();
+        assign_selection_groups(
+            &mut legacy,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            None,
+        );
+        assign_selection_groups(
+            &mut explicit_same_site,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            Some(LocalityGroupingScope::SameSite),
+        );
+        assert_eq!(
+            legacy.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
+            explicit_same_site.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn same_region_preserves_backend_boundary_and_admission() {
+        use crate::crd::grid_network::LocalityGroupingScope;
+
+        let mut candidates = vec![
+            group_candidate(
+                "model-a",
+                "east",
+                "east",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                0.8,
+            ),
+            group_candidate(
+                "model-a",
+                "west",
+                "west",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameRegion,
+                true,
+                0.8,
+            ),
+            group_candidate(
+                "model-a",
+                "cloud",
+                "cloud",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameRegion,
+                true,
+                0.8,
+            ),
+        ];
+        candidates[0].backend_kind = Some("local".to_owned());
+        candidates[1].backend_kind = Some("local".to_owned());
+        candidates[2].backend_kind = Some("api_provider".to_owned());
+        candidates[1].stable_id = Some("west-stable".to_owned());
+        candidates[2].stable_id = Some("cloud-stable".to_owned());
+        assign_selection_groups(
+            &mut candidates,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            Some(LocalityGroupingScope::SameRegion),
+        );
+        assert_eq!(candidates[0].selection_group, Some(0));
+        assert_eq!(candidates[1].selection_group, Some(0));
+        assert_eq!(candidates[2].selection_group, Some(1));
+
+        candidates[1].admission_state = Some(AdmissionState::ExistingOnly);
+        assign_selection_groups(
+            &mut candidates,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            Some(LocalityGroupingScope::SameRegion),
+        );
+        assert_eq!(
+            candidates[1].selection_group,
+            Some(1),
+            "existing_only remains outside new-request group"
+        );
+        assert_ne!(candidates[0].stable_id, candidates[1].stable_id);
+    }
+
+    #[test]
+    fn same_region_grouping_is_permutation_independent() {
+        use crate::crd::grid_network::LocalityGroupingScope;
+
+        let mut ordered = vec![
+            group_candidate(
+                "model-a",
+                "site-a",
+                "cluster-a",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                0.8,
+            ),
+            group_candidate(
+                "model-a",
+                "site-b",
+                "cluster-b",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameRegion,
+                true,
+                0.7,
+            ),
+        ];
+        let mut reversed = vec![ordered[1].clone(), ordered[0].clone()];
+        assign_selection_groups(
+            &mut ordered,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            Some(LocalityGroupingScope::SameRegion),
+        );
+        assign_selection_groups(
+            &mut reversed,
+            crate::crd::grid_network::RoutingPolicy::GeographyFirst,
+            Some(LocalityGroupingScope::SameRegion),
+        );
+        assert!(ordered.iter().all(|c| c.selection_group == Some(0)));
+        assert!(reversed.iter().all(|c| c.selection_group == Some(0)));
     }
 
     fn test_site(name: &str, network: &str) -> GridSite {
@@ -7379,13 +7664,23 @@ mod tests {
         cloud.spec.models[0].name = "gpt-4o-mini".to_owned();
         cloud.spec.models[0].logical_name = Some("chat-default".to_owned());
 
+        let pressured = scoring::BackendMetrics {
+            error_rate: 0.0,
+            healthy: true,
+            kv_cache_utilization: 0.0,
+            latency_p99_ms: 0.0,
+            prefix_cache_hit_ratio: 0.0,
+            queue_depth: 1.0,
+        };
+        let metrics = HashMap::from([("provider-a", pressured)]);
+
         let overlay = render_routing_overlay(
             &network,
             &[],
             &[local, cloud],
             &[],
             "provider-a",
-            None,
+            Some(&metrics),
             None,
             &scoring::ScoringWeights::default(),
         )
@@ -7421,7 +7716,7 @@ mod tests {
                 .find(|candidate| candidate.provider_model.as_deref() == Some("Qwen/Qwen2.5-3B-Instruct"))
                 .and_then(|candidate| candidate.selection_group),
             Some(0),
-            "the local route must be the preferred group"
+            "the local backend class must remain the preferred group"
         );
         assert_ne!(
             overlay.candidates[0].stable_id, overlay.candidates[1].stable_id,
@@ -7430,6 +7725,24 @@ mod tests {
         assert_ne!(
             overlay.candidates[0].selection_group, overlay.candidates[1].selection_group,
             "local and cloud routes must remain separate preference groups"
+        );
+        assert_eq!(
+            overlay
+                .candidates
+                .iter()
+                .find(|candidate| candidate.provider_model.as_deref() == Some("Qwen/Qwen2.5-3B-Instruct"))
+                .and_then(|candidate| candidate.admission_state),
+            Some(AdmissionState::ExistingOnly),
+            "local pressure must withdraw the local candidate"
+        );
+        assert_eq!(
+            overlay
+                .candidates
+                .iter()
+                .find(|candidate| candidate.provider_model.as_deref() == Some("gpt-4o-mini"))
+                .and_then(|candidate| candidate.admission_state),
+            Some(AdmissionState::NewAndExisting),
+            "metric-less elastic overflow must remain eligible for new traffic"
         );
     }
 

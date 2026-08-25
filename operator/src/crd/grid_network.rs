@@ -158,13 +158,47 @@ pub enum SelectionMode {
     WeightedRandom,
 }
 
+/// Locality scope used to form the active provider-selection group.
+///
+/// The scope changes only the locality boundary used for grouping. It does
+/// not change site identity, stable IDs, admission, or provider weights.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalityGroupingScope {
+    /// Keep only same-site candidates in the collapsed locality bucket.
+    SameSite,
+    /// Collapse same-site and same-zone candidates into one bucket.
+    SameZone,
+    /// Collapse same-site, same-zone, and same-region candidates into one bucket.
+    SameRegion,
+    /// Do not use locality as a grouping boundary.
+    AnyEligible,
+}
+
+/// Explicit grouping policy for the active provider-selection set.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SelectionGroupingPolicy {
+    /// Locality scope used to collapse eligible candidates into an active set.
+    pub locality_scope: LocalityGroupingScope,
+}
+
 /// Request selection policy published in the routing overlay.
+///
+/// `mode` chooses within the first viable group. `grouping`, when present,
+/// controls which eligible locality tiers may share that group. These are
+/// independent from `routingPolicy`, which orders groups and candidates.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct SelectionPolicyConfig {
     /// Local selection mode used by the data-plane gateway.
     pub mode: SelectionMode,
+
+    /// Optional active-set grouping policy. Omitted preserves legacy grouping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouping: Option<SelectionGroupingPolicy>,
 }
 
 /// Strategy used to produce explicit traffic weights within eligible groups.
@@ -2081,12 +2115,50 @@ mod tests {
             std::process::abort();
         };
         assert!(error.to_string().contains("unknown variant"));
+
+        let grouped: GridNetworkSpec = serde_json::from_value(serde_json::json!({
+            "seeds": [],
+            "selectionPolicy": {
+                "mode": "weightedRandom",
+                "grouping": { "localityScope": "sameRegion" }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            grouped
+                .selection_policy
+                .and_then(|policy| policy.grouping)
+                .map(|grouping| grouping.locality_scope),
+            Some(LocalityGroupingScope::SameRegion)
+        );
+
+        let invalid_grouping = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
+            "seeds": [],
+            "selectionPolicy": {
+                "mode": "weightedRandom",
+                "grouping": { "localityScope": "sameContinent" }
+            }
+        }));
+        assert!(invalid_grouping.is_err(), "unknown locality scope must be rejected");
+
+        let unknown_grouping_field = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
+            "seeds": [],
+            "selectionPolicy": {
+                "mode": "weightedRandom",
+                "grouping": { "localityScope": "sameRegion", "unexpected": true }
+            }
+        }));
+        assert!(
+            unknown_grouping_field.is_err(),
+            "unknown grouping fields must be rejected"
+        );
     }
 
     #[test]
     fn round_robin_mode_serializes_for_explicit_policy() {
         let serialized = serde_json::to_value(&SelectionPolicyConfig {
             mode: SelectionMode::RoundRobin,
+            grouping: None,
         })
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(serialized, serde_json::json!({"mode": "roundRobin"}));

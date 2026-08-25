@@ -451,6 +451,21 @@ spec:
                     selection override and Praxis uses deterministic selection.
                   nullable: true
                   properties:
+                    grouping:
+                      description: Optional active-set locality grouping policy.
+                      nullable: true
+                      properties:
+                        localityScope:
+                          description: Locality scope used to collapse eligible candidates into an active set.
+                          enum:
+                            - sameSite
+                            - sameZone
+                            - sameRegion
+                            - anyEligible
+                          type: string
+                      required:
+                        - localityScope
+                      type: object
                     mode:
                       description: Local selection mode used by the data-plane gateway.
                       enum:
