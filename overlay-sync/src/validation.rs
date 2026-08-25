@@ -344,7 +344,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::types::{ContentDigest, ContentRevision, OverlayProvenance, RoutingCandidate, RoutingOverlay};
+    use crate::types::{ContentDigest, ContentRevision, OverlayProvenance, RoutingCandidate};
 
     fn test_scope() -> ExpectedScope {
         ExpectedScope {
