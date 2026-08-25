@@ -288,6 +288,25 @@ fn process_configmap(
 
     match &result {
         Ok(validated) => {
+            if let Some(seal) = cm
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("grid.praxis-proxy.io/overlay-seal"))
+                && seal.as_str() != validated.revision
+            {
+                let error = validation::ValidationError {
+                    reason: RejectionReason::SealMismatch,
+                    detail: "ConfigMap overlay seal does not match the validated revision".to_owned(),
+                };
+                tracing::warn!(reason = %error, "overlay_rejected: revision seal mismatch");
+                metrics
+                    .validation_failures_total
+                    .with_label_values(&["seal_mismatch"])
+                    .inc();
+                status.mark_degraded("seal_mismatch");
+                return ProcessOutcome::Rejected;
+            }
             if handle_validated(validated, config, status, metrics) {
                 ProcessOutcome::Written
             } else {
@@ -606,6 +625,33 @@ mod tests {
         assert_eq!(outcome, ProcessOutcome::Written);
         assert!(status.is_ready());
         assert!(out.exists());
+    }
+
+    #[test]
+    fn process_configmap_rejects_revision_seal_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("routing-overlay.json");
+        let config = test_config(out);
+        let json = valid_envelope_json(&config.expected_scope);
+        let mut annotations = BTreeMap::new();
+        annotations.insert("grid.praxis-proxy.io/overlay-seal".to_owned(), "b".repeat(64));
+        let cm = ConfigMap {
+            metadata: kube::api::ObjectMeta {
+                annotations: Some(annotations),
+                ..Default::default()
+            },
+            data: Some(BTreeMap::from([("routing-overlay.json".to_owned(), json)])),
+            ..Default::default()
+        };
+
+        let status = SharedStatus::new("ns", "cm", "key");
+        let metrics = Arc::new(Metrics::new());
+
+        assert_eq!(
+            process_configmap(&cm, &config, &status, &metrics),
+            ProcessOutcome::Rejected
+        );
+        assert!(!status.is_ready());
     }
 
     #[test]

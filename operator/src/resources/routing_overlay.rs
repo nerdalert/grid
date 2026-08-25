@@ -1886,6 +1886,10 @@ pub fn build_overlay_configmap(
                 super::overlay_envelope::ANNOTATION_CONTENT_DIGEST.to_owned(),
                 env.content_digest.value.clone(),
             ),
+            (
+                super::overlay_envelope::ANNOTATION_SEAL.to_owned(),
+                env.revision.value.clone(),
+            ),
         ]))
     } else {
         None

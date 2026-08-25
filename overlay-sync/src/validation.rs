@@ -45,6 +45,8 @@ pub(crate) enum RejectionReason {
     RevisionDigestMismatch,
     /// Payload exceeds the configured size limit.
     Oversized,
+    /// ConfigMap seal does not match the content-addressed revision.
+    SealMismatch,
     /// Incoming semantic revision is identical to the written revision.
     Unchanged,
 }
@@ -58,6 +60,7 @@ impl fmt::Display for RejectionReason {
             Self::DigestMismatch => f.write_str("digest_mismatch"),
             Self::RevisionDigestMismatch => f.write_str("revision_digest_mismatch"),
             Self::Oversized => f.write_str("oversized"),
+            Self::SealMismatch => f.write_str("seal_mismatch"),
             Self::Unchanged => f.write_str("unchanged"),
         }
     }

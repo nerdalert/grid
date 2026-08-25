@@ -193,12 +193,19 @@ pub(crate) fn generate_consumer_praxis_config(
 ///
 /// The `ConfigMap` contains a single `praxis.yaml` key with the rendered YAML.
 /// Labels are consistent with routing overlay `ConfigMap`s.
-pub(crate) fn build_consumer_config_map(
+/// Build a consumer config `ConfigMap` sealed to one routing-overlay revision.
+///
+/// The generated Praxis configuration and its routing revision are published
+/// from the same controller render.  Consumers and sidecars can use the
+/// annotation as a convergence gate: a config without the matching revision
+/// must not be promoted alongside a newer overlay.
+pub(crate) fn build_consumer_config_map_at_revision(
     config_yaml: &str,
     config_map_name: &str,
     namespace: &str,
     network_name: &str,
     gateway_name: &str,
+    overlay_revision: Option<&str>,
 ) -> ConfigMap {
     let mut data = BTreeMap::new();
     data.insert("praxis.yaml".to_owned(), config_yaml.to_owned());
@@ -208,8 +215,16 @@ pub(crate) fn build_consumer_config_map(
     labels.insert("grid.praxis-proxy.io/gateway".to_owned(), gateway_name.to_owned());
     labels.insert("grid.praxis-proxy.io/network".to_owned(), network_name.to_owned());
 
+    let annotations = overlay_revision.map(|revision| {
+        BTreeMap::from([
+            ("grid.praxis-proxy.io/overlay-revision".to_owned(), revision.to_owned()),
+            ("grid.praxis-proxy.io/overlay-seal".to_owned(), revision.to_owned()),
+        ])
+    });
+
     ConfigMap {
         metadata: kube::api::ObjectMeta {
+            annotations,
             labels: Some(labels),
             name: Some(config_map_name.to_owned()),
             namespace: Some(namespace.to_owned()),
@@ -1266,7 +1281,7 @@ mod tests {
 
     #[test]
     fn build_consumer_config_map_uses_praxis_yaml_key() {
-        let cm = build_consumer_config_map("yaml-content", "my-cm", "ns", "net", "gw");
+        let cm = build_consumer_config_map_at_revision("yaml-content", "my-cm", "ns", "net", "gw", None);
         let data = cm.data.unwrap();
         assert!(data.contains_key("praxis.yaml"), "ConfigMap must use praxis.yaml key");
         assert_eq!(data["praxis.yaml"], "yaml-content");
@@ -1274,7 +1289,7 @@ mod tests {
 
     #[test]
     fn build_consumer_config_map_has_managed_by_label() {
-        let cm = build_consumer_config_map("yaml", "cm-name", "ns", "net", "gw");
+        let cm = build_consumer_config_map_at_revision("yaml", "cm-name", "ns", "net", "gw", None);
         let labels = cm.metadata.labels.unwrap();
         assert_eq!(
             labels.get("app.kubernetes.io/managed-by").map(String::as_str),
@@ -1285,7 +1300,7 @@ mod tests {
 
     #[test]
     fn build_consumer_config_map_has_network_and_gateway_labels() {
-        let cm = build_consumer_config_map("yaml", "cm-name", "ns", "my-network", "my-gateway");
+        let cm = build_consumer_config_map_at_revision("yaml", "cm-name", "ns", "my-network", "my-gateway", None);
         let labels = cm.metadata.labels.unwrap();
         assert_eq!(
             labels.get("grid.praxis-proxy.io/network").map(String::as_str),
@@ -1295,6 +1310,19 @@ mod tests {
             labels.get("grid.praxis-proxy.io/gateway").map(String::as_str),
             Some("my-gateway")
         );
+    }
+
+    #[test]
+    fn build_consumer_config_map_carries_overlay_seal() {
+        let revision = "a".repeat(64);
+        let cm =
+            build_consumer_config_map_at_revision("yaml", "cm-name", "ns", "my-network", "my-gateway", Some(&revision));
+        let annotations = cm.metadata.annotations.expect("sealed config must be annotated");
+        assert_eq!(
+            annotations.get("grid.praxis-proxy.io/overlay-revision"),
+            Some(&revision)
+        );
+        assert_eq!(annotations.get("grid.praxis-proxy.io/overlay-seal"), Some(&revision));
     }
 
     // -----------------------------------------------------------------------
