@@ -162,6 +162,23 @@ After Grid applies the ConfigMap, delivery is separate from re-ranking:
   Invalid updates leave the last-known-good snapshot serving; no request reads
   Kubernetes or Grid directly.
 
+### Revision sealing across the provider hop
+
+The overlay revision is also the convergence seal for generated gateway
+configuration. Grid stamps the overlay `ConfigMap` and any operator-generated
+consumer configuration with the same content-addressed revision. A provider
+gateway may opt into the same revision on its `provider_route` map. Praxis then
+forwards the revision selected by `intelligent_route`, and the provider gateway
+accepts the hop only when its route map has that exact revision. A missing or
+mismatched revision fails before backend selection, while an invalid reload
+leaves the previous complete pipeline serving.
+
+This protects health transitions and stable-ID changes as well as ordinary
+re-ranking: a provider removed for health failure cannot be selected from one
+revision and resolved through a stale route map from another. Older gateways
+that do not configure a route-map revision continue to use the legacy optional
+contract during rollout.
+
 Overlay-sync can remove kubelet projection delay, but it does **not** make
 metrics collection or operator reconciliation more frequent. The end-to-end
 route-change time is the sum of metric availability, the next reconcile,

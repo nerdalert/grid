@@ -39,6 +39,12 @@ pub const ANNOTATION_REVISION: &str = "grid.praxis-proxy.io/overlay-revision";
 /// `ConfigMap` annotation: content digest.
 pub const ANNOTATION_CONTENT_DIGEST: &str = "grid.praxis-proxy.io/overlay-content-digest";
 
+/// `ConfigMap` annotation: all routing data in this object belongs to this
+/// sealed semantic revision.  This is intentionally equal to the revision,
+/// rather than a wall-clock generation, so retries and identical renders do
+/// not churn the active snapshot.
+pub const ANNOTATION_SEAL: &str = "grid.praxis-proxy.io/overlay-seal";
+
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -605,6 +611,7 @@ mod tests {
             annotations.get(ANNOTATION_CONTENT_DIGEST).unwrap(),
             &result.revision_hex,
         );
+        assert_eq!(annotations.get(ANNOTATION_SEAL).unwrap(), &result.revision_hex);
     }
 
     #[test]

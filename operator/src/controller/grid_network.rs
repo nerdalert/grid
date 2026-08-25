@@ -965,7 +965,7 @@ async fn reconcile_routing_overlay_inner(
             schema_version: render.schema_version,
             rendered_revision: render.revision_hex.clone(),
             distributed_revision: render.revision_hex.clone(),
-            content_digest: render.revision_hex,
+            content_digest: render.revision_hex.clone(),
             config_map_resource_version: resource_version,
             rendered_at,
             candidate_count: render.candidate_count,
@@ -981,7 +981,9 @@ async fn reconcile_routing_overlay_inner(
         // Gateways with consumerConfig.enabled=false get a Disabled entry.
         // Gateways without a consumerConfig block are omitted from status.
         if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
-            match apply_consumer_config_for_gateway(&overlay, network_name, gw_ref, cc, client).await {
+            match apply_consumer_config_for_gateway(&overlay, &render.revision_hex, network_name, gw_ref, cc, client)
+                .await
+            {
                 Ok(()) => {
                     consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
                 },
@@ -1140,6 +1142,7 @@ async fn list_all_grid_sites(client: &Client) -> Result<Vec<GridSite>, OperatorE
 /// namespace.  The generated config never contains credential token bytes.
 async fn apply_consumer_config_for_gateway(
     overlay: &routing_overlay::RoutingOverlay,
+    overlay_revision: &str,
     network_name: &str,
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
@@ -1152,12 +1155,13 @@ async fn apply_consumer_config_for_gateway(
         &cc.tls_cert_mount_path,
         cc.listener_port,
     )?;
-    let cm = consumer_config::build_consumer_config_map(
+    let cm = consumer_config::build_consumer_config_map_at_revision(
         &config_yaml,
         &cc.config_map_name,
         &gw_ref.namespace,
         network_name,
         &gw_ref.name,
+        Some(overlay_revision),
     );
 
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
@@ -1260,6 +1264,7 @@ fn configmap_revision_matches(existing: &ConfigMap, desired: &ConfigMap, revisio
     annotation_matches(overlay_envelope::ANNOTATION_SCHEMA_VERSION)
         && annotation_matches(overlay_envelope::ANNOTATION_REVISION)
         && annotation_matches(overlay_envelope::ANNOTATION_CONTENT_DIGEST)
+        && annotation_matches(overlay_envelope::ANNOTATION_SEAL)
         && desired_annotations
             .get(overlay_envelope::ANNOTATION_REVISION)
             .is_some_and(|value| value == revision)
