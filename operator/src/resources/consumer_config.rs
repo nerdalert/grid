@@ -682,6 +682,7 @@ mod tests {
         )]);
         overlay.selection_policy = Some(crate::crd::grid_network::SelectionPolicyConfig {
             mode: SelectionMode::RoundRobin,
+            grouping: None,
         });
         let endpoints = endpoint_coverage(&overlay);
         let config = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/run/tls", 8080)

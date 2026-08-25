@@ -127,10 +127,31 @@ pub(crate) struct RoutingOverlay {
 
 /// Selection policy copied without interpretation by overlay-sync.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SelectionPolicy {
     /// Selection mode consumed by Praxis.
     pub(crate) mode: SelectionMode,
+
+    /// Optional grouping semantics consumed by compatible Praxis clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) grouping: Option<SelectionGrouping>,
+}
+
+/// Locality grouping metadata carried through without interpretation by
+/// overlay-sync. Grid validates this value before publishing the overlay.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SelectionGrouping {
+    pub(crate) locality_scope: LocalityGroupingScope,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum LocalityGroupingScope {
+    SameSite,
+    SameZone,
+    SameRegion,
+    AnyEligible,
 }
 
 /// Wire-level mode validation. Overlay-sync does not choose or execute it.
