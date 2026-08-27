@@ -37,7 +37,7 @@ use crate::{
         consumer_config::{self, ConsumerConfigError},
         overlay_envelope,
         placement::PlacementState,
-        provider_metrics, routing_overlay, secret,
+        provider_admission, provider_metrics, routing_overlay, secret,
         trust_bundle::{self, CertPemStatus},
     },
     swim::{MemberStatus, MembershipSnapshot},
@@ -81,6 +81,9 @@ pub struct OperatorCtx {
     /// wrapping `Arc`; the inner [`Mutex`] ensures safe concurrent access.
     pub(crate) metrics_cache: Mutex<provider_metrics::MetricsCache>,
 
+    /// Cross-reconcile admission hysteresis state.
+    pub(crate) admission_memory: Mutex<provider_admission::AdmissionMemory>,
+
     /// Cross-reconcile pressure-placement state, keyed by `GridNetwork` name.
     pub(crate) placement_states: std::sync::Mutex<HashMap<String, PlacementState>>,
 
@@ -107,6 +110,7 @@ impl OperatorCtx {
             client,
             swim,
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
+            admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
             placement_states: std::sync::Mutex::new(HashMap::new()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
         }
@@ -384,6 +388,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &providers,
         &remote_crdt_providers,
         &raw_metrics,
+        &admission_states,
         &scoring_weights,
         &ctx.placement_states,
     )
@@ -808,6 +813,7 @@ async fn reconcile_routing_overlay_inner(
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
+    admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
     scoring_weights: &scoring::ScoringWeights,
     placement_states: &std::sync::Mutex<HashMap<String, PlacementState>>,
 ) -> Result<(Vec<ConsumerConfigStatus>, Vec<OverlayRevisionStatus>), OperatorError> {
@@ -866,6 +872,7 @@ async fn reconcile_routing_overlay_inner(
                 metrics_arg,
                 timestamp.as_deref(),
                 scoring_weights,
+                Some(&admission_states),
                 placement_guard.entry(network_name.to_owned()).or_default(),
             )
         };

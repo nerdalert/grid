@@ -1405,6 +1405,7 @@ pub fn render_routing_overlay(
         metrics,
         generated_at,
         weights,
+        None,
         &mut PlacementState::default(),
     )
 }
@@ -1424,6 +1425,7 @@ pub(crate) fn render_routing_overlay_with_placement_state(
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
     generated_at: Option<&str>,
     weights: &scoring::ScoringWeights,
+    precomputed_admission: Option<&HashMap<String, AdmissionState>>,
     placement_state: &mut PlacementState,
 ) -> Result<RoutingOverlay, String> {
     let network_name = network

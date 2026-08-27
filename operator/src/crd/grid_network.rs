@@ -681,6 +681,10 @@ pub struct GridNetworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoring_policy: Option<ScoringPolicyConfig>,
 
+    /// Provider admission and pressure-recovery policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_policy: Option<AdmissionPolicyConfig>,
+
     /// Local request distribution policy for the active selection group.
     ///
     /// This is independent of scoring. When absent, the overlay carries no
