@@ -29,6 +29,8 @@ pub mod overlay_bridge;
 pub mod overlay_envelope;
 /// Typed provider traffic-placement calculations.
 pub(crate) mod placement;
+/// Stateful provider admission evaluation used by the GridNetwork controller.
+pub(crate) mod provider_admission;
 /// Provider metrics collection for the [`GridNetwork`] overlay renderer.
 ///
 /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork

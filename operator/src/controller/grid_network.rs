@@ -35,7 +35,9 @@ use crate::{
     error::OperatorError,
     resources::{
         consumer_config::{self, ConsumerConfigError},
-        overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
+        overlay_envelope,
+        placement::PlacementState,
+        provider_admission, provider_metrics, routing_overlay, secret,
         trust_bundle::{self, CertPemStatus},
     },
     swim::{MemberStatus, MembershipSnapshot},
@@ -85,6 +87,9 @@ pub struct OperatorCtx {
     /// state is copied into the overlay. It is never consulted by a request.
     pub(crate) admission_memory: Mutex<provider_admission::AdmissionMemory>,
 
+    /// Cross-reconcile pressure-placement state, keyed by `GridNetwork` name.
+    pub(crate) placement_states: std::sync::Mutex<HashMap<String, PlacementState>>,
+
     /// Tracks the seed set announced on the last reconcile per `GridNetwork`.
     ///
     /// Keyed by `GridNetwork` name.  On each reconcile, the new seed set is
@@ -109,6 +114,7 @@ impl OperatorCtx {
             swim,
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
+            placement_states: std::sync::Mutex::new(HashMap::new()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -385,8 +391,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &providers,
         &remote_crdt_providers,
         &raw_metrics,
-        &scoring_weights,
         &admission_states,
+        &scoring_weights,
+        &ctx.placement_states,
     )
     .await?;
 
@@ -809,8 +816,9 @@ async fn reconcile_routing_overlay_inner(
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
-    scoring_weights: &scoring::ScoringWeights,
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
+    scoring_weights: &scoring::ScoringWeights,
+    placement_states: &std::sync::Mutex<HashMap<String, PlacementState>>,
 ) -> Result<(Vec<ConsumerConfigStatus>, Vec<OverlayRevisionStatus>), OperatorError> {
     let network_name = grid_network_name(network)?;
 
@@ -854,17 +862,24 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let overlay = match routing_overlay::render_routing_overlay_with_admission(
-            network,
-            &sites,
-            providers,
-            &eligible_remote_owned,
-            local_site,
-            metrics_arg,
-            timestamp.as_deref(),
-            scoring_weights,
-            Some(admission_states),
-        ) {
+        let render_result = {
+            let mut placement_guard = placement_states
+                .lock()
+                .map_err(|error| OperatorError::InvalidResource(format!("placement state lock poisoned: {error}")))?;
+            routing_overlay::render_routing_overlay_with_placement_state(
+                network,
+                &sites,
+                providers,
+                &eligible_remote_owned,
+                local_site,
+                metrics_arg,
+                timestamp.as_deref(),
+                scoring_weights,
+                Some(&admission_states),
+                placement_guard.entry(network_name.to_owned()).or_default(),
+            )
+        };
+        let overlay = match render_result {
             Ok(overlay) => overlay,
             Err(error) => {
                 tracing::warn!(
