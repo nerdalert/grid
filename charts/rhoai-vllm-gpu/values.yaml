@@ -1,0 +1,21 @@
+namespace: grid-cloud-burst-rhoai
+namePrefix: rhoai-qwen3b
+runtime:
+  name: vllm-cuda-runtime
+  image: registry.redhat.io/rhaii/vllm-cuda-rhel9@sha256:5800e12b2a465f15961fcf34b645d79ed4f91ec9161eab22b1205d12682183c8
+  model: Qwen/Qwen2.5-3B-Instruct
+  maxModelLen: 8192
+  maxNumSeqs: 2
+  maxNumBatchedTokens: 512
+  gpuMemoryUtilization: "0.90"
+  languageModelOnly: true
+  cpuRequest: "2"
+  cpuLimit: "4"
+  memoryRequest: 10Gi
+  memoryLimit: 16Gi
+  sharedMemory: 6Gi
+providers:
+  - name: east
+    nodeName: ip-10-0-66-123.us-east-2.compute.internal
+  - name: west
+    nodeName: ip-10-0-70-154.us-east-2.compute.internal

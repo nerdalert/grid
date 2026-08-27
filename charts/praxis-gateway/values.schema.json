@@ -103,11 +103,16 @@
     "config": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["existingConfigMap"],
       "properties": {
         "existingConfigMap": {
           "type": "string",
           "description": "Name of an existing ConfigMap containing the Praxis configuration."
+        },
+        "create": { "type": "boolean" },
+        "data": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "ConfigMap data when config.create is true."
         },
         "key": {
           "type": "string",
@@ -164,6 +169,22 @@
         "loadBalancerIP": {
           "type": "string",
           "description": "Static IP for LoadBalancer type."
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "host": { "type": "string" },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "termination": { "type": "string", "enum": ["edge", "passthrough", "reencrypt"] },
+            "insecureEdgeTerminationPolicy": { "type": "string", "enum": ["None", "Allow", "Redirect"] }
+          }
         }
       }
     },

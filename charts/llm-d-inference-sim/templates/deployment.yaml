@@ -1,0 +1,93 @@
+{{- range .Values.pools }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "llm-d-inference-sim.fullname" $ }}-{{ .name }}
+  labels:
+    {{- include "llm-d-inference-sim.labels" $ | nindent 4 }}
+    grid.praxis-proxy.io/pool: static-{{ .name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: llm-d-inference-sim
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      grid.praxis-proxy.io/pool: static-{{ .name }}
+  template:
+    metadata:
+      labels:
+        {{- include "llm-d-inference-sim.labels" $ | nindent 8 }}
+        grid.praxis-proxy.io/pool: static-{{ .name }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+        {{- with $.Values.podSecurityContext }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: simulator
+          image: {{ include "llm-d-inference-sim.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy | quote }}
+          {{- with $.Values.backend.command }}
+          command: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $.Values.backend.args }}
+          args: {{- toYaml $.Values.backend.args | nindent 12 }}
+          {{- else if eq $.Values.backend.type "simulator" }}
+          args: ["--config", "/config/config.yaml"]
+          {{- end }}
+          {{- with $.Values.backend.env }}
+          env: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $.Values.service.port }}
+          {{- if eq $.Values.backend.type "simulator" }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+          {{- end }}
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+          {{- if not $.Values.gpu.enabled }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            readOnlyRootFilesystem: true
+            {{- with $.Values.containerSecurityContext }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if $.Values.gpu.enabled }}
+          resources:
+            limits:
+              {{ $.Values.gpu.resourceName }}: {{ $.Values.gpu.count }}
+            requests:
+              {{ $.Values.gpu.resourceName }}: {{ $.Values.gpu.count }}
+          {{- end }}
+      volumes:
+        {{- if eq $.Values.backend.type "simulator" }}
+        - name: config
+          configMap:
+            name: {{ include "llm-d-inference-sim.fullname" $ }}-{{ .name }}-config
+        {{- end }}
+---
+{{- end }}

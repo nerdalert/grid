@@ -412,6 +412,148 @@ Round-robin does not move an established session just to improve aggregate
 balance. The observed request distribution can therefore differ from an exact
 split when sessions generate different amounts of traffic.
 
+## Cloud burst and overflow behavior
+
+Cloud burst is not a separate mechanism. It is the emergent result of admission,
+grouping, and affinity working together. There is no "burst percentage" knob.
+
+For example, a network with two local providers and two overflow (cloud) providers
+behaves like this as local queue pressure crosses the admission threshold:
+
+```mermaid
+%%{init: {"flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    subgraph calm["Calm (local queue below threshold)"]
+        direction TB
+        C1["New request"]
+        subgraph cg0["group 0 - active"]
+            L1a["local-a<br/>newAndExisting"]
+            L1b["local-b<br/>newAndExisting"]
+        end
+        subgraph cg1["group 1 - dormant fallback"]
+            O1a["cloud-a<br/>newAndExisting"]
+            O1b["cloud-b<br/>newAndExisting"]
+        end
+        C1 --> cg0
+        cg0 -. unused .-> cg1
+    end
+
+    subgraph pressure["Under pressure (all locals over threshold)"]
+        direction TB
+        C2["New request"]
+        subgraph pg0["group 0 - active"]
+            O2a["cloud-a<br/>newAndExisting"]
+            O2b["cloud-b<br/>newAndExisting"]
+        end
+        subgraph pg1["group 1 - existing sessions only"]
+            L2a["local-a<br/>existingOnly"]
+            L2b["local-b<br/>existingOnly"]
+        end
+        C2 --> pg0
+        Aff["Bound existing session"] -. affinity .-> pg1
+    end
+```
+
+New/unbound traffic always follows the first viable group; the group numbers re-flow
+as admission changes. Established sessions stay pinned by affinity even after their
+provider becomes `existingOnly`.
+
+**Overflow providers sit in a fallback group.** A cloud/overflow provider is a more
+distant locality tier (for example `cross_region`) and/or a different backend class,
+so under `geographyFirst` it lands in a later group than the local providers. In the
+calm state every provider is `newAndExisting`, and Praxis serves new traffic from the
+local group, so the overflow group is dormant:
+
+```text
+Calm:   group 0  local-a, local-b   (newAndExisting)  <- all new traffic
+        group 1  cloud-a,  cloud-b   (newAndExisting)  <- dormant
+```
+
+**Admission is what triggers burst.** `derive_admission_state` marks a provider
+`existingOnly` when its normalized `queue_depth > 0.85` **or** `kv_cache_utilization
+> 0.90` (absent metrics stay `newAndExisting`). When a local provider crosses that
+line it stops receiving new bindings. Because `newAndExisting` sorts before
+`existingOnly`, the group numbering re-flows: the still-fresh overflow candidates
+become the first viable group for new traffic, and the saturated locals fall to a
+later group.
+
+```text
+Pressure: group 0  cloud-a, cloud-b   (newAndExisting)  <- new traffic bursts here
+          group 1  local-a, local-b   (existingOnly)    <- existing sessions only
+```
+
+The group *numbers* are positional (best-viable-group ordering), not identity. Cloud
+appearing as group 0 under pressure is correct behavior, not a grouping bug.
+
+**Burst affects new/unbound traffic; affinity pins healthy existing sessions.**
+Affinity is resolved before selection (see the sequence above), and an `existingOnly`
+provider still serves sessions already bound to it. So during a transition:
+
+- existing healthy sessions stay on their current (local) provider;
+- new/unbound sessions use the first viable group, which is now the overflow group.
+
+This is why burst is transitional rather than a mass migration: established sessions
+keep using local capacity while new sessions overflow.
+
+**Overflow is all-or-nothing across the local group, not a proportional split.**
+Selection weights (when configured) distribute traffic *within* a single group; they
+never split traffic across groups. Consequently:
+
+- while **at least one** local provider is `newAndExisting` (below the thresholds),
+  **all** new traffic stays local and the overflow group stays dormant;
+- once **every** local provider is `existingOnly`, **all** new traffic goes to the
+  overflow group.
+
+There is no state in which new traffic is simultaneously split, say, 80% local / 20%
+cloud — locals and cloud are in different groups. To keep some new traffic local
+during a pressure test, keep at least one local provider below the queue-depth
+threshold (for example a normalized queue of 0.80 with a 0.85 threshold); driving all
+locals to 0.90 sends 100% of new traffic to the overflow group. A proportional spill
+would require an explicit partial-overflow placement policy and is not the current
+default.
+
+### Connection settings for cloud/API providers
+
+Overflow providers are typically remote HTTPS endpoints (for example an
+OpenAI-compatible API). The provider gateway pools and reuses upstream keep-alive
+connections to them, which is good for latency but exposes a race: a bursty upstream
+sees idle gaps between bursts, the remote server closes idle connections on its side,
+and the next request written onto a reused-but-closed connection fails with a
+`Connection reset by peer` while reading response headers, surfaced as an HTTP 502.
+
+To avoid this, set an idle-connection timeout on the cloud upstream cluster that is
+**shorter than the provider's server-side idle close**, so the gateway recycles idle
+connections before the remote end does. `idle_timeout_ms` is a per-cluster field; when
+unset the built-in timeout is used, which is usually too long for a bursty cloud
+upstream.
+
+```yaml
+- filter: load_balancer
+  clusters:
+    - name: openai-overflow
+      authority: api.openai.com
+      endpoints: ["api.openai.com:443"]
+      tls:
+        sni: api.openai.com
+        verify: true
+      connection_timeout_ms: 5000
+      idle_timeout_ms: 5000     # recycle idle conns before the provider closes them
+```
+
+Guidance:
+
+- Choose `idle_timeout_ms` conservatively below the provider's observed idle-close
+  window (a few seconds is a safe starting point for public LLM APIs). This shrinks
+  the reuse race window without giving up connection pooling.
+- Do **not** solve this by disabling connection reuse entirely
+  (`runtime.upstream_keepalive_pool_size: 0`) except as a last resort — it forces a
+  full TLS handshake on every request.
+- A bounded idle timeout mitigates but does not fully close the race. The complete fix
+  is to safely retry a reset that occurs on a *reused* connection before any response
+  byte (a first delivery on a fresh connection, safe even for non-idempotent methods);
+  configure `retriable_conditions` to include `reset` on such clusters where the
+  gateway build supports reused-connection-aware retries.
+
 ## Multiple consumer gateways
 
 The design supports multiple consumer gateways. Each gateway receives an

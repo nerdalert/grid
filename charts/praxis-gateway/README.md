@@ -20,6 +20,12 @@ release ownership exist. Do not treat this as a permanent Grid responsibility.
 - A Praxis configuration ConfigMap already created in the target namespace
 - A compatible Grid AI gateway image (default: Grid v0.1.3 rollup)
 
+On OpenShift, the chart does not require a fixed UID and can optionally create
+the Praxis ConfigMap and an edge-terminated Route. The Route is disabled by
+default; enable it only for a gateway that is intentionally externally
+reachable. Use `config.create=true` with `config.data` for a self-contained
+demo release, or keep the default external ConfigMap workflow for production.
+
 ## Install
 
 From a local checkout:
@@ -59,7 +65,9 @@ AI image; these values may advance independently.
 | `podAnnotations` | object | `{}` | Pod annotations. |
 | `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
-| `config.existingConfigMap` | string | **required** | Name of an existing ConfigMap with the Praxis config. |
+| `config.existingConfigMap` | string | `""` | Name of an existing ConfigMap with the Praxis config. Required unless `config.create` is enabled. |
+| `config.create` | bool | `false` | Create the Praxis ConfigMap from `config.data`. |
+| `config.data` | object | `{}` | ConfigMap data when `config.create` is enabled. |
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
 | `port.containerPort` | int | `8080` | Container port. |
 | `port.name` | string | `http` | Port name. |
@@ -69,6 +77,8 @@ AI image; these values may advance independently.
 | `service.port` | int | `8080` | Service port. |
 | `service.annotations` | object | `{}` | Service annotations. |
 | `service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. |
+| `route.enabled` | bool | `false` | Create an OpenShift Route. |
+| `route.host` | string | `""` | Optional Route hostname. |
 | `overlay.enabled` | bool | `false` | Mount an overlay ConfigMap. |
 | `overlay.existingConfigMap` | string | `""` | Name of the overlay ConfigMap. |
 | `overlay.mountPath` | string | `/etc/praxis/routing` | Mount path for overlay files. |

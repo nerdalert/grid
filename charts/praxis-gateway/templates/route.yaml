@@ -1,0 +1,20 @@
+{{- if .Values.route.enabled }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "praxis-gateway.fullname" . }}
+  labels:
+    {{- include "praxis-gateway.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.route.host }}
+  host: {{ . | quote }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ include "praxis-gateway.fullname" . }}
+  port:
+    targetPort: {{ .Values.port.name }}
+  tls:
+    termination: {{ .Values.route.tls.termination | quote }}
+    insecureEdgeTerminationPolicy: {{ .Values.route.tls.insecureEdgeTerminationPolicy | quote }}
+{{- end }}

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: rhoai-vllm-gpu
+description: Two-provider KServe vLLM deployment for the cloud-burst validation topology
+type: application
+version: 0.1.0
+appVersion: "Qwen/Qwen2.5-3B-Instruct"

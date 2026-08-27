@@ -192,7 +192,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: {{ .Values.config.existingConfigMap | quote }}
+            name: {{ include "praxis-gateway.configMapName" . | quote }}
             items:
               - key: {{ .Values.config.key | quote }}
                 path: "praxis.yaml"

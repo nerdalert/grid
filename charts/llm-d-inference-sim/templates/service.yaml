@@ -1,0 +1,20 @@
+{{- range .Values.pools }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "llm-d-inference-sim.fullname" $ }}-{{ .name }}
+  labels:
+    {{- include "llm-d-inference-sim.labels" $ | nindent 4 }}
+    grid.praxis-proxy.io/pool: static-{{ .name }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: llm-d-inference-sim
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    grid.praxis-proxy.io/pool: static-{{ .name }}
+  ports:
+    - name: http
+      port: {{ $.Values.service.port }}
+      targetPort: http
+---
+{{- end }}

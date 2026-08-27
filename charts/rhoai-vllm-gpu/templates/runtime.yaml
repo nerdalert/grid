@@ -1,0 +1,66 @@
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: {{ .Values.runtime.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    opendatahub.io/dashboard: "true"
+spec:
+  annotations:
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8080"
+  containers:
+    - name: kserve-container
+      image: {{ .Values.runtime.image | quote }}
+      command: [vllm, serve]
+      args:
+        - --port=8080
+        - --model=/mnt/models
+        - --served-model-name={{ .Values.runtime.model }}
+        - --distributed-executor-backend=mp
+        - --max-model-len={{ .Values.runtime.maxModelLen }}
+        - --max-num-seqs={{ .Values.runtime.maxNumSeqs }}
+        - --max-num-batched-tokens={{ .Values.runtime.maxNumBatchedTokens }}
+        - --enable-auto-tool-choice
+        - --tool-call-parser=hermes
+        - --gpu-memory-utilization={{ .Values.runtime.gpuMemoryUtilization }}
+        {{- if .Values.runtime.languageModelOnly }}
+        - --language-model-only
+        {{- end }}
+      env:
+        - name: HOME
+          value: /tmp
+        - name: XDG_CACHE_HOME
+          value: /tmp/.cache
+        - name: FLASHINFER_WORKSPACE_DIR
+          value: /tmp/flashinfer
+        - name: HF_HUB_CACHE
+          value: /tmp/hf_cache
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      resources:
+        requests:
+          cpu: {{ .Values.runtime.cpuRequest | quote }}
+          memory: {{ .Values.runtime.memoryRequest | quote }}
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: {{ .Values.runtime.cpuLimit | quote }}
+          memory: {{ .Values.runtime.memoryLimit | quote }}
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+  multiModel: false
+  supportedModelFormats:
+    - name: vLLM
+      autoSelect: true
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: {{ .Values.runtime.sharedMemory | quote }}

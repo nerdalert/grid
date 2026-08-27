@@ -1,0 +1,34 @@
+{{- range .Values.providers }}
+---
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: {{ printf "%s-%s" $.Values.namePrefix .name | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $.Values.namespace }}
+  annotations:
+    serving.kserve.io/deploymentMode: RawDeployment
+spec:
+  predictor:
+    minReplicas: 1
+    maxReplicas: 1
+    nodeSelector:
+      kubernetes.io/hostname: {{ .nodeName | quote }}
+    model:
+      modelFormat:
+        name: vLLM
+      runtime: {{ $.Values.runtime.name }}
+      storageUri: {{ printf "hf://%s" $.Values.runtime.model | quote }}
+      resources:
+        requests:
+          cpu: {{ $.Values.runtime.cpuRequest | quote }}
+          memory: {{ $.Values.runtime.memoryRequest | quote }}
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: {{ $.Values.runtime.cpuLimit | quote }}
+          memory: {{ $.Values.runtime.memoryLimit | quote }}
+          nvidia.com/gpu: "1"
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+{{- end }}

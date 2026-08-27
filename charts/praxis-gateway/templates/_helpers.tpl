@@ -82,9 +82,16 @@ Validate image digest format when provided.
 Validate required config ConfigMap name.
 */}}
 {{- define "praxis-gateway.validateConfig" -}}
-{{- if not .Values.config.existingConfigMap }}
-{{- fail "config.existingConfigMap is required" }}
+{{- if and (not .Values.config.existingConfigMap) (not .Values.config.create) }}
+{{- fail "config.existingConfigMap or config.create=true is required" }}
 {{- end }}
+{{- if and .Values.config.create (not .Values.config.data) }}
+{{- fail "config.data is required when config.create=true" }}
+{{- end }}
+{{- end }}
+
+{{- define "praxis-gateway.configMapName" -}}
+{{- if .Values.config.create }}{{ include "praxis-gateway.fullname" . }}-config{{ else }}{{ .Values.config.existingConfigMap }}{{ end }}
 {{- end }}
 
 {{/*

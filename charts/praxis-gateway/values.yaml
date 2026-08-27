@@ -43,6 +43,8 @@ config:
   # -- Name of an existing ConfigMap containing the Praxis configuration.
   # The chart does not create or manage this ConfigMap.
   existingConfigMap: ""
+  create: false
+  data: {}
   # -- Key within the ConfigMap that holds praxis.yaml.
   key: "praxis.yaml"
 
@@ -67,6 +69,13 @@ service:
   annotations: {}
   # -- Static IP for LoadBalancer type.
   loadBalancerIP: ""
+
+route:
+  enabled: false
+  host: ""
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
 
 # -- Optional operator-produced overlay ConfigMap mount (edge gateways).
 overlay:
