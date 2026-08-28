@@ -1499,14 +1499,11 @@ pub(crate) fn render_routing_overlay_with_placement_state(
     match policy {
         crate::crd::grid_network::RoutingPolicy::GeographyFirst => {
             candidates.sort_by(|a, b| {
-                admission_sort_key(a.admission_state)
-                    .cmp(&admission_sort_key(b.admission_state))
+                backend_kind_sort_key(a.backend_kind.as_deref())
+                    .cmp(&backend_kind_sort_key(b.backend_kind.as_deref()))
+                    .then(admission_sort_key(a.admission_state).cmp(&admission_sort_key(b.admission_state)))
                     .then(locality_sort_key(a.selection_tier).cmp(&locality_sort_key(b.selection_tier)))
                     .then(b.fresh.cmp(&a.fresh))
-                    .then(
-                        backend_kind_sort_key(a.backend_kind.as_deref())
-                            .cmp(&backend_kind_sort_key(b.backend_kind.as_deref())),
-                    )
                     .then_with(|| score_of(&b.cluster).total_cmp(&score_of(&a.cluster)))
                     .then(a.site.cmp(&b.site))
                     .then(a.name.cmp(&b.name))
@@ -1515,13 +1512,10 @@ pub(crate) fn render_routing_overlay_with_placement_state(
         },
         crate::crd::grid_network::RoutingPolicy::ScoreFirst => {
             candidates.sort_by(|a, b| {
-                admission_sort_key(a.admission_state)
-                    .cmp(&admission_sort_key(b.admission_state))
+                backend_kind_sort_key(a.backend_kind.as_deref())
+                    .cmp(&backend_kind_sort_key(b.backend_kind.as_deref()))
+                    .then(admission_sort_key(a.admission_state).cmp(&admission_sort_key(b.admission_state)))
                     .then(b.fresh.cmp(&a.fresh))
-                    .then(
-                        backend_kind_sort_key(a.backend_kind.as_deref())
-                            .cmp(&backend_kind_sort_key(b.backend_kind.as_deref())),
-                    )
                     .then_with(|| score_of(&b.cluster).total_cmp(&score_of(&a.cluster)))
                     .then(locality_sort_key(a.selection_tier).cmp(&locality_sort_key(b.selection_tier)))
                     .then(a.site.cmp(&b.site))
