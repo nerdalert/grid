@@ -1556,6 +1556,8 @@ fn provider_state_from_kube(
         phase,
         metrics: metrics_to_crdt(metrics),
         access_policy: access_policy_to_crdt(&provider.spec.access_policy),
+        capacity_weight: provider.spec.capacity_weight,
+        queue_capacity: provider.spec.metrics_config.as_ref().and_then(|metrics| metrics.queue_capacity),
         revision,
         writer_id: site_id.to_owned(),
     })

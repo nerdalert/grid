@@ -105,10 +105,12 @@ const PRESSURE_GENERATOR_DEPLOYMENT: &str = "pressure-generator";
 
 /// Number of pressure generator replicas during the pressure phase.
 ///
-/// With 4 workers per pod, 6 replicas = 24 concurrent requests. This
-/// reliably pushes pool-a queue past 3.5/4, triggering the rank flip
+/// With 4 workers per pod, 2 replicas = 8 concurrent requests. This pushes
+/// pool-a queue above the pressure threshold without crossing the admission
+/// saturation boundary, so both providers remain in the active group for the
+/// weighted-distribution proof.
 /// even when pool-b's SWIM-propagated overlay scores are stale.
-const PRESSURE_REPLICAS: u32 = 6;
+const PRESSURE_REPLICAS: u32 = 2;
 
 /// GridNetwork resource name.
 const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
@@ -190,6 +192,15 @@ enum ScoringFlavor {
     KvCachePressure,
 }
 
+/// Placement behavior selected for a demo run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacementMode {
+    /// Use score-based deterministic selection.
+    ScorePreference,
+    /// Publish pressure-derived weights and use weighted selection.
+    PressureWeighted,
+}
+
 impl ScoringFlavor {
     /// Selects the flavor from the `--kv-cache` CLI flag.
     fn from_kv_cache_flag(kv_cache: bool) -> Self {
@@ -232,6 +243,8 @@ struct DemoContext {
     metrics_transport: MetricsTransport,
     /// Selected scoring flavor (which signal drives routing).
     scoring_flavor: ScoringFlavor,
+    /// Whether this run uses pressure-derived weighted selection.
+    pressure_weighted: bool,
 }
 
 /// Resolved container image references.
@@ -265,6 +278,8 @@ struct Evidence {
     metrics_transport: String,
     /// Scoring strategy: "queue-depth" or "kv-cache-pressure".
     scoring_strategy: String,
+    /// Placement strategy used for this run.
+    placement_strategy: String,
     /// UTC timestamp when the run started.
     started_at: String,
     /// Wall-clock duration in seconds.
@@ -334,6 +349,8 @@ struct ScorecardRow {
     score: f64,
     /// Rank from the overlay ConfigMap (0 = preferred).
     rank: i64,
+    /// Effective weight from the overlay, or zero when not weighted.
+    traffic_weight: u32,
 }
 
 /// Parsed overlay candidate scores from the overlay ConfigMap JSON.
@@ -351,6 +368,8 @@ struct OverlayCandidate {
     admission_state: String,
     /// Score breakdown from the production scoring engine.
     breakdown: Option<super::operator_overlay::ScoreBreakdown>,
+    /// Effective provider weight, when weighted selection is enabled.
+    traffic_weight: Option<u32>,
 }
 
 /// Parsed inference response with gateway attribution.
@@ -359,6 +378,32 @@ struct InferenceResponse {
     provider_gateway: String,
     /// Demo attribution from `x-ai-demo-provider-gateway`.
     demo_attribution: String,
+}
+
+/// Result of one bounded unbound-traffic sample.
+struct TrafficSample {
+    /// Number of requests attempted.
+    attempted: u32,
+    /// Number of HTTP 200 responses with complete attribution.
+    ok: u32,
+    /// Requests attributed to Pool A.
+    pool_a: u32,
+    /// Requests attributed to Pool B.
+    pool_b: u32,
+    /// Explicit failure category for every unsuccessful probe.
+    failures: Vec<String>,
+}
+
+/// Weighted overlay state captured at a sample boundary.
+struct WeightedSampleState {
+    /// Semantic overlay revision.
+    revision: String,
+    /// Kubernetes ConfigMap resourceVersion.
+    resource_version: String,
+    /// Pool A effective traffic weight.
+    weight_a: u32,
+    /// Pool B effective traffic weight.
+    weight_b: u32,
 }
 
 /// Aggregated request counts from pressure generator pods.
@@ -375,6 +420,229 @@ struct PressureStats {
     b_reqs: u64,
 }
 
+/// Read the semantic and Kubernetes revisions for the consumer overlay.
+///
+/// The semantic revision is the routing contract used by Praxis. The
+/// Kubernetes resourceVersion is retained for evidence, but is not sufficient
+/// to prove that request-time routing changed.
+fn read_consumer_overlay_revisions() -> Result<(String, String), Box<dyn std::error::Error>> {
+    let context = kind_context("pool-a");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "configmap",
+            OVERLAY_CONFIGMAP,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read consumer overlay ConfigMap: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let semantic = value
+        .pointer("/metadata/annotations/grid.praxis-proxy.io~1overlay-revision")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("consumer overlay has no semantic revision annotation")?
+        .to_owned();
+    let resource = value
+        .pointer("/metadata/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("consumer overlay has no resourceVersion")?
+        .to_owned();
+    Ok((semantic, resource))
+}
+
+/// Read the bounded Praxis gateway log used by the pressure proof.
+fn read_consumer_gateway_logs() -> Result<String, Box<dyn std::error::Error>> {
+    let context = kind_context("pool-a");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "logs",
+            "deployment/consumer-gateway",
+            "-c",
+            "praxis",
+            "--tail=300",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read consumer gateway logs: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(strip_gateway_ansi(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Remove ANSI SGR sequences emitted by the gateway tracing subscriber.
+fn strip_gateway_ansi(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' {
+            if chars.next() == Some('[') {
+                for final_byte in chars.by_ref() {
+                    if final_byte.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+/// Return the latest value of a key=value field in gateway logs.
+fn latest_gateway_log_field(logs: &str, field: &str) -> Option<String> {
+    logs.lines().rev().find_map(|line| {
+        let prefix = format!("{field}=");
+        let index = line.find(&prefix)?;
+        let value = line.get(index + prefix.len()..)?;
+        Some(
+            value
+                .strip_prefix('"')
+                .map_or_else(
+                    || value.split_whitespace().next().unwrap_or(""),
+                    |v| v.split('"').next().unwrap_or(""),
+                )
+                .to_owned(),
+        )
+    })
+}
+
+/// Establish the serving barrier for a newly published consumer overlay.
+fn wait_for_consumer_overlay_revision(revision: &str) -> Result<(), Box<dyn std::error::Error>> {
+    const TIMEOUT: Duration = Duration::from_secs(90);
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let logs = read_consumer_gateway_logs()?;
+        let accepted = latest_gateway_log_field(&logs, "accepted_revision");
+        let serving = latest_gateway_log_field(&logs, "serving_revision");
+        if accepted.as_deref() == Some(revision) && serving.as_deref() == Some(revision) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Praxis did not accept and serve overlay revision {} within {TIMEOUT:?} (accepted={:?}, serving={:?})",
+                &revision[..revision.len().min(16)],
+                accepted.as_deref().map(|v| &v[..v.len().min(16)]),
+                serving.as_deref().map(|v| &v[..v.len().min(16)])
+            )
+            .into());
+        }
+        std::thread::park_timeout(Duration::from_secs(2));
+    }
+}
+
+/// Send a bounded sample through one consumer gateway and count attribution.
+fn sample_consumer_traffic(cluster: &str, count: u32) -> TrafficSample {
+    let context = kind_context(cluster);
+    let mut sample = TrafficSample {
+        attempted: count,
+        ok: 0,
+        pool_a: 0,
+        pool_b: 0,
+        failures: Vec::new(),
+    };
+    for request_number in 1..=count {
+        let body =
+            format!(r#"{{"model":"{VCR_MODEL}","messages":[{{"role":"user","content":"test"}}],"max_tokens":4}}"#);
+        let curl_cmd = format!(
+            "curl -s --connect-timeout 5 --max-time 30 -o /dev/null \\
+             -w 'STATUS:%{{http_code}}\\nPROVIDER_GW:%header{{X-Grid-LlmD-Provider-Gateway}}\\nDEMO_ATTRIB:%header{{x-ai-demo-provider-gateway}}\\n' \\
+             -X POST http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions \\
+             -H 'Content-Type: application/json' \\
+             -d '{body}'"
+        );
+        let Ok(raw) = kubectl_exec_curl_raw(&context, &curl_cmd) else {
+            sample.failures.push(format!("request {request_number}: pod execution"));
+            continue;
+        };
+        let mut status = 0_u16;
+        let mut provider_gateway = String::new();
+        let mut demo_attribution = String::new();
+        for line in raw.lines() {
+            if let Some(code) = line.strip_prefix("STATUS:") {
+                status = code.trim().parse().unwrap_or(0);
+            } else if let Some(value) = line.strip_prefix("PROVIDER_GW:") {
+                value.trim().clone_into(&mut provider_gateway);
+            } else if let Some(value) = line.strip_prefix("DEMO_ATTRIB:") {
+                value.trim().clone_into(&mut demo_attribution);
+            }
+        }
+        if status != 200 {
+            sample.failures.push(format!("request {request_number}: HTTP {status}"));
+            continue;
+        }
+        if provider_gateway.is_empty() || demo_attribution.is_empty() {
+            sample
+                .failures
+                .push(format!("request {request_number}: missing attribution"));
+            continue;
+        }
+        if !provider_gateway.contains("pool-a") && !provider_gateway.contains("pool-b") {
+            sample
+                .failures
+                .push(format!("request {request_number}: unknown provider gateway"));
+            continue;
+        }
+        if !demo_attribution.contains("pool-a") && !demo_attribution.contains("pool-b") {
+            sample
+                .failures
+                .push(format!("request {request_number}: unknown demo attribution"));
+            continue;
+        }
+        if provider_gateway.contains("pool-a") && demo_attribution.contains("pool-a") {
+            sample.ok += 1;
+            sample.pool_a += 1;
+        } else if provider_gateway.contains("pool-b") && demo_attribution.contains("pool-b") {
+            sample.ok += 1;
+            sample.pool_b += 1;
+        } else {
+            sample
+                .failures
+                .push(format!("request {request_number}: gateway/attribution mismatch"));
+        }
+    }
+    sample
+}
+
+/// Capture the semantic revision and effective weights used by a sample.
+fn read_weighted_sample_state() -> Result<WeightedSampleState, Box<dyn std::error::Error>> {
+    let candidates = read_overlay_candidates("pool-a");
+    let (revision, resource_version) = read_consumer_overlay_revisions()?;
+    Ok(WeightedSampleState {
+        revision,
+        resource_version,
+        weight_a: overlay_weight_for_cluster(&candidates, "pool-a"),
+        weight_b: overlay_weight_for_cluster(&candidates, "pool-b"),
+    })
+}
+
+/// Format explicit probe failures for evidence.
+fn format_sample_failures(sample: &TrafficSample) -> String {
+    if sample.failures.is_empty() {
+        "none".to_owned()
+    } else {
+        sample.failures.join(", ")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -389,6 +657,7 @@ pub(crate) fn run(
     options: &GlbDemoOptions,
     metrics_mtls: bool,
     kv_cache: bool,
+    placement_mode: PlacementMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = options.mode();
     let metrics_transport = if metrics_mtls {
@@ -397,6 +666,7 @@ pub(crate) fn run(
         MetricsTransport::DirectHttp
     };
     let scoring_flavor = ScoringFlavor::from_kv_cache_flag(kv_cache);
+    let pressure_weighted = placement_mode == PlacementMode::PressureWeighted;
     let run_id = format_utc_timestamp();
     let started_at = format_utc_iso();
     let wall_start = Instant::now();
@@ -410,11 +680,19 @@ pub(crate) fn run(
     eprintln!("Mode: {}", if mode == DemoMode::Quick { "quick" } else { "full" });
     eprintln!("Metrics transport: {}", metrics_transport.label());
     eprintln!("Scoring strategy:  {}", scoring_flavor.label());
+    eprintln!(
+        "Placement mode:    {}",
+        if pressure_weighted {
+            "pressure-weighted"
+        } else {
+            "score-preference"
+        }
+    );
     eprintln!("Forge config: {}", forge_config.display());
     eprintln!("Demo root:    {}", demo_root.display());
     eprintln!("{OUTPUT_RULE}");
 
-    let context = prepare_setup(forge_config, metrics_transport, scoring_flavor)?;
+    let context = prepare_setup(forge_config, metrics_transport, scoring_flavor, pressure_weighted)?;
     let mut teardown_success = false;
     let mut run_error: Option<String> = None;
 
@@ -474,6 +752,11 @@ pub(crate) fn run(
         mode: format!("{mode:?}").to_lowercase(),
         metrics_transport: metrics_transport.label().to_owned(),
         scoring_strategy: scoring_flavor.label().to_owned(),
+        placement_strategy: if pressure_weighted {
+            "pressure-weighted".to_owned()
+        } else {
+            "score-preference".to_owned()
+        },
         started_at,
         wall_secs,
         success,
@@ -524,11 +807,19 @@ fn prepare_setup(
     forge_config: &Path,
     metrics_transport: MetricsTransport,
     scoring_flavor: ScoringFlavor,
+    pressure_weighted: bool,
 ) -> Result<DemoContext, Box<dyn std::error::Error>> {
     let images = resolve_images(metrics_transport)?;
     verify_images(&images)?;
 
-    let resolved_config = materialize_config(forge_config, metrics_transport, scoring_flavor, images.nginx.as_deref())?;
+    let resolved_config = materialize_config(
+        forge_config,
+        metrics_transport,
+        scoring_flavor,
+        pressure_weighted,
+        images.nginx.as_deref(),
+        Some(&images),
+    )?;
     let forge_bin = glb::resolve_forge_binary()
         .ok_or("praxis-forge binary not found")?
         .into();
@@ -539,6 +830,7 @@ fn prepare_setup(
         images,
         metrics_transport,
         scoring_flavor,
+        pressure_weighted,
     })
 }
 
@@ -836,9 +1128,15 @@ fn proof_provenance(mtls: bool) -> ProofResult {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Ok(metrics_text) = kubectl_exec_epp_metrics(cluster, mtls) {
-                let has_kv = any_metric_present(&metrics_text, EPP_KV_CACHE_METRICS);
-                let has_queue = any_metric_present(&metrics_text, EPP_QUEUE_SIZE_METRICS);
-                let has_ready = any_metric_present(&metrics_text, EPP_READY_METRICS);
+                let has_kv = metrics_text.contains("llm_d_epp_average_kv_cache_utilization")
+                    || metrics_text.contains("inference_pool_average_kv_cache_utilization")
+                    || metrics_text.contains("llm_d_router_epp_average_kv_cache_utilization");
+                let has_queue = metrics_text.contains("llm_d_epp_average_queue_size")
+                    || metrics_text.contains("inference_pool_average_queue_size")
+                    || metrics_text.contains("llm_d_router_epp_average_queue_size");
+                let has_ready = metrics_text.contains("llm_d_epp_ready_endpoints")
+                    || metrics_text.contains("inference_pool_ready_pods")
+                    || metrics_text.contains("llm_d_router_epp_ready_endpoints");
                 if has_kv && has_queue && has_ready {
                     observations.push(format!("{cluster}: all 3 EPP pool metrics present"));
                     metrics_ok = true;
@@ -900,6 +1198,7 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
         }
 
         let epp_a = scrape_epp_metrics("pool-a", context.metrics_transport == MetricsTransport::MtlsProxy);
+        let epp_b = scrape_epp_metrics("pool-b", context.metrics_transport == MetricsTransport::MtlsProxy);
         let candidates = read_overlay_candidates("pool-a");
         let rank_a = overlay_rank_for_cluster(&candidates, "pool-a");
 
@@ -910,6 +1209,66 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
                 epp_a.queue_size
             );
             let probe_ctx = kind_context("pool-a");
+            if context.pressure_weighted {
+                let (semantic_revision, resource_version) = match read_consumer_overlay_revisions() {
+                    Ok(revisions) => revisions,
+                    Err(error) => {
+                        observations.push(format!("baseline overlay revision read failed: {error}"));
+                        continue;
+                    },
+                };
+                if let Err(error) = wait_for_consumer_overlay_revision(&semantic_revision) {
+                    observations.push(format!("baseline serving barrier failed: {error}"));
+                    continue;
+                }
+                let sample = sample_consumer_traffic("pool-a", 20);
+                let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a", &epp_a);
+                let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b", &epp_b);
+                observations.push(format!(
+                    "baseline weighted sample: ok={}/{} pool-a={} pool-b={} weights={}/{} revision={} resourceVersion={} failures={}",
+                    sample.ok,
+                    sample.attempted,
+                    sample.pool_a,
+                    sample.pool_b,
+                    overlay_weight_for_cluster(&candidates, "pool-a"),
+                    overlay_weight_for_cluster(&candidates, "pool-b"),
+                    semantic_revision,
+                    resource_version,
+                    format_sample_failures(&sample)
+                ));
+                observations.push(format!(
+                    "baseline overlay state: pool-a queue={:.2} weight={} rank={}; pool-b queue={:.2} weight={} rank={}",
+                    row_a.queue,
+                    row_a.traffic_weight,
+                    row_a.rank,
+                    row_b.queue,
+                    row_b.traffic_weight,
+                    row_b.rank
+                ));
+                if sample.ok == 20 && sample.pool_a > 0 && sample.pool_b > 0 {
+                    print_scorecard_with_cause(
+                        "BASELINE",
+                        &[&row_a, &row_b],
+                        "WEIGHTED ACTIVE GROUP",
+                        &candidates,
+                        "Both eligible pools participate before direct pressure is applied.",
+                    );
+                    return ProofResult {
+                        success: true,
+                        description: "Baseline: weighted active-group sample succeeded".to_owned(),
+                        observations,
+                    };
+                }
+                eprintln!(
+                    "  [BASELINE] weighted sample not ready: ok={}/{} A={} B={} failures={}",
+                    sample.ok,
+                    sample.attempted,
+                    sample.pool_a,
+                    sample.pool_b,
+                    format_sample_failures(&sample)
+                );
+                continue;
+            }
             match send_inference_request(&probe_ctx, VCR_MODEL) {
                 Ok(resp) => {
                     if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
@@ -970,8 +1329,9 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
     }
 }
 
-/// Proof 3: Scale up pressure through the consumer gateway, wait for
-/// A→B flip with live metrics table and attribution tracking.
+/// Proof 3: Scale up pressure through Pool A's provider path, wait for a
+/// weighted overlay update, and verify new consumer traffic changes its
+/// distribution with live metrics table and attribution tracking.
 fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> ProofResult {
     let mut observations = Vec::new();
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
@@ -988,14 +1348,28 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
         };
     }
     observations.push("precondition: pool-a rank=0 at entry".to_owned());
+    let initial_weight_a = overlay_weight_for_cluster(&candidates, "pool-a");
+    let initial_weight_b = overlay_weight_for_cluster(&candidates, "pool-b");
+    let initial_revision = match read_consumer_overlay_revisions() {
+        Ok((revision, _)) => revision,
+        Err(error) => {
+            observations.push(format!("initial overlay revision read failed: {error}"));
+            return ProofResult {
+                success: false,
+                description: "Pressure & flip: initial overlay revision unavailable".to_owned(),
+                observations,
+            };
+        },
+    };
+    observations.push(format!("initial semantic overlay revision={initial_revision}"));
 
     eprintln!();
-    eprintln!("  [PRESSURE] Starting pressure generator through the consumer gateway");
+    eprintln!("  [PRESSURE] Starting pressure generator directly against Pool A's provider gateway");
     eprintln!("    replicas:    {PRESSURE_REPLICAS}");
-    eprintln!("    workers:     4 per replica (total {})", PRESSURE_REPLICAS * 4);
-    eprintln!("    gateway:     consumer-gateway.grid-system:8080");
+    eprintln!("    workers:     5 per replica (total {})", PRESSURE_REPLICAS * 5);
+    eprintln!("    target:      provider-gateway.grid-system:8443 (direct provider path)");
     eprintln!("    model:       {VCR_MODEL}");
-    eprintln!("    max_tokens:  64");
+    eprintln!("    max_tokens:  32");
     if let Err(e) = scale_pressure_generator("pool-a", PRESSURE_REPLICAS) {
         observations.push(format!("pressure generator scale-up failed: {e}"));
         return ProofResult {
@@ -1005,13 +1379,13 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
         };
     }
     observations.push(format!(
-        "pressure generator scaled to {PRESSURE_REPLICAS} replicas (gateway-routed)"
+        "pressure generator scaled to {PRESSURE_REPLICAS} replicas (direct Pool A provider path)"
     ));
 
     eprintln!();
     eprintln!("  Live Metrics Table");
     eprintln!("    Queue/KV/Score/Rank: derived from the Grid overlay (production scoring engine)");
-    eprintln!("    A_REQ/B_REQ:        cumulative gateway attribution counts from pressure pods");
+    eprintln!("    A_REQ/B_REQ:        cumulative provider attribution counts from pressure pods");
     eprintln!("    LAST_ROUTE:         most recent confirmed request destination");
     print_live_table_header();
     let deadline = Instant::now() + DATA_PLANE_WAIT;
@@ -1059,14 +1433,114 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
             last_route: &last_route,
         });
 
-        if row_b.rank == 0 && row_a.rank > 0 && score_gap >= MIN_PRESSURE_SCORE_GAP {
+        let pressure_weight_change = context.pressure_weighted
+            && row_a.traffic_weight < initial_weight_a
+            && row_b.traffic_weight > initial_weight_b;
+        let preference_flip = row_b.rank == 0 && row_a.rank > 0 && score_gap >= MIN_PRESSURE_SCORE_GAP;
+        if (preference_flip || pressure_weight_change)
+            && (score_gap >= MIN_PRESSURE_SCORE_GAP || context.pressure_weighted)
+        {
+            let (revision, resource_version) = match read_consumer_overlay_revisions() {
+                Ok(revisions) => revisions,
+                Err(error) => {
+                    observations.push(format!("changed-weight overlay read failed: {error}"));
+                    continue;
+                },
+            };
+            if context.pressure_weighted && revision == initial_revision {
+                observations.push(
+                    "effective weights changed without a semantic overlay revision; refusing to measure traffic"
+                        .to_owned(),
+                );
+                continue;
+            }
+            if context.pressure_weighted {
+                if let Err(error) = wait_for_consumer_overlay_revision(&revision) {
+                    observations.push(format!("changed-weight serving barrier failed: {error}"));
+                    continue;
+                }
+                observations.push(format!(
+                    "semantic overlay revision changed {initial_revision} -> {revision}; resourceVersion={resource_version}; Praxis accepted and serves new revision"
+                ));
+                observations.push(format!(
+                    "pressure overlay state: pool-a queue={:.2} weight={} rank={}; pool-b queue={:.2} weight={} rank={}",
+                    row_a.queue,
+                    row_a.traffic_weight,
+                    row_a.rank,
+                    row_b.queue,
+                    row_b.traffic_weight,
+                    row_b.rank
+                ));
+            }
             eprintln!(
                 "  [SCORING] Pool A score={:.2} rank={}; Pool B score={:.2} rank={} (gap={:.2})",
                 row_a.score, row_a.rank, row_b.score, row_b.rank, score_gap
             );
             eprintln!("  [FAILOVER] Pool B is now preferred; sending verification request");
             let probe_ctx = kind_context("pool-a");
-            if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
+            if context.pressure_weighted {
+                let sample_start = match read_weighted_sample_state() {
+                    Ok(state) => state,
+                    Err(error) => {
+                        observations.push(format!("pressure sample start state failed: {error}"));
+                        continue;
+                    },
+                };
+                let sample = sample_consumer_traffic("pool-a", 30);
+                let sample_end = match read_weighted_sample_state() {
+                    Ok(state) => state,
+                    Err(error) => {
+                        observations.push(format!("pressure sample end state failed: {error}"));
+                        continue;
+                    },
+                };
+                let state_stable = sample_start.revision == sample_end.revision
+                    && sample_start.weight_a == sample_end.weight_a
+                    && sample_start.weight_b == sample_end.weight_b;
+                observations.push(format!(
+                    "pressure sample start: weights={}/{} revision={} resourceVersion={}",
+                    sample_start.weight_a, sample_start.weight_b, sample_start.revision, sample_start.resource_version
+                ));
+                observations.push(format!(
+                    "pressure sample end: weights={}/{} revision={} resourceVersion={}",
+                    sample_end.weight_a, sample_end.weight_b, sample_end.revision, sample_end.resource_version
+                ));
+                observations.push(format!(
+                    "pressure weighted sample: ok={}/{} pool-a={} pool-b={} failures={}",
+                    sample.ok,
+                    sample.attempted,
+                    sample.pool_a,
+                    sample.pool_b,
+                    format_sample_failures(&sample)
+                ));
+                let weights_match = weighted_sample_matches(
+                    sample_start.weight_a,
+                    sample_start.weight_b,
+                    u64::from(sample.pool_a),
+                    u64::from(sample.pool_b),
+                );
+                if sample.ok == 30 && state_stable && weights_match {
+                    observations.push(format!(
+                        "weighted migration: ok={}/30 pool-a={} pool-b={} weights={}/{}",
+                        sample.ok, sample.pool_a, sample.pool_b, sample_start.weight_a, sample_start.weight_b
+                    ));
+                    return ProofResult {
+                        success: true,
+                        description: "Pressure changed effective weights and new traffic favored Pool B".to_owned(),
+                        observations,
+                    };
+                }
+                observations.push(format!(
+                    "weighted sample did not match one stable published state: ok={}/{} A={} B={} weights={}/{} stable_state={}",
+                    sample.ok,
+                    sample.attempted,
+                    sample.pool_a,
+                    sample.pool_b,
+                    sample_start.weight_a,
+                    sample_start.weight_b,
+                    state_stable
+                ));
+            } else if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
                 last_route = if resp.provider_gateway.contains("pool-b") {
                     "pool-b".to_owned()
                 } else {
@@ -1101,11 +1575,13 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
                         "load stats: total={} ok={} fail={} a={} b={}",
                         stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
                     ));
-                    observations
-                        .push("Grid rerouted: gateway-routed load caused A\u{2192}B preference change".to_owned());
+                    observations.push(
+                        "Grid changed the semantic overlay: direct Pool A pressure caused A\u{2192}B preference change"
+                            .to_owned(),
+                    );
                     return ProofResult {
                         success: true,
-                        description: "Gateway-routed load drove A\u{2192}B routing with visible attribution shift"
+                        description: "Direct Pool A pressure drove A\u{2192}B routing with visible attribution shift"
                             .to_owned(),
                         observations,
                     };
@@ -1124,7 +1600,7 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
     observations.push("A\u{2192}B flip did not converge in data plane within timeout".to_owned());
     ProofResult {
         success: false,
-        description: "Gateway-routed load drove A\u{2192}B routing with visible attribution shift".to_owned(),
+        description: "Direct Pool A pressure drove A\u{2192}B routing with visible attribution shift".to_owned(),
         observations,
     }
 }
@@ -1151,16 +1627,23 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
         };
     }
     observations.push("pressure generator scaled to 0 replicas".to_owned());
+    observations.push("pressure stopped before recovery measurement".to_owned());
     observations.push(format!(
         "final load stats: total={} ok={} fail={} a={} b={}",
         final_stats.total, final_stats.ok, final_stats.fail, final_stats.a_reqs, final_stats.b_reqs
     ));
 
+    // Allow the scaled-to-zero pressure pods to terminate before sampling
+    // recovery. This is a control-plane settling interval, not unmeasured
+    // traffic: the measured recovery window starts only after pressure has
+    // stopped and the serving-revision barrier is checked below.
+    std::thread::sleep(Duration::from_secs(5));
+
     eprintln!("  [RECOVERY] Pressure stopped; waiting for Pool A to drain and regain rank 0");
 
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     let mut last_reconcile_trigger = Instant::now();
-    let mut last_route = String::from("-");
+    let last_route = String::from("-");
 
     for cluster in CLUSTERS {
         trigger_gridnetwork_reconcile(cluster);
@@ -1190,41 +1673,108 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
 
         if row_a.rank == 0 && recovery_condition_met(context.scoring_flavor, &epp_a) {
             eprintln!(
-                "  [RECOVERY] Pool A drained (queue={:.1} kv={:.2}); sending verification request",
+                "  [RECOVERY] Pool A drained (queue={:.1} kv={:.2}); checking the serving barrier",
                 epp_a.queue_size, epp_a.kv_cache
             );
-            let probe_ctx = kind_context("pool-a");
-            if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
-                last_route = if resp.provider_gateway.contains("pool-a") {
-                    "pool-a".to_owned()
-                } else {
-                    "pool-b".to_owned()
-                };
-                if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
-                    eprintln!("  [RECOVERED] Pool A is preferred again; request attributed to pool-a");
-                    print_scorecard_with_cause(
-                        "RECOVERED",
-                        &[&row_a, &row_b],
-                        "CLUSTER A",
-                        &candidates,
-                        "Pressure stopped; Pool A drained and regained rank 0.",
-                    );
-                    observations.push(format!(
-                        "recovery: pool-a queue={:.2} kv={:.2} score={:.2} rank=0",
-                        row_a.queue, row_a.kv_cache, row_a.score
-                    ));
-                    observations.push(format!(
-                        "attribution: gateway={} provider={}",
-                        resp.provider_gateway, resp.demo_attribution
-                    ));
-                    observations.push("pool-a recovered to rank 0, pool-a attribution confirmed".to_owned());
-                    return ProofResult {
-                        success: true,
-                        description: "Recovery: measured queue drain restores pool-a, attribution confirmed".to_owned(),
-                        observations,
-                    };
-                }
+            let (revision, resource_version) = match read_consumer_overlay_revisions() {
+                Ok(revisions) => revisions,
+                Err(error) => {
+                    observations.push(format!("recovery overlay read failed: {error}"));
+                    continue;
+                },
+            };
+            if let Err(error) = wait_for_consumer_overlay_revision(&revision) {
+                observations.push(format!("recovery serving barrier failed: {error}"));
+                continue;
             }
+
+            // Recovery must demonstrate the recovered weighted policy, not just
+            // one successful request to the provider that regained rank zero.
+            // Keep pressure stopped while this unbound sample is measured.
+            let sample_start = match read_weighted_sample_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    observations.push(format!("recovery sample start state failed: {error}"));
+                    continue;
+                },
+            };
+            let sample = sample_consumer_traffic("pool-a", 30);
+            let sample_end = match read_weighted_sample_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    observations.push(format!("recovery sample end state failed: {error}"));
+                    continue;
+                },
+            };
+            let state_stable = sample_start.revision == sample_end.revision
+                && sample_start.weight_a == sample_end.weight_a
+                && sample_start.weight_b == sample_end.weight_b;
+            let weights_match = weighted_sample_matches(
+                sample_start.weight_a,
+                sample_start.weight_b,
+                u64::from(sample.pool_a),
+                u64::from(sample.pool_b),
+            );
+            observations.push(format!(
+                "recovery sample start: weights={}/{} revision={} resourceVersion={}",
+                sample_start.weight_a, sample_start.weight_b, sample_start.revision, sample_start.resource_version
+            ));
+            observations.push(format!(
+                "recovery sample end: weights={}/{} revision={} resourceVersion={}",
+                sample_end.weight_a, sample_end.weight_b, sample_end.revision, sample_end.resource_version
+            ));
+            observations.push(format!(
+                "recovery overlay state: pool-a queue={:.2} weight={} rank={}; pool-b queue={:.2} weight={} rank={}; revision={} resourceVersion={}",
+                row_a.queue,
+                row_a.traffic_weight,
+                row_a.rank,
+                row_b.queue,
+                row_b.traffic_weight,
+                row_b.rank,
+                revision,
+                resource_version
+            ));
+            observations.push(format!(
+                "recovery weighted sample: ok={}/{} pool-a={} pool-b={} failures={} stable_state={}",
+                sample.ok,
+                sample.attempted,
+                sample.pool_a,
+                sample.pool_b,
+                format_sample_failures(&sample),
+                state_stable
+            ));
+            if sample.ok == 30 && state_stable && weights_match {
+                eprintln!(
+                    "  [RECOVERED] Pool A is rank 0; unbound traffic matched recovered weights ({}/{})",
+                    sample.pool_a, sample.pool_b
+                );
+                print_scorecard_with_cause(
+                    "RECOVERED",
+                    &[&row_a, &row_b],
+                    "CLUSTER A",
+                    &candidates,
+                    "Pressure stopped; Pool A drained and the recovered weighted policy was measured.",
+                );
+                observations.push(
+                    "pool-a recovered to rank 0 and post-recovery distribution matched published weights".to_owned(),
+                );
+                return ProofResult {
+                    success: true,
+                    description:
+                        "Recovery: queue drain restored pool-a and recovered weighted distribution was confirmed"
+                            .to_owned(),
+                    observations,
+                };
+            }
+            observations.push(
+                "post-recovery weighted sample did not match the published weights; refusing to claim recovery"
+                    .to_owned(),
+            );
+            return ProofResult {
+                success: false,
+                description: "Recovery: post-recovery distribution did not match published weights".to_owned(),
+                observations,
+            };
         }
 
         std::thread::sleep(Duration::from_secs(2));
@@ -1385,46 +1935,22 @@ fn scrape_epp_metrics(cluster: &str, mtls: bool) -> EppMetrics {
     parse_epp_metrics(&text)
 }
 
-/// EPP Prometheus metric names accepted for each reading, in priority order.
-///
-/// The endpoint picker's metric names have changed across releases: the
-/// current `llm-d-router-endpoint-picker` build emits the `llm_d_epp_*`
-/// series, older `llm-d-inference-scheduler` builds emit `inference_pool_*`,
-/// and an intermediate build emitted `llm_d_router_epp_*`. Keeping the names
-/// as data lets one accessor serve whichever EPP image the topology pins.
-/// Average per-pool request queue depth, newest EPP series first.
-const EPP_QUEUE_SIZE_METRICS: &[&str] = &[
-    "llm_d_epp_average_queue_size",
-    "inference_pool_average_queue_size",
-    "llm_d_router_epp_average_queue_size",
-];
-/// Average per-pool KV cache utilization, newest EPP series first.
-const EPP_KV_CACHE_METRICS: &[&str] = &[
-    "llm_d_epp_average_kv_cache_utilization",
-    "inference_pool_average_kv_cache_utilization",
-    "llm_d_router_epp_average_kv_cache_utilization",
-];
-/// Ready endpoint/pod count for a pool, newest EPP series first.
-const EPP_READY_METRICS: &[&str] = &[
-    "llm_d_epp_ready_endpoints",
-    "inference_pool_ready_pods",
-    "llm_d_router_epp_ready_endpoints",
-];
-
 /// Parse `EppMetrics` out of raw Prometheus text (functional core of
 /// [`scrape_epp_metrics`], separated out so metric-name-fallback behavior is
 /// unit-testable without a live EPP).
 ///
-/// Each field takes the first series the EPP actually exposes (see
-/// [`EPP_QUEUE_SIZE_METRICS`] and [`EPP_KV_CACHE_METRICS`]), so a build
-/// emitting only the newer or only the older names still yields a real
-/// reading. An absent series must not be read as a silent 0.0: that would
-/// leave a `kvCachePressure` run's pressure phase unannounced even while real
-/// KV pressure is driving the rank flip.
+/// Both `queue_size` and `kv_cache` prefer the canonical `llm_d_epp_*`
+/// series and fall back symmetrically to the legacy metric names.
 fn parse_epp_metrics(text: &str) -> EppMetrics {
     EppMetrics {
-        queue_size: first_prom_value(text, EPP_QUEUE_SIZE_METRICS).unwrap_or(0.0),
-        kv_cache: first_prom_value(text, EPP_KV_CACHE_METRICS).unwrap_or(0.0),
+        queue_size: extract_prom_value(text, "llm_d_epp_average_queue_size")
+            .or_else(|| extract_prom_value(text, "inference_pool_average_queue_size"))
+            .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_queue_size"))
+            .unwrap_or(0.0),
+        kv_cache: extract_prom_value(text, "llm_d_epp_average_kv_cache_utilization")
+            .or_else(|| extract_prom_value(text, "inference_pool_average_kv_cache_utilization"))
+            .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_kv_cache_utilization"))
+            .unwrap_or(0.0),
     }
 }
 
@@ -1472,19 +1998,6 @@ fn extract_prom_value(text: &str, metric_name: &str) -> Option<f64> {
     None
 }
 
-/// Value of the first metric in `names` that is present in `text`, in order.
-fn first_prom_value(text: &str, names: &[&str]) -> Option<f64> {
-    names.iter().find_map(|name| extract_prom_value(text, name))
-}
-
-/// Whether any metric in `names` is emitted as a (non-comment) line in `text`.
-fn any_metric_present(text: &str, names: &[&str]) -> bool {
-    names.iter().any(|name| {
-        text.lines()
-            .any(|line| line.starts_with(name) && !line.starts_with('#'))
-    })
-}
-
 /// Read overlay candidates from the overlay ConfigMap on a cluster.
 fn read_overlay_candidates(cluster: &str) -> Vec<OverlayCandidate> {
     let ctx = kind_context(cluster);
@@ -1513,6 +2026,10 @@ fn read_overlay_candidates(cluster: &str) -> Vec<OverlayCandidate> {
             let breakdown = c
                 .get("score_breakdown")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let traffic_weight = c
+                .get("traffic_weight")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok());
             Some(OverlayCandidate {
                 cluster: cluster_name,
                 rank,
@@ -1520,6 +2037,7 @@ fn read_overlay_candidates(cluster: &str) -> Vec<OverlayCandidate> {
                 fresh,
                 admission_state: admission,
                 breakdown,
+                traffic_weight,
             })
         })
         .collect()
@@ -1541,7 +2059,38 @@ fn overlay_score_for_cluster(candidates: &[OverlayCandidate], cluster_suffix: &s
         .map_or(0.0, |c| c.score)
 }
 
-/// Build a scorecard row from the overlay decision and live EPP metrics.
+/// Get the effective traffic weight for a provider from the accepted overlay.
+fn overlay_weight_for_cluster(candidates: &[OverlayCandidate], cluster_suffix: &str) -> u32 {
+    candidates
+        .iter()
+        .find(|candidate| candidate.cluster.contains(cluster_suffix))
+        .and_then(|candidate| candidate.traffic_weight)
+        .unwrap_or(0)
+}
+
+/// Check a finite weighted sample against the two published candidate weights.
+/// A zero-weight candidate must receive no requests. For positive weights, use
+/// a chi-square bound rather than accepting any observed provider split.
+fn weighted_sample_matches(weight_a: u32, weight_b: u32, count_a: u64, count_b: u64) -> bool {
+    let total = count_a.saturating_add(count_b);
+    if total == 0 || weight_a == 0 && weight_b == 0 {
+        return false;
+    }
+    if weight_a == 0 {
+        return count_a == 0 && count_b == total;
+    }
+    if weight_b == 0 {
+        return count_b == 0 && count_a == total;
+    }
+    let expected_a = total as f64 * f64::from(weight_a) / f64::from(weight_a + weight_b);
+    let expected_b = total as f64 - expected_a;
+    let observed_a = count_a as f64;
+    let observed_b = count_b as f64;
+    let chi_square = (observed_a - expected_a).powi(2) / expected_a + (observed_b - expected_b).powi(2) / expected_b;
+    chi_square <= 9.21
+}
+
+/// Build a scorecard row entirely from the overlay.
 ///
 /// The overlay owns score and rank. EPP owns the raw queue and KV-cache
 /// measurements. Reconstructing raw metrics from score-breakdown weights is
@@ -1563,6 +2112,7 @@ fn build_scorecard_row(
         kv_cache: metrics.kv_cache,
         score,
         rank,
+        traffic_weight: overlay_weight_for_cluster(candidates, cluster_suffix),
     }
 }
 
@@ -1680,7 +2230,7 @@ fn print_live_table_row(row: &LiveTableRow<'_>) {
 
 /// Send an inference request and capture gateway attribution headers.
 fn send_inference_request(kube_context: &str, model: &str) -> Result<InferenceResponse, Box<dyn std::error::Error>> {
-    let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"test"}}]}}"#,);
+    let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"test"}}],"max_tokens":4}}"#,);
     let session_id = format!("probe-{}", format_utc_timestamp());
     let curl_cmd = format!(
         "curl -s -o /dev/null \
@@ -2204,6 +2754,17 @@ fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::e
         "llm-d-epp:llmd-pool-metrics-demo",
         "vllm-vcr:llmd-pool-metrics-demo",
     ];
+    for image in [
+        &context.images.operator,
+        &context.images.gateway,
+        &context.images.overlay_sync,
+        &context.images.epp,
+        &context.images.vcr,
+    ] {
+        if !tags.contains(&image.as_str()) {
+            tags.push(image);
+        }
+    }
     if let Some(nginx) = &context.images.nginx {
         tags.push(nginx);
     }
@@ -2338,7 +2899,9 @@ fn materialize_config(
     forge_config: &Path,
     metrics_transport: MetricsTransport,
     scoring_flavor: ScoringFlavor,
+    pressure_weighted: bool,
     nginx_image: Option<&str>,
+    image_overrides: Option<&ResolvedImages>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = forge_config.parent().unwrap_or_else(|| Path::new("."));
     let resolved = dir.join(".forge.resolved.yaml");
@@ -2349,6 +2912,85 @@ fn materialize_config(
         let anchor = format!("poolName: {cluster}");
         let replacement = format!("{anchor}\n        candidateId: \"{candidate_id}\"");
         result = checked_replace(&result, &anchor, &replacement, 1, &format!("poolName:{cluster}"))?;
+    }
+
+    if let Some(images) = image_overrides {
+        let (gateway_repo, gateway_tag) = split_image_ref(&images.gateway)?;
+        let (operator_repo, operator_tag) = split_image_ref(&images.operator)?;
+        let (overlay_sync_repo, overlay_sync_tag) = split_image_ref(&images.overlay_sync)?;
+        let pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
+
+        for (field, old, image, repo, tag) in [
+            (
+                "gateway",
+                "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3",
+                &images.gateway,
+                gateway_repo.as_str(),
+                gateway_tag.as_str(),
+            ),
+            (
+                "operator",
+                "ghcr.io/praxis-proxy/grid-operator:v0.1.3",
+                &images.operator,
+                operator_repo.as_str(),
+                operator_tag.as_str(),
+            ),
+        ] {
+            result = checked_replace(
+                &result,
+                &format!("{field}Image: \"{old}\""),
+                &format!("{field}Image: \"{image}\""),
+                2,
+                &format!("{field} image reference"),
+            )?;
+            let default_repo = if field == "gateway" {
+                "ghcr.io/praxis-proxy/grid-ai-rollup"
+            } else {
+                "ghcr.io/praxis-proxy/grid-operator"
+            };
+            result = checked_replace(
+                &result,
+                &format!("{field}ImageRepo: \"{default_repo}\""),
+                &format!("{field}ImageRepo: \"{repo}\""),
+                2,
+                &format!("{field} image repository"),
+            )?;
+            result = checked_replace(
+                &result,
+                &format!("{field}ImageTag: \"v0.1.3\""),
+                &format!("{field}ImageTag: \"{tag}\""),
+                2,
+                &format!("{field} image tag"),
+            )?;
+        }
+        result = checked_replace(
+            &result,
+            "repository: \"ghcr.io/praxis-proxy/grid-overlay-sync\"",
+            &format!("repository: \"{overlay_sync_repo}\""),
+            1,
+            "overlay-sync image repository",
+        )?;
+        result = checked_replace(
+            &result,
+            "tag: \"v0.1.3\"",
+            &format!("tag: \"{overlay_sync_tag}\""),
+            1,
+            "overlay-sync image tag",
+        )?;
+        result = checked_replace(
+            &result,
+            "pullPolicy: \"IfNotPresent\"",
+            &format!("pullPolicy: \"{pull_policy}\""),
+            1,
+            "overlay-sync image pull policy",
+        )?;
+        result = checked_replace(
+            &result,
+            "imagePullPolicy: IfNotPresent",
+            &format!("imagePullPolicy: {pull_policy}"),
+            2,
+            "cluster image pull policy",
+        )?;
     }
 
     if metrics_transport == MetricsTransport::MtlsProxy {
@@ -2438,8 +3080,43 @@ fn materialize_config(
         }
     }
 
+    if pressure_weighted {
+        let strategy = scoring_flavor.strategy_yaml();
+        let signal = match scoring_flavor {
+            ScoringFlavor::QueueDepth => "queueDepth",
+            ScoringFlavor::KvCachePressure => "kvCachePressure",
+        };
+        let selection_anchor = format!("              scoringPolicy:\n                strategy: {strategy}");
+        let selection_block = format!(
+            "              scoringPolicy:\n                strategy: {strategy}\n              metricsRefreshInterval: \"10s\"\n              selectionPolicy:\n                mode: weightedRandom\n              placementPolicy:\n                strategy: pressureWeighted\n                pressureWeighted:\n                  signal: {signal}\n                  minimumWeight: 1\n                  maximumWeight: 1000\n                  availabilityFloorPercent: 5\n                  smoothingFactor: 0.35\n                  changeThresholdPercent: 5"
+        );
+        result = checked_replace(
+            &result,
+            &selection_anchor,
+            &selection_block,
+            2,
+            "pressure weighted policy",
+        )?;
+    }
+
     fs::write(&resolved, result)?;
     Ok(resolved)
+}
+
+/// Split a Forge image reference into the repository and tag fields expected
+/// by the chart. Digest-only references cannot be represented by this Forge
+/// template and are rejected instead of silently falling back to a tag.
+fn split_image_ref(image: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+    if image.contains('@') {
+        return Err(format!("Forge image override must use repo:tag, not digest: {image}").into());
+    }
+    let colon = image
+        .rfind(':')
+        .ok_or_else(|| format!("Forge image override has no tag: {image}"))?;
+    if colon <= image.rfind('/').unwrap_or(0) || colon + 1 == image.len() {
+        return Err(format!("Forge image override has an invalid tag: {image}").into());
+    }
+    Ok((image[..colon].to_owned(), image[colon + 1..].to_owned()))
 }
 
 /// Replace `needle` in `content`, failing if the match count differs from `expected`.
@@ -3777,6 +4454,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             mode: "quick".to_owned(),
             metrics_transport: "direct-http".to_owned(),
             scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
+            placement_strategy: "score-preference".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             wall_secs: 42.0,
             success: true,
@@ -3872,12 +4550,10 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     #[test]
     #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
     fn parse_epp_metrics_prefers_llm_d_epp_metric_names() {
-        // The current llm-d-router-endpoint-picker build emits the
-        // llm_d_epp_* series; when several series are present it must win.
         let text = "llm_d_epp_average_queue_size{name=\"pool-a\"} 4.5\n\
                      llm_d_epp_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n\
-                     inference_pool_average_queue_size{name=\"pool-a\"} 9.9\n\
-                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.99\n";
+                     inference_pool_average_queue_size{name=\"pool-a\"} 7.0\n\
+                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.70\n";
         let epp = parse_epp_metrics(text);
         assert_eq!(epp.queue_size, 4.5);
         assert_eq!(epp.kv_cache, 0.35);
@@ -3886,12 +4562,11 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     #[test]
     #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
     fn parse_epp_metrics_falls_back_to_inference_pool_metric_names() {
-        // Older llm-d-inference-scheduler builds expose only inference_pool_*.
-        let text = "inference_pool_average_queue_size{name=\"pool-a\"} 4.5\n\
-                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n";
+        let text = "inference_pool_average_queue_size{name=\"pool-a\"} 5.0\n\
+                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.40\n";
         let epp = parse_epp_metrics(text);
-        assert_eq!(epp.queue_size, 4.5);
-        assert_eq!(epp.kv_cache, 0.35);
+        assert_eq!(epp.queue_size, 5.0);
+        assert_eq!(epp.kv_cache, 0.40);
     }
 
     #[test]
@@ -3917,11 +4592,17 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
-    fn any_metric_present_ignores_comment_lines_and_absence() {
-        let text = "# HELP llm_d_epp_ready_endpoints ready endpoints\n\
-                     llm_d_epp_ready_endpoints{name=\"pool-a\"} 2\n";
-        assert!(any_metric_present(text, EPP_READY_METRICS));
-        assert!(!any_metric_present("no epp metrics here", EPP_READY_METRICS));
+    fn gateway_revision_fields_survive_ansi_stripping() {
+        let logs = "\x1b[32mINFO\x1b[0m accepted_revision\x1b[0m=\x1b[0m\"revision-a\" serving_revision=revision-a";
+        let stripped = strip_gateway_ansi(logs);
+        assert_eq!(
+            latest_gateway_log_field(&stripped, "accepted_revision").as_deref(),
+            Some("revision-a")
+        );
+        assert_eq!(
+            latest_gateway_log_field(&stripped, "serving_revision").as_deref(),
+            Some("revision-a")
+        );
     }
 
     #[test]
@@ -3979,6 +4660,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             mode: "quick".to_owned(),
             metrics_transport: MetricsTransport::DirectHttp.label().to_owned(),
             scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
+            placement_strategy: "score-preference".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             wall_secs: 10.0,
             success: true,
@@ -4006,6 +4688,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             mode: "quick".to_owned(),
             metrics_transport: MetricsTransport::MtlsProxy.label().to_owned(),
             scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
+            placement_strategy: "score-preference".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             wall_secs: 10.0,
             success: true,
@@ -4034,9 +4717,23 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         "\
       properties:
         poolName: pool-a
+        gatewayImage: \"ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3\"
+        operatorImage: \"ghcr.io/praxis-proxy/grid-operator:v0.1.3\"
+        gatewayImageRepo: \"ghcr.io/praxis-proxy/grid-ai-rollup\"
+        gatewayImageTag: \"v0.1.3\"
+        operatorImageRepo: \"ghcr.io/praxis-proxy/grid-operator\"
+        operatorImageTag: \"v0.1.3\"
+        imagePullPolicy: IfNotPresent
 
       properties:
         poolName: pool-b
+        gatewayImage: \"ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3\"
+        operatorImage: \"ghcr.io/praxis-proxy/grid-operator:v0.1.3\"
+        gatewayImageRepo: \"ghcr.io/praxis-proxy/grid-ai-rollup\"
+        gatewayImageTag: \"v0.1.3\"
+        operatorImageRepo: \"ghcr.io/praxis-proxy/grid-operator\"
+        operatorImageTag: \"v0.1.3\"
+        imagePullPolicy: IfNotPresent
 
     llmd-pool-a:
       steps:
@@ -4062,6 +4759,14 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
               scoringPolicy:
                 strategy: queueDepth
+
+              overlay:
+                sidecar:
+                  image:
+                    repository: \"ghcr.io/praxis-proxy/grid-overlay-sync\"
+                    tag: \"v0.1.3\"
+                    pullPolicy: \"IfNotPresent\"
+                  expectedNetwork: \"grid-llmd-pool-metrics\"
 
               scoringPolicy:
                 strategy: queueDepth
@@ -4097,6 +4802,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             &forge_path,
             MetricsTransport::DirectHttp,
             ScoringFlavor::QueueDepth,
+            false,
+            None,
             None,
         )
         .unwrap();
@@ -4136,6 +4843,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             &forge_path,
             MetricsTransport::MtlsProxy,
             ScoringFlavor::QueueDepth,
+            false,
+            None,
             None,
         )
         .unwrap();
@@ -4178,7 +4887,9 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             &forge_path,
             MetricsTransport::MtlsProxy,
             ScoringFlavor::QueueDepth,
+            false,
             Some(custom_image),
+            None,
         )
         .unwrap();
 
@@ -4208,6 +4919,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             &forge_path,
             MetricsTransport::DirectHttp,
             ScoringFlavor::QueueDepth,
+            false,
+            None,
             None,
         )
         .unwrap();
@@ -4233,6 +4946,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             &forge_path,
             MetricsTransport::DirectHttp,
             ScoringFlavor::KvCachePressure,
+            false,
+            None,
             None,
         )
         .unwrap();
@@ -4251,29 +4966,74 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
-    fn materialize_kv_cache_flavor_accepts_preselected_strategy() {
-        let dir = std::env::temp_dir().join("grid-test-materialize-kv-cache-preselected");
+    fn materialize_pressure_weighted_adds_public_policy() {
+        let dir = std::env::temp_dir().join("grid-test-materialize-pressure-weighted");
         drop(fs::create_dir_all(&dir));
-        let forge_path = dir.join("forge-kv-cache.yaml");
-        let config = test_forge_config().replace("strategy: queueDepth", "strategy: kvCachePressure");
-        fs::write(&forge_path, config).unwrap();
+        let forge_path = dir.join("forge.yaml");
+        fs::write(&forge_path, test_forge_config()).unwrap();
 
         let resolved = materialize_config(
             &forge_path,
             MetricsTransport::DirectHttp,
-            ScoringFlavor::KvCachePressure,
+            ScoringFlavor::QueueDepth,
+            true,
+            None,
             None,
         )
         .unwrap();
         let content = fs::read_to_string(&resolved).unwrap();
-
-        assert_eq!(
-            content.matches("strategy: kvCachePressure").count(),
-            2,
-            "a preselected kv-cache config must remain unchanged"
-        );
-        assert!(!content.contains("strategy: queueDepth"));
+        assert_eq!(content.matches("mode: weightedRandom").count(), 2);
+        assert_eq!(content.matches("metricsRefreshInterval: \"10s\"").count(), 2);
+        assert_eq!(content.matches("strategy: pressureWeighted").count(), 2);
+        assert_eq!(content.matches("signal: queueDepth").count(), 2);
+        assert!(!content.contains("selection_policy"));
         drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn materialize_applies_exact_local_image_overrides() {
+        let dir = std::env::temp_dir().join("grid-test-materialize-image-overrides");
+        drop(fs::create_dir_all(&dir));
+        let forge_path = dir.join("forge.yaml");
+        fs::write(&forge_path, test_forge_config()).unwrap();
+        let images = ResolvedImages {
+            gateway: "praxis-ai:test-local".to_owned(),
+            operator: "grid-operator:test-local".to_owned(),
+            epp: "epp:test-local".to_owned(),
+            vcr: "vcr:test-local".to_owned(),
+            overlay_sync: "grid-overlay-sync:test-local".to_owned(),
+            nginx: None,
+        };
+
+        let resolved = materialize_config(
+            &forge_path,
+            MetricsTransport::DirectHttp,
+            ScoringFlavor::QueueDepth,
+            false,
+            None,
+            Some(&images),
+        )
+        .unwrap();
+        let content = fs::read_to_string(&resolved).unwrap();
+        assert_eq!(content.matches("gatewayImage: \"praxis-ai:test-local\"").count(), 2);
+        assert_eq!(
+            content.matches("operatorImage: \"grid-operator:test-local\"").count(),
+            2
+        );
+        assert_eq!(content.matches("repository: \"grid-overlay-sync\"").count(), 1);
+        assert!(content.contains("tag: \"test-local\""));
+        assert!(!content.contains("ghcr.io/praxis-proxy/grid-operator:v0.1.3"));
+        assert!(!content.contains("ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"));
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn split_image_ref_rejects_digest_only_references() {
+        assert!(split_image_ref("registry.example/grid/operator@sha256:abc").is_err());
+        assert_eq!(
+            split_image_ref("registry.example/grid/operator:v1").unwrap(),
+            ("registry.example/grid/operator".to_owned(), "v1".to_owned())
+        );
     }
 
     #[test]
@@ -4286,6 +5046,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             &forge_path,
             MetricsTransport::DirectHttp,
             ScoringFlavor::QueueDepth,
+            false,
+            None,
             None,
         );
         assert!(result.is_err(), "must fail when anchors are missing");
@@ -4311,5 +5073,17 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         let images = resolve_images(MetricsTransport::MtlsProxy).unwrap();
         assert!(images.nginx.is_some(), "mTLS must resolve nginx image");
         assert_eq!(images.nginx.unwrap(), DEFAULT_NGINX_IMAGE);
+    }
+
+    #[test]
+    fn weighted_sample_requires_zero_weight_candidate_to_receive_no_requests() {
+        assert!(weighted_sample_matches(0, 1000, 0, 30));
+        assert!(!weighted_sample_matches(0, 1000, 1, 29));
+    }
+
+    #[test]
+    fn weighted_sample_rejects_equal_weights_when_all_requests_choose_one_pool() {
+        assert!(!weighted_sample_matches(500, 500, 0, 30));
+        assert!(weighted_sample_matches(500, 500, 14, 16));
     }
 }
