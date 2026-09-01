@@ -1401,6 +1401,136 @@ mod tests {
     }
 
     #[test]
+    fn receive_item_rejects_a_broadcast_whose_revision_was_tampered_after_signing() {
+        // A relay that forwards someone else's broadcast is a legitimate path
+        // (A -> B -> C); a relay that *edits* the payload in transit is not.
+        // Sign with the correct key, then mutate the struct before encoding
+        // to simulate exactly that: bytes that left the origin correctly
+        // signed but arrived changed.
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (signing_key, pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![pubkey])));
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(now_ms()));
+        let signature = crate::signing::sign_ecdsa_p256(
+            &signing_key,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let mut tampered = unsigned.with_signature(Some(signature));
+        tampered.revision = 99;
+        let bytes = tampered.encode().unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::SignatureInvalid { origin_site }) if origin_site.as_str() == "site-p"),
+            "a broadcast edited after signing must fail verification even though the signature itself is well-formed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn receive_item_rejects_a_broadcast_whose_tenant_spend_was_tampered_after_signing() {
+        // The concrete attack grid#75 is worried about: a relay (or a peer
+        // holding only the shared SWIM key) inflates a tenant's reported
+        // spend on someone else's correctly-signed broadcast. Proves that
+        // attack lands as a rejected broadcast, not a silently-merged one.
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (signing_key, pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![pubkey])));
+
+        let mut snap = snapshot("site-p", 1, 0.1);
+        snap.increment_tenant_spend("tenant-x", 500);
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snap, None).with_signed_at(Some(now_ms()));
+        let signature = crate::signing::sign_ecdsa_p256(
+            &signing_key,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let mut tampered = unsigned.with_signature(Some(signature));
+        tampered.snapshot.increment_tenant_spend("tenant-x", 1_000_000);
+        let bytes = tampered.encode().unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::SignatureInvalid { origin_site }) if origin_site.as_str() == "site-p"),
+            "an inflated tenant_spend added after signing must be rejected, got {result:?}"
+        );
+        assert!(
+            !handler.snapshot().tenant_spend.contains_key("tenant-x"),
+            "a rejected tampered broadcast must not merge its forged tenant_spend into the snapshot"
+        );
+    }
+
+    #[test]
+    fn receive_item_rejects_a_broadcast_signed_by_a_key_dropped_from_a_completed_rotation() {
+        // Same rejection path as the wrong-key test, but exercised as a
+        // rotation *completion*: the old key is fully retired (not just
+        // outnumbered by a new one), so a straggler still signing with it
+        // must be rejected exactly like an impostor would be.
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (retired_key, retired_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![retired_pubkey])));
+        let (_current_key, current_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![current_pubkey])));
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(now_ms()));
+        let signature = crate::signing::sign_ecdsa_p256(
+            &retired_key,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let bytes = unsigned
+            .with_signature(Some(signature))
+            .encode()
+            .unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::SignatureInvalid { origin_site }) if origin_site.as_str() == "site-p"),
+            "a broadcast signed by a key retired at the end of rotation must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn receive_item_rejects_a_malformed_signature_without_panicking() {
+        // Distinct from "signed by the wrong key": this signature isn't a
+        // well-formed ECDSA signature at all, proving the verifier fails
+        // closed on garbage input instead of panicking on it.
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (_signing_key, pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![pubkey])));
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(now_ms()));
+        let bytes = unsigned
+            .with_signature(Some(vec![0xFF; 4]))
+            .encode()
+            .unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::SignatureInvalid { origin_site }) if origin_site.as_str() == "site-p"),
+            "a malformed signature must be rejected cleanly, not panic, got {result:?}"
+        );
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "verifies acceptance under both the 'next' and 'current' pinned keys in one proof"
