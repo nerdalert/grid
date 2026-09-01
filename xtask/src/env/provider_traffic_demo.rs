@@ -1000,16 +1000,15 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
         std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "praxis-ai:provider-traffic-demo".to_owned());
     let operator =
         std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
-    let overlay_sync = crate::env::image_overrides::overlay_sync_image();
     let vcr = crate::env::image_overrides::vcr_image();
 
-    for image in [&gateway, &operator, &overlay_sync, &vcr] {
+    for image in [&gateway, &operator, &vcr] {
         require_local_image(image)?;
         eprintln!("  verified local image: {image}");
     }
 
     for cluster in CLUSTERS {
-        for image in [&gateway, &operator, &overlay_sync, &vcr] {
+        for image in [&gateway, &operator, &vcr] {
             eprintln!("  loading {image} into {cluster}...");
             let output = Command::new(forge_bin.as_os_str())
                 .arg("--config")
@@ -1932,13 +1931,11 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) {
         std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "praxis-ai:provider-traffic-demo".to_owned());
     let operator_image =
         std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
-    let overlay_sync_image = crate::env::image_overrides::overlay_sync_image();
     let vcr_image = crate::env::image_overrides::vcr_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
 
     let (gateway_repo, gateway_tag) = parse_image_ref(&gateway_image);
     let (operator_repo, operator_tag) = parse_image_ref(&operator_image);
-    let (overlay_sync_repo, overlay_sync_tag) = parse_image_ref(&overlay_sync_image);
 
     if let Some(spec) = config.get_mut("spec") {
         if let Some(clusters) = spec.get_mut("clusters") {
@@ -1955,9 +1952,6 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) {
                                 ("gatewayImageTag", &gateway_tag),
                                 ("operatorImageRepo", &operator_repo),
                                 ("operatorImageTag", &operator_tag),
-                                ("overlaySyncImage", &overlay_sync_image),
-                                ("overlaySyncImageRepo", &overlay_sync_repo),
-                                ("overlaySyncImageTag", &overlay_sync_tag),
                             ];
                             for (key, val) in pairs {
                                 props_map.insert(
@@ -2084,12 +2078,12 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
         total_phases
     );
 
-    let status = Command::new(&context.forge_bin)
+    let config_status = Command::new(&context.forge_bin)
         .args(["up", "--config"])
         .arg(&context.resolved_config)
         .status()?;
 
-    if !status.success() {
+    if !config_status.success() {
         return Err("Failed to create provider-traffic clusters".into());
     }
 
@@ -2113,12 +2107,12 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
                        stack: &str|
      -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  applying {stack} to {cluster}...");
-        let status = Command::new(forge_bin)
+        let stack_status = Command::new(forge_bin)
             .arg("--config")
             .arg(resolved_config)
             .args(["--non-interactive", "stack", "apply", cluster, stack])
             .status()?;
-        if !status.success() {
+        if !stack_status.success() {
             return Err(format!("Failed to apply {stack} to {cluster}").into());
         }
         Ok(())
@@ -2677,7 +2671,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let mut teardown_success = false;
     let mut run_error = None;
     let mut overlay_state = OverlayState::default();
-    let mut images = BTreeMap::new();
+    let mut image_evidence = BTreeMap::new();
 
     let proof_results = match &setup_ctx {
         Ok(context) => {
@@ -2690,8 +2684,8 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
             match deploy_setup(context) {
                 Ok(state) => {
                     overlay_state = state;
-                    images = match collect_image_evidence() {
-                        Ok(images) => images,
+                    image_evidence = match collect_image_evidence() {
+                        Ok(collected_images) => collected_images,
                         Err(error) => {
                             run_error = Some(format!("image evidence collection failed: {error}"));
                             BTreeMap::new()
@@ -2758,7 +2752,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
         topology: "provider-traffic".to_owned(),
         clusters: CLUSTERS.iter().map(|&s| s.to_owned()).collect(),
         proof_results,
-        images,
+        images: image_evidence,
         overlay_state,
         cluster_health: Vec::new(),     // Will be populated during runtime assertions
         components: Vec::new(),         // Will be populated during runtime assertions
@@ -2791,13 +2785,13 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     reason = "Evidence collection queries the bounded set of deployed component images."
 )]
 fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
-    let mut images = BTreeMap::new();
+    let mut image_evidence = BTreeMap::new();
 
     for cluster in CLUSTERS {
         let context = format!("kind-grid-provider-traffic-{cluster}");
 
         // Get grid operator image
-        let output = Command::new("kubectl")
+        let operator_output = Command::new("kubectl")
             .args([
                 "get",
                 "deployment/grid-operator",
@@ -2810,13 +2804,13 @@ fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::err
             ])
             .output()?;
 
-        if output.status.success() {
-            let operator_image = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            images.insert(format!("{cluster}_operator"), operator_image);
+        if operator_output.status.success() {
+            let operator_image = String::from_utf8_lossy(&operator_output.stdout).trim().to_owned();
+            image_evidence.insert(format!("{cluster}_operator"), operator_image);
         }
 
         // Get consumer gateway image
-        let output = Command::new("kubectl")
+        let consumer_output = Command::new("kubectl")
             .args([
                 "get",
                 "deployment/consumer-gateway",
@@ -2829,13 +2823,13 @@ fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::err
             ])
             .output()?;
 
-        if output.status.success() {
-            let consumer_image = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            images.insert(format!("{cluster}_consumer_gateway"), consumer_image);
+        if consumer_output.status.success() {
+            let consumer_image = String::from_utf8_lossy(&consumer_output.stdout).trim().to_owned();
+            image_evidence.insert(format!("{cluster}_consumer_gateway"), consumer_image);
         }
 
         // Get provider gateway image
-        let output = Command::new("kubectl")
+        let provider_output = Command::new("kubectl")
             .args([
                 "get",
                 "deployment/provider-gateway",
@@ -2848,13 +2842,13 @@ fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::err
             ])
             .output()?;
 
-        if output.status.success() {
-            let provider_image = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            images.insert(format!("{cluster}_provider_gateway"), provider_image);
+        if provider_output.status.success() {
+            let provider_image = String::from_utf8_lossy(&provider_output.stdout).trim().to_owned();
+            image_evidence.insert(format!("{cluster}_provider_gateway"), provider_image);
         }
 
         // Get VCR inference image
-        let output = Command::new("kubectl")
+        let vcr_output = Command::new("kubectl")
             .args([
                 "get",
                 &format!("deployment/vcr-inference-{cluster}"),
@@ -2867,13 +2861,13 @@ fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::err
             ])
             .output()?;
 
-        if output.status.success() {
-            let mock_image = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            images.insert(format!("{cluster}_vcr_inference"), mock_image);
+        if vcr_output.status.success() {
+            let mock_image = String::from_utf8_lossy(&vcr_output.stdout).trim().to_owned();
+            image_evidence.insert(format!("{cluster}_vcr_inference"), mock_image);
         }
     }
 
-    Ok(images)
+    Ok(image_evidence)
 }
 
 #[cfg(test)]
@@ -2881,7 +2875,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_proof_success_creation() {
+    fn proof_success_creation() {
         let mut facts = BTreeMap::new();
         facts.insert("cluster_count".to_owned(), serde_json::Value::Number(3.into()));
         facts.insert("all_healthy".to_owned(), serde_json::Value::Bool(true));
@@ -2899,7 +2893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_failure_creation() {
+    fn proof_failure_creation() {
         let mut facts = BTreeMap::new();
         facts.insert("error_code".to_owned(), serde_json::Value::Number(500.into()));
 
@@ -2916,7 +2910,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assertion_result_error_handling() {
+    fn assertion_result_error_handling() {
         let assertion_fn = || -> AssertionResult { Err("Simulated assertion failure".into()) };
 
         let result = run_assertion("test_assertion", assertion_fn);
@@ -2932,7 +2926,7 @@ mod tests {
 
     #[test]
     #[expect(clippy::too_many_lines, reason = "This test exercises the complete evidence schema.")]
-    fn test_evidence_serialization() {
+    fn evidence_serialization() {
         let evidence = Evidence {
             schema_version: "test".to_owned(),
             mode: "quick".to_owned(),
@@ -2985,7 +2979,7 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_count_validation() {
+    fn proof_count_validation() {
         let names = [
             "cluster_health",
             "component_deployment",
@@ -3002,7 +2996,7 @@ mod tests {
     }
 
     #[test]
-    fn test_evidence_schema_version() {
+    fn evidence_schema_version() {
         assert_eq!(EVIDENCE_SCHEMA_VERSION, "1");
     }
 

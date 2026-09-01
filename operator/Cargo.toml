@@ -44,6 +44,7 @@ zeroize = { workspace = true }
 # Server-side rmcp features, only for the mcp_probe integration tests, which
 # spin up a real Streamable HTTP MCP server to probe against.
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+serde_yaml = { workspace = true }
 tower = { workspace = true }
 
 [lints]

@@ -242,7 +242,7 @@ fn render_selection_policy(policy: Option<&crate::crd::grid_network::SelectionPo
         SelectionMode::RoundRobin => "roundRobin",
         SelectionMode::Random => "random",
     };
-    format!("         selection_policy:\n           mode: {mode}\n")
+    format!("        selection_policy:\n          mode: {mode}\n")
 }
 
 /// Render one `intelligent_route` candidate.
@@ -622,6 +622,22 @@ mod tests {
             .collect()
     }
 
+    fn selection_policy_mode(config: &str) -> Option<String> {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config).ok()?;
+        parsed
+            .get("filter_chains")?
+            .as_sequence()?
+            .first()?
+            .get("filters")?
+            .as_sequence()?
+            .iter()
+            .find(|filter| filter.get("filter").and_then(serde_yaml::Value::as_str) == Some("intelligent_route"))?
+            .get("selection_policy")?
+            .get("mode")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
     // -----------------------------------------------------------------------
     // Renderer: basic structure
     // -----------------------------------------------------------------------
@@ -672,8 +688,7 @@ mod tests {
         let endpoints = endpoint_coverage(&overlay);
         let config = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/run/tls", 8080)
             .unwrap_or_else(|_| std::process::abort());
-        assert!(config.contains("selection_policy:"));
-        assert!(config.contains("mode: roundRobin"));
+        assert_eq!(selection_policy_mode(&config).as_deref(), Some("roundRobin"));
     }
 
     #[test]

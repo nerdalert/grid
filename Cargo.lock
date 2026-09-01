@@ -1774,6 +1774,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
+ "serde_yaml",
  "sha2",
  "swim",
  "thiserror 2.0.20",
