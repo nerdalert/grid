@@ -1,4 +1,4 @@
-# Example Scenarios — 2026
+# Example Scenarios - 2026
 
 Example scenarios for the AI Grid, progressing from
 simple multi-cluster routing to full grid operations
@@ -41,7 +41,7 @@ OpenAI with transparent credential injection.
 breaker failover, credential injection for API
 providers, transparent provider switching.
 
-## Example 3: Full Grid — Clusters + Cloud + APIs
+## Example 3: Full Grid - Clusters + Cloud + APIs
 
 **Setup**: Three clusters, one cloud service, two
 API providers.

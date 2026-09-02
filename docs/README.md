@@ -33,7 +33,7 @@
 
 ## Examples
 
-- [Example Scenarios 2026](examples-2026.md) — progressive scenarios covering
+- [Example Scenarios 2026](examples-2026.md) - progressive scenarios covering
   multi-cluster routing, provider fallback, load balancing, affinity, policy,
   discovery, federation, and partition handling.
 - [Provider Traffic Selection](../tests/e2e/topologies/grid-provider-traffic/README.md) —
@@ -45,10 +45,10 @@
 
 ## Integration Qualifications
 
-- [Provider Traffic Qualification](../tests/e2e/topologies/grid-provider-traffic/README.md) —
+- [Provider Traffic Qualification](../tests/e2e/topologies/grid-provider-traffic/README.md) -
   proves multi-cluster discovery, accepted-overlay delivery, request-time
   round-robin selection, provider attribution, and stable routing.
-- [Distributed Token Quota Qualification](../tests/e2e/topologies/grid-token-rate-limit/README.md) —
+- [Distributed Token Quota Qualification](../tests/e2e/topologies/grid-token-rate-limit/README.md) -
   proves shared identity-scoped quota enforcement across gateway replicas,
   regional provider selection, expiry, restart persistence, fail-closed state
   storage, and storage-network isolation.

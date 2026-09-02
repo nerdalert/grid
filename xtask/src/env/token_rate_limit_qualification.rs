@@ -2,8 +2,8 @@
 //!
 //! This is the first-class replacement for the removed `validate.sh`. It deploys
 //! the three-cluster (west/central/east, presented as New York/London/Tokyo)
-//! quota topology in explicit dependency order — Forge does not infer
-//! cross-cluster capture ordering — then proves the quota and routing contract
+//! quota topology in explicit dependency order. Forge does not infer
+//! cross-cluster capture ordering, so the runner then proves the quota and routing contract
 //! with typed evidence. Requests are issued from ephemeral in-cluster curl pods
 //! rather than host port-forwards, which keeps cleanup free of host child
 //! processes. No secrets, authorization values, Valkey passwords, or kubeconfig
@@ -336,6 +336,15 @@ fn kubectl(cluster: &str, args: &[&str], secs: u64) -> Result<Output, Box<dyn st
     run_timed("kubectl", &full, secs)
 }
 
+/// Run `kubectl` while preserving non-zero command output for assertions that
+/// distinguish a protocol response from a network timeout.
+fn kubectl_unchecked(cluster: &str, args: &[&str], secs: u64) -> Result<Output, Box<dyn std::error::Error>> {
+    let context = context_for(cluster);
+    let mut full = vec!["--context", &context, "-n", NAMESPACE];
+    full.extend_from_slice(args);
+    spawn_timed("kubectl", &full, secs)
+}
+
 /// Verify the required external tools exist.
 fn require_tools() -> Result<(), Box<dyn std::error::Error>> {
     for tool in ["kubectl", "kind", "timeout", "docker"] {
@@ -424,7 +433,7 @@ fn classify(status: u16) -> Outcome {
 /// Parse curl header-dump (`-D -`) output into status and provider site.
 ///
 /// The status is read from the last `HTTP/<v> <code>` status line, never from a
-/// `-w` trailer: `kubectl run --rm` appends a `pod "…" deleted` message with no
+/// `-w` trailer: `kubectl run --rm` appends a `pod "..." deleted` message with no
 /// separating newline, which would corrupt a trailing status code.
 fn parse_probe_output(raw: &str) -> (u16, Option<String>) {
     let status = raw
@@ -532,6 +541,110 @@ fn probe(label: &str, gateway: &str, credential: Credential) -> Result<HttpResul
     })
 }
 
+/// Restricted long-lived curl pod used to remove pod scheduling from the
+/// concurrency measurement.
+#[expect(
+    clippy::too_many_lines,
+    reason = "pod creation, restricted security, and readiness form one lifecycle"
+)]
+fn create_concurrency_client(index: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let pod = format!("quota-concurrent-{index}-{sequence}");
+    let overrides = serde_json::json!({
+        "spec": {
+            "automountServiceAccountToken": false,
+            "securityContext": {
+                "runAsNonRoot": true,
+                "runAsUser": 1000,
+                "seccompProfile": { "type": "RuntimeDefault" }
+            },
+            "containers": [{
+                "name": pod,
+                "image": CURL_IMAGE,
+                "command": ["sleep", "300"],
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "runAsUser": 1000,
+                    "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true,
+                    "capabilities": { "drop": ["ALL"] }
+                }
+            }]
+        }
+    })
+    .to_string();
+    kubectl(
+        "west",
+        &[
+            "run",
+            &pod,
+            &format!("--image={CURL_IMAGE}"),
+            "--restart=Never",
+            "--overrides",
+            &overrides,
+            "--command",
+            "--",
+            "sleep",
+            "300",
+        ],
+        60,
+    )?;
+    let ready = poll_until(Duration::from_secs(60), Duration::from_secs(1), || {
+        let output = kubectl("west", &["get", "pod", &pod, "-o", "json"], 20)?;
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let running = value.pointer("/status/phase").and_then(serde_json::Value::as_str) == Some("Running");
+        let container_ready = value
+            .pointer("/status/containerStatuses/0/ready")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        Ok((running && container_ready).then_some(()))
+    });
+    if let Err(error) = ready {
+        drop(kubectl(
+            "west",
+            &["delete", "pod", &pod, "--ignore-not-found=true", "--wait=true"],
+            30,
+        ));
+        return Err(error);
+    }
+    Ok(pod)
+}
+
+/// Issue one request from an already-running concurrency client.
+fn exec_concurrency_probe(pod: &str, label: &str, gateway: &str) -> Result<HttpResult, Box<dyn std::error::Error>> {
+    let url = consumer_url(gateway);
+    let curl = curl_args(&url, Credential::Valid, REQUEST_BODY);
+    let mut args = vec!["exec", pod, "--"];
+    args.extend(curl.iter().map(String::as_str));
+    let output = kubectl("west", &args, 30)?;
+    let raw = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (status, provider_site) = parse_probe_output(&raw);
+    Ok(HttpResult {
+        label: label.to_owned(),
+        status,
+        provider_site,
+    })
+}
+
+/// Best-effort cleanup for pre-created concurrency clients on every exit path.
+struct ConcurrencyClients(Vec<String>);
+
+impl Drop for ConcurrencyClients {
+    fn drop(&mut self) {
+        for pod in &self.0 {
+            drop(kubectl(
+                "west",
+                &["delete", "pod", pod, "--ignore-not-found=true", "--wait=true"],
+                30,
+            ));
+        }
+    }
+}
+
 /// Run a `valkey-cli` command inside the Valkey pod; never logs the password.
 fn valkey_cli(query: &str, secs: u64) -> Result<String, Box<dyn std::error::Error>> {
     let script = format!("valkey-cli -a \"${{VALKEY_PASSWORD}}\" --no-auth-warning {query}");
@@ -545,7 +658,7 @@ fn valkey_cli(query: &str, secs: u64) -> Result<String, Box<dyn std::error::Erro
 
 /// Count settled quota entries in the shared sliding window.
 ///
-/// The limiter stores each identity's admitted requests in a `…:settled` sorted
+/// The limiter stores each identity's admitted requests in a `...:settled` sorted
 /// set; its cardinality is the trailing-window occupancy. Counter keys
 /// (`active-count`, `reservation-seq`) and the `:keys` index are intentionally
 /// excluded so this reflects real window consumption.
@@ -954,23 +1067,31 @@ fn scenario_shared_budget(
 }
 
 /// Fire `count` concurrent valid probes and sample the shared reservation
-/// ledger while they overlap. The barrier removes client-side launch jitter;
-/// the active hash is sampled independently of completed HTTP responses.
+/// ledger while they overlap. Every client pod is Running before the barrier
+/// releases its request, removing pod scheduling from the measurement.
 #[expect(
     clippy::too_many_lines,
     reason = "the bounded concurrent probe lifecycle is kept together"
 )]
 fn concurrent_admitted(count: usize) -> Result<ConcurrentEvidence, Box<dyn std::error::Error>> {
+    let mut clients = ConcurrencyClients(Vec::with_capacity(count));
+    for index in 0..count {
+        clients.0.push(create_concurrency_client(index)?);
+    }
     let barrier = Arc::new(Barrier::new(count + 1));
     let completed = Arc::new(AtomicUsize::new(0));
-    let handles: Vec<_> = (0..count)
-        .map(|index| {
+    let handles: Vec<_> = clients
+        .0
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, pod)| {
             let gateway = consumer_for(index).to_owned();
             let barrier = Arc::clone(&barrier);
             let completed = Arc::clone(&completed);
             std::thread::spawn(move || {
                 barrier.wait();
-                let result = probe(&format!("concurrent-{index}"), &gateway, Credential::Valid)
+                let result = exec_concurrency_probe(&pod, &format!("concurrent-{index}"), &gateway)
                     .map_err(|error| error.to_string());
                 completed.fetch_add(1, Ordering::Relaxed);
                 result
@@ -1250,7 +1371,7 @@ fn network_probe_pod(
         );
         let dns_ok = dns.as_ref().is_ok_and(|output| output.status.success());
         facts.insert("dns_succeeded".to_owned(), serde_json::json!(dns_ok));
-        let connect = kubectl(
+        let connect = kubectl_unchecked(
             "west",
             &[
                 "exec",
@@ -1262,20 +1383,19 @@ fn network_probe_pod(
             ],
             20,
         );
-        let connect_ok = connect.as_ref().is_ok_and(|output| output.status.success());
+        let connection_output = connect.as_ref().map_or_else(ToString::to_string, |output| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .trim()
+            .to_owned()
+        });
+        let command_succeeded = connect.as_ref().is_ok_and(|output| output.status.success());
+        let connect_ok = redis_connection_reached(command_succeeded, &connection_output);
         facts.insert("connection_allowed".to_owned(), serde_json::json!(connect_ok));
-        facts.insert(
-            "connection_output".to_owned(),
-            serde_json::json!(connect.as_ref().map_or_else(ToString::to_string, |output| {
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                )
-                .trim()
-                .to_owned()
-            })),
-        );
+        facts.insert("connection_output".to_owned(), serde_json::json!(connection_output));
         facts.insert(
             "policy_expectation_met".to_owned(),
             serde_json::json!(dns_ok && (connect_ok == allowed)),
@@ -1289,6 +1409,12 @@ fn network_probe_pod(
     .is_ok();
     facts.insert("pod_deleted".to_owned(), serde_json::json!(deleted));
     Ok(facts)
+}
+
+/// A Redis protocol response proves the `NetworkPolicy` allowed the connection,
+/// even when curl later times out waiting for the persistent socket to close.
+fn redis_connection_reached(command_succeeded: bool, output: &str) -> bool {
+    command_succeeded || output.contains("+PONG") || output.contains("-NOAUTH")
 }
 
 /// Scenario: restricted unlabeled traffic is denied and an allowed quota
@@ -1556,7 +1682,7 @@ fn qualify(session: &Session) -> Result<Collected, Box<dyn std::error::Error>> {
 /// valid provider-site header. Every intermediate status is recorded as
 /// evidence; a persistent non-ready state fails the qualification (it is never
 /// hidden or treated as normal). This readiness gate is distinct from overlay
-/// convergence — the overlay existing does not mean routing is live.
+/// convergence; the overlay existing does not mean routing is live.
 fn await_data_plane_ready(results: &mut Vec<HttpResult>) -> Result<(), Box<dyn std::error::Error>> {
     for gateway in CONSUMERS {
         let start = Instant::now();
@@ -1582,8 +1708,8 @@ fn await_data_plane_ready(results: &mut Vec<HttpResult>) -> Result<(), Box<dyn s
 
 /// Wait for the sliding window to fully age so the next request starts clean.
 ///
-/// The limiter prunes each identity's settled sorted set lazily — only when a
-/// request arrives — so an idle poll for zero entries never completes. Waiting
+/// The limiter prunes each identity's settled sorted set lazily, only when a
+/// request arrives, so an idle poll for zero entries never completes. Waiting
 /// one full window plus a margin guarantees the next request prunes every prior
 /// entry. This is a genuine time condition, not a pollable readiness signal, and
 /// it never mutates Valkey state.
@@ -1673,6 +1799,16 @@ mod tests {
             overrides.pointer("/spec/containers/0/securityContext/capabilities/drop/0"),
             Some(&serde_json::json!("ALL"))
         );
+    }
+
+    #[test]
+    fn redis_response_proves_connectivity_despite_curl_timeout() {
+        assert!(redis_connection_reached(false, "-NOAUTH Authentication required"));
+        assert!(redis_connection_reached(false, "+PONG"));
+        assert!(!redis_connection_reached(
+            false,
+            "curl: (28) Connection timed out after 3000 milliseconds"
+        ));
     }
 
     #[test]
