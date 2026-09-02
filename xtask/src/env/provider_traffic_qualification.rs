@@ -1,4 +1,4 @@
-//! Narrated, evidence-backed provider-traffic demo scenarios.
+//! Narrated, evidence-backed provider-traffic qualification scenarios.
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -996,10 +996,10 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
         return Ok(());
     }
 
-    let gateway =
-        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "praxis-ai:provider-traffic-demo".to_owned());
-    let operator =
-        std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
+    let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE")
+        .unwrap_or_else(|_| "praxis-ai:provider-traffic-qualification".to_owned());
+    let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
+        .unwrap_or_else(|_| "grid-operator:provider-traffic-qualification".to_owned());
     let vcr = crate::env::image_overrides::vcr_image();
 
     for image in [&gateway, &operator, &vcr] {
@@ -1927,10 +1927,10 @@ fn materialize_config(source: &Path) -> Result<PathBuf, Box<dyn std::error::Erro
     reason = "Image override application with structured YAML manipulation; nested ifs follow YAML structure hierarchy"
 )]
 fn apply_image_overrides(config: &mut serde_yaml::Value) {
-    let gateway_image =
-        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "praxis-ai:provider-traffic-demo".to_owned());
-    let operator_image =
-        std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
+    let gateway_image = std::env::var("GRID_XTASK_GATEWAY_IMAGE")
+        .unwrap_or_else(|_| "praxis-ai:provider-traffic-qualification".to_owned());
+    let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
+        .unwrap_or_else(|_| "grid-operator:provider-traffic-qualification".to_owned());
     let vcr_image = crate::env::image_overrides::vcr_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
 
@@ -2538,8 +2538,8 @@ fn update_operator_swim_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let context = format!("kind-grid-provider-traffic-{cluster}");
 
-    let operator_image =
-        std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:provider-traffic-demo".to_owned());
+    let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
+        .unwrap_or_else(|_| "grid-operator:provider-traffic-qualification".to_owned());
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
     let (operator_repo, operator_tag) = parse_image_ref(&operator_image);
 
@@ -2650,7 +2650,7 @@ fn teardown_environment(context: &ProviderTrafficContext) -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// Run the focused provider-traffic demo.
+/// Run the focused provider-traffic qualification.
 #[expect(
     clippy::too_many_lines,
     reason = "The public demo entrypoint keeps setup, proof, evidence, and teardown visible."
@@ -2676,7 +2676,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let proof_results = match &setup_ctx {
         Ok(context) => {
             eprintln!("{OUTPUT_RULE}");
-            eprintln!("Grid Provider Traffic Demo");
+            eprintln!("Grid Provider Traffic Qualification");
             eprintln!("Mode: {}", if mode == DemoMode::Quick { "quick" } else { "full" });
             eprintln!("Config: {}", forge_config.display());
             eprintln!("{OUTPUT_RULE}");

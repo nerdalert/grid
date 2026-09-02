@@ -23,8 +23,8 @@ metadata:
 type: Opaque
 stringData:
   # Demo-only credential; consumers receive the URL through a Secret-backed env var.
-  password: token-rate-limit-demo-only
-  url: redis://:token-rate-limit-demo-only@valkey.grid-system.svc.cluster.local:6379
+  password: token-rate-limit-qualification-only
+  url: redis://:token-rate-limit-qualification-only@valkey.grid-system.svc.cluster.local:6379
 ---
 apiVersion: apps/v1
 kind: Deployment

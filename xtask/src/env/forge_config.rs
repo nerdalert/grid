@@ -84,14 +84,23 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) -> Result<(), Box<dyn s
 
 /// Split an image reference into repository and tag components.
 fn parse_image_ref(image: &str) -> (String, String) {
-    image.rsplit_once(':').map_or_else(
-        || (image.to_owned(), "latest".to_owned()),
-        |(repo, tag)| (repo.to_owned(), tag.to_owned()),
-    )
+    let last_slash = image.rfind('/');
+    image
+        .rfind(':')
+        .filter(|colon| last_slash.is_none_or(|slash| *colon > slash))
+        .map_or_else(
+            || (image.to_owned(), "latest".to_owned()),
+            |colon| {
+                let (repo, tagged) = image.split_at(colon);
+                (repo.to_owned(), tagged.strip_prefix(':').unwrap_or_default().to_owned())
+            },
+        )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use super::parse_image_ref;
 
     #[test]
@@ -104,5 +113,87 @@ mod tests {
             parse_image_ref("repo/image"),
             ("repo/image".to_owned(), "latest".to_owned())
         );
+        assert_eq!(
+            parse_image_ref("localhost:5000/image"),
+            ("localhost:5000/image".to_owned(), "latest".to_owned())
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::too_many_lines,
+        reason = "A test fixture should fail at the exact missing quota-contract field."
+    )]
+    fn quota_consumers_use_the_upstream_limiter_schema_and_shared_rule() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/e2e/topologies/grid-token-rate-limit");
+        let configs = [
+            root.join("configs/consumer/praxis-valkey-a.yaml"),
+            root.join("configs/consumer/praxis-valkey-b.yaml"),
+        ];
+        let mut quota_contract = None;
+
+        for path in configs {
+            let source = fs::read_to_string(&path).expect("read quota consumer config");
+            for removed in ["reservationTimeout", "token_budgets", "estimation", "identity.user_id"] {
+                assert!(
+                    !source.contains(removed),
+                    "{} still contains legacy field {removed}",
+                    path.display()
+                );
+            }
+            assert!(
+                !source.contains("username: bob"),
+                "{} must remain a single-principal qualification",
+                path.display()
+            );
+
+            let config: serde_yaml::Value = serde_yaml::from_str(&source).expect("parse quota consumer config");
+            let filters = config["filter_chains"][0]["filters"]
+                .as_sequence()
+                .expect("filter chain must contain filters");
+            let limiter = filters
+                .iter()
+                .find(|filter| filter["filter"].as_str() == Some("token_rate_limit"))
+                .expect("token_rate_limit filter must exist");
+            let contract = (
+                limiter["backend"]["namespace"].as_str().expect("namespace").to_owned(),
+                limiter["rules"][0]["name"].as_str().expect("rule name").to_owned(),
+                limiter["rules"][0]["algorithm"].as_str().expect("algorithm").to_owned(),
+                limiter["rules"][0]["window"].as_str().expect("window").to_owned(),
+                limiter["rules"][0]["capacity"].as_u64().expect("capacity"),
+                limiter["rules"][0]["reserved_tokens"]
+                    .as_u64()
+                    .expect("reserved tokens"),
+                limiter["rules"][0]["reservation_timeout"]
+                    .as_str()
+                    .expect("reservation timeout")
+                    .to_owned(),
+            );
+            assert_eq!(
+                contract,
+                (
+                    "praxis:grid-token-rate-limit".to_owned(),
+                    "alice-shared-budget".to_owned(),
+                    "sliding_window".to_owned(),
+                    "60s".to_owned(),
+                    60,
+                    15,
+                    "30s".to_owned(),
+                )
+            );
+            assert_eq!(
+                limiter["rules"][0]["match"]["headers"]["x-model"].as_str(),
+                Some("Qwen/Qwen3-0.6B"),
+                "quota must apply only to the validated inference model"
+            );
+
+            if let Some(expected) = quota_contract.as_ref() {
+                assert_eq!(&contract, expected, "both consumers must address the same Valkey rule");
+            } else {
+                quota_contract = Some(contract);
+            }
+        }
     }
 }

@@ -4,7 +4,7 @@ metadata:
   name: vcr-inference-allow-provider-gateway-only
   namespace: grid-system
   labels:
-    app.kubernetes.io/part-of: grid-combined-site
+    app.kubernetes.io/part-of: grid-token-rate-limit
 spec:
   podSelector:
     matchLabels:
@@ -26,7 +26,7 @@ metadata:
   name: vcr-inference-allow-grid-operator-health
   namespace: grid-system
   labels:
-    app.kubernetes.io/part-of: grid-combined-site
+    app.kubernetes.io/part-of: grid-token-rate-limit
 spec:
   podSelector:
     matchLabels:

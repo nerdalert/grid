@@ -1,10 +1,10 @@
-# Demo Scenarios — 2026
+# Example Scenarios — 2026
 
-Demo scenarios for the AI Grid, progressing from
+Example scenarios for the AI Grid, progressing from
 simple multi-cluster routing to full grid operations
 with metrics-driven failover.
 
-## Demo 1: Basic Multi-Cluster Model Routing
+## Example 1: Basic Multi-Cluster Model Routing
 
 **Setup**: Two clusters, each running llm-d with
 different models.
@@ -23,7 +23,7 @@ returns transparently.
 mTLS data plane, grid scoring, SNI-based workload
 access.
 
-## Demo 2: API Provider Fallback
+## Example 2: API Provider Fallback
 
 **Setup**: One cluster running llm-d + one third-party
 API provider.
@@ -41,7 +41,7 @@ OpenAI with transparent credential injection.
 breaker failover, credential injection for API
 providers, transparent provider switching.
 
-## Demo 3: Full Grid — Clusters + Cloud + APIs
+## Example 3: Full Grid — Clusters + Cloud + APIs
 
 **Setup**: Three clusters, one cloud service, two
 API providers.
@@ -64,7 +64,7 @@ response header confirming the routing decision.
 region-aware locality scoring, consumer-only sites,
 multi-site GridNetwork formation.
 
-## Demo 4: Metrics-Driven Load Balancing
+## Example 4: Metrics-Driven Load Balancing
 
 **Setup**: Two clusters with the same model, different
 load levels.
@@ -88,7 +88,7 @@ routing, automatic spillover to API providers when
 self-hosted capacity is exhausted, graceful
 degradation.
 
-## Demo 5: KV Cache Affinity
+## Example 5: KV Cache Affinity
 
 **Setup**: Two clusters with the same model.
 
@@ -105,7 +105,7 @@ continue routing to Cluster A for cache affinity.
 **Demonstrates**: Prefix cache scoring signal, cache-
 aware routing, TTFT improvement from cache hits.
 
-## Demo 6: Budget Enforcement
+## Example 6: Budget Enforcement
 
 **Setup**: Two clusters + one API provider, budget
 configured per tenant.
@@ -124,7 +124,7 @@ requests are rejected with a budget-exceeded error.
 cost constraint, graceful degradation from expensive
 to cheap backends.
 
-## Demo 7: Site Join and Discovery
+## Example 7: Site Join and Discovery
 
 **Setup**: Two clusters already in a GridNetwork. A
 third cluster joins.
@@ -145,7 +145,7 @@ InferenceProviders are visible to A and B.
 GridSite creation, public certificate propagation, site
 lifecycle state machine, capability propagation.
 
-## Demo 8: MCP Tool Federation
+## Example 8: MCP Tool Federation
 
 **Setup**: Two clusters, each with different MCP tools.
 
@@ -164,7 +164,7 @@ transparently.
 tool discovery, transparent tool invocation routing,
 virtual MCP server on the Gateway.
 
-## Demo 9: Failover Under Partition
+## Example 9: Failover Under Partition
 
 **Setup**: Three clusters in a GridNetwork. Network
 partition isolates Cluster C.

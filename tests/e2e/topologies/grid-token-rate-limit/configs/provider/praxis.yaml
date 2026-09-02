@@ -1,4 +1,4 @@
-# Combined-site provider gateway: mTLS listener with Grid peer authentication.
+# Token-quota provider gateway: mTLS listener with Grid peer authentication.
 #
 # This listener requires downstream mTLS. `peer_identity_trust` authenticates
 # and authorizes the consumer gateway before AI-owned x-ai-routing-* fields can
@@ -32,7 +32,7 @@ filter_chains:
 
       - filter: headers
         response_set:
-          - name: X-Grid-Combined-Provider-Gateway
+          - name: X-Grid-Provider-Site
             value: "SITE_PLACEHOLDER"
 
       - filter: provider_route

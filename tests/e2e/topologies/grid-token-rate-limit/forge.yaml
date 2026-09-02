@@ -15,7 +15,7 @@ spec:
 
   clusters:
     - name: west
-      stacks: [metallb, west-operator-base, west-operator-seed, vcr-backend, provider-boundary, west-trust-bootstrap, west-site, site-trust-bootstrap, provider-gateway, valkey, consumer-west-a, consumer-west-b]
+      stacks: [metallb, west-operator-base, west-operator-seed, vcr-backend, provider-boundary, provider-gateway, west-site, west-trust-bootstrap, site-trust-bootstrap, valkey, consumer-west-a, consumer-west-b]
       properties:
         region: west
         role: combined
@@ -33,7 +33,7 @@ spec:
         overlaySyncImageTag: "v0.1.3"
 
     - name: central
-      stacks: [metallb, central-operator-base, central-operator-seed, vcr-backend, provider-boundary, central-trust-bootstrap, central-site, site-trust-bootstrap, provider-gateway]
+      stacks: [metallb, central-operator-base, central-operator-seed, vcr-backend, provider-boundary, provider-gateway, central-site, central-trust-bootstrap, site-trust-bootstrap]
       properties:
         region: central
         role: combined
@@ -51,7 +51,7 @@ spec:
         overlaySyncImageTag: "v0.1.3"
 
     - name: east
-      stacks: [metallb, east-operator-base, east-operator-seed, vcr-backend, provider-boundary, east-trust-bootstrap, east-site, site-trust-bootstrap, provider-gateway]
+      stacks: [metallb, east-operator-base, east-operator-seed, vcr-backend, provider-boundary, provider-gateway, east-site, east-trust-bootstrap, site-trust-bootstrap]
       properties:
         region: east
         role: combined
@@ -259,7 +259,7 @@ spec:
               port: "8443"
 
     vcr-backend:
-      description: vllm-vcr inference backend for demo scenarios
+      description: vllm-vcr inference backend for qualification scenarios
       steps:
         - type: manifest
           path: resources/common/grid-system-namespace.yaml
@@ -284,15 +284,17 @@ spec:
             - bash
             - -c
             - >-
+              set -euo pipefail;
               context=kind-grid-token-rate-limit-{{ cluster.name }};
+              cert_prefix=$(case '{{ cluster.name }}' in west) echo provider-a;; central) echo provider-b;; east) echo provider-c;; *) echo invalid-cluster >&2; exit 1;; esac);
               kubectl --context "$context" -n grid-system create secret generic consumer-gateway-tls
-              --from-file=tls.crt=tests/env/certs/{{ cluster.name }}-cert.pem
-              --from-file=tls.key=tests/env/certs/{{ cluster.name }}-key.pem
+              --from-file=tls.crt=tests/env/certs/${cert_prefix}-cert.pem
+              --from-file=tls.key=tests/env/certs/${cert_prefix}-key.pem
               --from-file=ca.crt=tests/env/certs/ca.pem --dry-run=client -o yaml |
               kubectl --context "$context" apply -f -;
               kubectl --context "$context" -n grid-system create secret generic provider-gateway-tls
-              --from-file=tls.crt=tests/env/certs/{{ cluster.name }}-cert.pem
-              --from-file=tls.key=tests/env/certs/{{ cluster.name }}-key.pem
+              --from-file=tls.crt=tests/env/certs/${cert_prefix}-cert.pem
+              --from-file=tls.key=tests/env/certs/${cert_prefix}-key.pem
               --from-file=ca.crt=tests/env/certs/ca.pem --dry-run=client -o yaml |
               kubectl --context "$context" apply -f -;
               kubectl --context "$context" -n grid-system create secret generic vcr-inference-credential
@@ -360,7 +362,7 @@ spec:
               kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f "$runtime"
 
     west-site:
-      description: West combined site with Grid CRs via grid-site chart
+      description: West quota site with Grid CRs via grid-site chart
       steps:
         - type: helm
           release: grid-site
@@ -410,7 +412,7 @@ spec:
                 address: "{{ captures.west.provider-gateway-ip }}:8443"
                 tls:
                   mode: Mutual
-                  serverName: west.grid.internal
+                  serverName: provider-a.grid.internal
             inferenceProviders:
               - name: vcr-west-provider
                 gridNetworkRef: grid-token-rate-limit
@@ -434,7 +436,7 @@ spec:
                   timeout: "5s"
 
     central-site:
-      description: Central combined site with Grid CRs via grid-site chart
+      description: Central quota site with Grid CRs via grid-site chart
       steps:
         - type: helm
           release: grid-site
@@ -481,7 +483,7 @@ spec:
                 address: "{{ captures.central.provider-gateway-ip }}:8443"
                 tls:
                   mode: Mutual
-                  serverName: central.grid.internal
+                  serverName: provider-b.grid.internal
             inferenceProviders:
               - name: vcr-central-provider
                 gridNetworkRef: grid-token-rate-limit
@@ -505,7 +507,7 @@ spec:
                   timeout: "5s"
 
     east-site:
-      description: East combined site with Grid CRs via grid-site chart
+      description: East quota site with Grid CRs via grid-site chart
       steps:
         - type: helm
           release: grid-site
@@ -552,7 +554,7 @@ spec:
                 address: "{{ captures.east.provider-gateway-ip }}:8443"
                 tls:
                   mode: Mutual
-                  serverName: east.grid.internal
+                  serverName: provider-c.grid.internal
             inferenceProviders:
               - name: vcr-east-provider
                 gridNetworkRef: grid-token-rate-limit
@@ -651,76 +653,6 @@ spec:
           namespace: grid-system
           jsonpath: "{.status.loadBalancer.ingress[0].ip}"
           key: provider-gateway-ip
-          timeout: "60s"
-          interval: "2s"
-
-    consumer-gateway:
-      description: Praxis consumer gateway with operator-managed overlay
-      steps:
-        - type: template-file
-          source: configs/consumer/praxis.yaml
-          target: .forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
-        - type: exec
-          command:
-            - bash
-            - -c
-            - >-
-              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} -n grid-system
-              create configmap consumer-gateway-config
-              --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
-              --dry-run=client -o yaml |
-              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f -
-        - type: helm
-          release: consumer-gateway
-          chart: charts/praxis-gateway
-          version: "0.1.0"
-          namespace: grid-system
-          values:
-            fullnameOverride: "consumer-gateway"
-            image:
-              repository: "{{ cluster.properties.gatewayImageRepo }}"
-              tag: "{{ cluster.properties.gatewayImageTag }}"
-              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
-            podSecurityContext:
-              runAsUser: 100
-              runAsGroup: 101
-            resources:
-              requests:
-                cpu: 100m
-                memory: 64Mi
-              limits:
-                cpu: 500m
-                memory: 256Mi
-            config:
-              existingConfigMap: "consumer-gateway-config"
-            service:
-              type: "LoadBalancer"
-            overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-grid-token-rate-limit-consumer-gateway"
-              sidecar:
-                enabled: true
-                image:
-                  repository: "{{ cluster.properties.overlaySyncImageRepo }}"
-                  tag: "{{ cluster.properties.overlaySyncImageTag }}"
-                  pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
-                expectedNetwork: "grid-token-rate-limit"
-                expectedLocalSite: "{{ cluster.name }}"
-            tls:
-              enabled: true
-              existingSecret: "consumer-gateway-tls"
-            podLabels:
-              grid.praxis-proxy.io/consumer-site: "{{ cluster.name }}"
-        - type: wait
-          resource: deployment/consumer-gateway
-          namespace: grid-system
-          condition: available
-          timeout: "120s"
-        - type: capture
-          resource: svc/consumer-gateway
-          namespace: grid-system
-          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
-          key: consumer-gateway-ip
           timeout: "60s"
           interval: "2s"
 

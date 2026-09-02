@@ -8,68 +8,32 @@ filter_chains:
   - name: main
     filters:
       - filter: basic_auth
-        realm: "Grid token-rate-limit demo"
+        realm: "Grid token-rate-limit qualification"
         strip_authorization: true
         credentials:
           - username: alice
             password: alice-secret
-          - username: bob
-            password: bob-secret
-      - filter: token_rate_limit
-        key:
-          principal:
-            source: metadata
-            name: identity.user_id
-            onMissing: reject
-          model:
-            source: header
-            name: x-model
-            onMissing: reject
-            allowedModels:
-              - Qwen/Qwen3-0.6B
-        reservationTimeout: 2m
-        backend:
-          kind: valkey
-          url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
-          namespace: praxis:token-rate-limit:v1
-        limits:
-          maxKeys: 32
-          maxKeyLength: 256
-          maxActiveReservations: 16
-        rules:
-          - name: alice
-            match:
-              metadata:
-                identity.user_id: alice
-            estimation:
-              strategy: fixed
-              tokens: 5
-            token_budgets:
-              - window: 1m
-                capacity: 60
-          - name: bob
-            match:
-              metadata:
-                identity.user_id: bob
-            estimation:
-              strategy: fixed
-              tokens: 5
-            token_budgets:
-              - window: 10m
-                capacity: 5000
-          - name: default
-            estimation:
-              strategy: fixed
-              tokens: 5
-            token_budgets:
-              - window: 10m
-                capacity: 5000
       - filter: json_body_field
         field: model
         header: X-Model
+      - filter: token_rate_limit
+        backend:
+          kind: valkey
+          url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
+          namespace: praxis:grid-token-rate-limit
+        rules:
+          - name: alice-shared-budget
+            match:
+              headers:
+                x-model: Qwen/Qwen3-0.6B
+            algorithm: sliding_window
+            window: 60s
+            capacity: 60
+            reserved_tokens: 15
+            reservation_timeout: 30s
       - filter: headers
         response_set:
-          - name: X-Grid-Combined-Consumer-Gateway
+          - name: X-Grid-Quota-Consumer-Gateway
             value: "consumer-gateway-b"
       - filter: intelligent_route
         overlay_file: /etc/praxis/routing/routing-overlay.json
@@ -101,7 +65,7 @@ filter_chains:
               client_cert:
                 cert_path: /etc/praxis/tls/tls.crt
                 key_path: /etc/praxis/tls/tls.key
-              sni: west.grid.internal
+              sni: provider-a.grid.internal
               verify: true
             endpoints:
               - "{{ captures.west.provider-gateway-ip }}:8443"
@@ -112,7 +76,7 @@ filter_chains:
               client_cert:
                 cert_path: /etc/praxis/tls/tls.crt
                 key_path: /etc/praxis/tls/tls.key
-              sni: central.grid.internal
+              sni: provider-b.grid.internal
               verify: true
             endpoints:
               - "{{ captures.central.provider-gateway-ip }}:8443"
@@ -123,7 +87,7 @@ filter_chains:
               client_cert:
                 cert_path: /etc/praxis/tls/tls.crt
                 key_path: /etc/praxis/tls/tls.key
-              sni: east.grid.internal
+              sni: provider-c.grid.internal
               verify: true
             endpoints:
               - "{{ captures.east.provider-gateway-ip }}:8443"

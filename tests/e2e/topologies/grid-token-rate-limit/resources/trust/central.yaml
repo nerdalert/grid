@@ -11,7 +11,7 @@ spec:
     address: "{{ captures.west.swim-lb-ip }}:8443"
     tls:
       mode: Mutual
-      serverName: west.grid.internal
+      serverName: provider-a.grid.internal
   trust:
     canonicalFingerprints:
       - PEER_WEST_FINGERPRINT
@@ -29,7 +29,7 @@ spec:
     address: "{{ captures.east.swim-lb-ip }}:8443"
     tls:
       mode: Mutual
-      serverName: east.grid.internal
+      serverName: provider-c.grid.internal
   trust:
     canonicalFingerprints:
       - PEER_EAST_FINGERPRINT

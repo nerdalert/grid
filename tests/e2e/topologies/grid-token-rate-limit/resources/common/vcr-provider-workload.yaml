@@ -62,7 +62,8 @@ spec:
             - name: MOCK_MAX_MODEL_LEN
               value: "512"
             - name: MOCK_TTFT_MS
-              value: "50"
+              # Keep reservations observable during the concurrency proof.
+              value: "500"
             - name: MOCK_ITL_MS
               value: "20"
             - name: MOCK_TIME_FACTOR_UNDER_LOAD

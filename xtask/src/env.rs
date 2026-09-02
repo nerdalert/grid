@@ -17,8 +17,9 @@ pub(crate) mod kubectl;
 pub(crate) mod llmd_pool_metrics_demo;
 pub(crate) mod operator;
 pub(crate) mod operator_overlay;
-pub(crate) mod provider_traffic_demo;
+pub(crate) mod provider_traffic_qualification;
 pub(crate) mod providers;
+pub(crate) mod token_rate_limit_qualification;
 pub(crate) mod trust;
 pub(crate) mod verify;
 pub(crate) mod workload;
@@ -1010,15 +1011,31 @@ pub(crate) enum Action {
         kv_cache: bool,
     },
 
-    /// Create the focused provider-gateway traffic demo, then prove equal
+    /// Qualify the provider-gateway traffic topology, proving equal
     /// selection across its active provider group.
-    RunGridProviderTrafficDemo {
+    RunGridProviderTrafficQualification {
         /// Path to the Forge environment config file.
         #[arg(long, default_value = "tests/e2e/topologies/grid-provider-traffic/forge.yaml")]
         forge_config: PathBuf,
-        /// Demo mode and teardown options. Only `--quick` is supported.
+        /// Run mode and teardown options. Only `--quick` is supported.
         #[command(flatten)]
         options: GlbDemoOptions,
+    },
+
+    /// Run the distributed token-rate-limit topology with structured evidence.
+    RunGridTokenRateLimitQualification {
+        /// Path to the Forge environment config file.
+        #[arg(long, default_value = "tests/e2e/topologies/grid-token-rate-limit/forge.yaml")]
+        forge_config: PathBuf,
+        /// Directory for machine-readable evidence.
+        #[arg(long)]
+        evidence_dir: Option<PathBuf>,
+        /// Expected locally materialized image tag.
+        #[arg(long)]
+        image_tag: Option<String>,
+        /// Keep clusters for debugging instead of automatic teardown.
+        #[arg(long)]
+        keep: bool,
     },
 }
 
@@ -1150,9 +1167,20 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             metrics_mtls,
             kv_cache,
         } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
-        Action::RunGridProviderTrafficDemo { forge_config, options } => {
-            provider_traffic_demo::run(forge_config, options)
+        Action::RunGridProviderTrafficQualification { forge_config, options } => {
+            provider_traffic_qualification::run(forge_config, options)
         },
+        Action::RunGridTokenRateLimitQualification {
+            forge_config,
+            evidence_dir,
+            image_tag,
+            keep,
+        } => token_rate_limit_qualification::run(&token_rate_limit_qualification::Options {
+            forge_config: forge_config.clone(),
+            evidence_dir: evidence_dir.clone(),
+            image_tag: image_tag.clone(),
+            keep: *keep,
+        }),
     }
 }
 
