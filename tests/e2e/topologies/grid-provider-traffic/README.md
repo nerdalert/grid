@@ -134,11 +134,11 @@ Build `praxis-forge` and the two source images from clean Grid and AI checkouts:
 # From the Grid repository.
 cargo build -p forge
 docker build -f deploy/operator/Containerfile \
-  -t grid-operator:provider-traffic-demo .
+  -t grid-operator:provider-traffic-qualification .
 
 # From the Praxis AI repository.
 docker build -f Containerfile \
-  -t praxis-ai:provider-traffic-demo .
+  -t praxis-ai:provider-traffic-qualification .
 ```
 
 The Forge binary is written to `target/debug/praxis-forge`. Add that directory
@@ -152,12 +152,12 @@ cargo test -p xtask provider_traffic --locked
 ```
 
 ```console
-export GRID_XTASK_OPERATOR_IMAGE=grid-operator:provider-traffic-demo
-export GRID_XTASK_GATEWAY_IMAGE=praxis-ai:provider-traffic-demo
+export GRID_XTASK_OPERATOR_IMAGE=grid-operator:provider-traffic-qualification
+export GRID_XTASK_GATEWAY_IMAGE=praxis-ai:provider-traffic-qualification
 export GRID_XTASK_VCR_IMAGE=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
 export GRID_XTASK_IMAGE_PULL_POLICY=Never
 
-cargo xtask env run-grid-provider-traffic-demo \
+cargo xtask env run-grid-provider-traffic-qualification \
   --forge-config tests/e2e/topologies/grid-provider-traffic/forge.yaml \
   --quick \
   --teardown

@@ -31,14 +31,31 @@
 - [CI Kind E2E](architecture/ci-kind-e2e.md) — validation tiers, gate sequence,
   sequencing requirements, and environment dependencies.
 
-## Demos
+## Examples
 
+- [Example Scenarios 2026](examples-2026.md) - progressive scenarios covering
+  multi-cluster routing, provider fallback, load balancing, affinity, policy,
+  discovery, federation, and partition handling.
 - [Provider Traffic Selection](../tests/e2e/topologies/grid-provider-traffic/README.md) —
   runnable three-cluster topology for Grid selection groups and request-time
   round-robin provider choice.
 - [Grid QuickStarts](https://github.com/praxis-proxy/demos) — deployable
-  demonstrations with automated runtime proofs of routing, failover, security
+  examples with automated runtime proofs of routing, failover, security
   boundaries, and provider lifecycle.
+
+## Integration Qualifications
+
+- [Provider Traffic Qualification](../tests/e2e/topologies/grid-provider-traffic/README.md) -
+  proves multi-cluster discovery, accepted-overlay delivery, request-time
+  round-robin selection, provider attribution, and stable routing.
+- [Distributed Token Quota Qualification](../tests/e2e/topologies/grid-token-rate-limit/README.md) -
+  proves shared identity-scoped quota enforcement across gateway replicas,
+  regional provider selection, expiry, restart persistence, fail-closed state
+  storage, and storage-network isolation.
+
+These integration tests create their environments through Forge and execute
+through first-class Rust `xtask` commands. Their topology READMEs document
+image preparation, execution, evidence, and cleanup.
 
 ## Installation
 

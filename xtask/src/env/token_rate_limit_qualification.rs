@@ -1,0 +1,1851 @@
+//! Evidence-backed qualification for the distributed token-rate-limit topology.
+//!
+//! This is the first-class replacement for the removed `validate.sh`. It deploys
+//! the three-cluster (west/central/east, presented as New York/London/Tokyo)
+//! quota topology in explicit dependency order. Forge does not infer
+//! cross-cluster capture ordering, so the runner then proves the quota and routing contract
+//! with typed evidence. Requests are issued from ephemeral in-cluster curl pods
+//! rather than host port-forwards, which keeps cleanup free of host child
+//! processes. No secrets, authorization values, Valkey passwords, or kubeconfig
+//! contents are ever written to evidence.
+
+use std::{
+    collections::BTreeMap,
+    fs::{self, File},
+    io::Write as _,
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Serialize};
+
+/// Default Forge topology used when no `--forge-config` is supplied.
+const TOPOLOGY: &str = "tests/e2e/topologies/grid-token-rate-limit/forge.yaml";
+/// Cluster (site) names in deployment order.
+const CLUSTERS: [&str; 3] = ["west", "central", "east"];
+/// Kubernetes namespace hosting every workload.
+const NAMESPACE: &str = "grid-system";
+/// KIND cluster name prefix; the context is `kind-<prefix>-<site>`.
+const CLUSTER_PREFIX: &str = "grid-token-rate-limit";
+/// West consumer gateway A release name.
+const CONSUMER_A: &str = "consumer-gateway-a";
+/// West consumer gateway B release name.
+const CONSUMER_B: &str = "consumer-gateway-b";
+/// West consumer gateway releases that share one Alice quota.
+const CONSUMERS: [&str; 2] = [CONSUMER_A, CONSUMER_B];
+/// Data-plane listener port on each consumer gateway.
+const CONSUMER_PORT: &str = "8080";
+/// Response header the provider gateway sets for regional attribution.
+const PROVIDER_SITE_HEADER: &str = "x-grid-provider-site";
+/// Valkey key namespace for the shared sliding-window quota.
+const QUOTA_KEY_PREFIX: &str = "praxis:grid-token-rate-limit";
+/// Valkey deployment name (west only).
+const VALKEY_DEPLOY: &str = "valkey";
+/// Pinned curl image for in-cluster probes.
+const CURL_IMAGE: &str = "curlimages/curl:8.12.1";
+/// Rule capacity in tokens for the shared Alice budget.
+const CAPACITY_TOKENS: u32 = 60;
+/// Reserved tokens per admitted request.
+const RESERVED_TOKENS: u32 = 15;
+/// Sliding-window length in seconds.
+const WINDOW_SECS: u64 = 60;
+/// Cargo features that must be compiled into the Praxis AI qualification image.
+const REQUIRED_GATEWAY_FEATURES: &str = "token-rate-limit-filter,praxis-filter/basic-auth-filter";
+/// OCI label used to make the gateway image's feature contract inspectable.
+const GATEWAY_FEATURES_LABEL: &str = "org.praxis-proxy.ai.features";
+/// Alice principal username.
+const ALICE_USER: &str = "alice";
+/// Alice principal password used only by this qualification topology.
+const ALICE_PASS: &str = "alice-secret";
+/// Inference request body; `max_tokens` is small to keep runs fast.
+const REQUEST_BODY: &str =
+    r#"{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"hello"}],"max_tokens":1}"#;
+/// Inference route on the consumer data plane.
+const INFERENCE_PATH: &str = "/v1/chat/completions";
+/// Monotonic suffix source for unique probe pod names.
+static PROBE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+/// CLI options for `cargo xtask env run-grid-token-rate-limit-qualification`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct Options {
+    /// Source Forge configuration to materialize and deploy.
+    #[arg(long, default_value = TOPOLOGY)]
+    pub(crate) forge_config: PathBuf,
+    /// Evidence output directory. Defaults beside the Forge config.
+    #[arg(long)]
+    pub(crate) evidence_dir: Option<PathBuf>,
+    /// Image tag to materialize and load (e.g. `quota-qualification-20260902T023708Z`).
+    #[arg(long)]
+    pub(crate) image_tag: Option<String>,
+    /// Keep Kind resources after completion for debugging.
+    #[arg(long)]
+    pub(crate) keep: bool,
+}
+
+/// A single credential shape exercised by the qualification.
+#[derive(Clone, Copy, Debug)]
+enum Credential {
+    /// Correct Alice basic-auth credential.
+    Valid,
+    /// Correct user, wrong password.
+    WrongPassword,
+    /// No `Authorization` header at all.
+    Missing,
+    /// Syntactically invalid `Authorization` header.
+    Malformed,
+}
+
+/// Classification of a data-plane response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// Request admitted (HTTP 200).
+    Admitted,
+    /// Quota denied (HTTP 429).
+    QuotaDenied,
+    /// Backend unavailable / fail-closed (HTTP 503).
+    FailClosed,
+    /// Authentication rejected (HTTP 401).
+    Unauthorized,
+    /// Any other status or transport failure.
+    Other,
+}
+
+/// One recorded HTTP probe result.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct HttpResult {
+    /// Human label for the probe.
+    pub(crate) label: String,
+    /// HTTP status code (`0` when no response was received).
+    pub(crate) status: u16,
+    /// Regional attribution from the provider-site header, if present.
+    pub(crate) provider_site: Option<String>,
+}
+
+/// One overlay routing candidate as published by the operator.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct OverlayCandidate {
+    /// Provider site of the candidate.
+    pub(crate) site: String,
+    /// Stable candidate identity.
+    pub(crate) stable_id: String,
+    /// Zero-based selection group.
+    pub(crate) selection_group: u32,
+}
+
+/// A parsed, validated routing overlay for one consumer gateway.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct OverlayView {
+    /// Content-addressed overlay revision.
+    pub(crate) revision: String,
+    /// Selection policy mode (`roundRobin` for this topology).
+    pub(crate) selection_policy: String,
+    /// Routing candidates.
+    pub(crate) candidates: Vec<OverlayCandidate>,
+}
+
+/// Result of one qualification scenario.
+#[derive(Debug, Serialize)]
+struct ScenarioResult {
+    /// Scenario name.
+    name: String,
+    /// Whether the scenario proved its property.
+    passed: bool,
+    /// Human-readable detail.
+    detail: String,
+    /// Structured observed facts.
+    facts: BTreeMap<String, serde_json::Value>,
+}
+
+/// Machine-readable evidence document.
+#[derive(Debug, Serialize)]
+struct Evidence {
+    /// Evidence schema version.
+    schema_version: &'static str,
+    /// Topology identifier.
+    topology: &'static str,
+    /// Image tag deployed.
+    image_tag: String,
+    /// Cargo feature contract required of the Praxis AI gateway image.
+    required_gateway_features: &'static str,
+    /// Resolved Forge config path used.
+    resolved_config: String,
+    /// Accepted overlays keyed by consumer gateway.
+    overlays: BTreeMap<String, OverlayView>,
+    /// All recorded HTTP probes.
+    http_results: Vec<HttpResult>,
+    /// Regional distribution of admitted requests.
+    distribution: BTreeMap<String, u32>,
+    /// Scenario outcomes.
+    scenarios: Vec<ScenarioResult>,
+    /// Whether cluster teardown ran and succeeded.
+    cleanup_succeeded: Option<bool>,
+}
+
+/// Accepted overlays keyed by consumer gateway release name.
+type Overlays = BTreeMap<String, OverlayView>;
+
+/// Result of exhausting the budget: (admitted provider sites, quota-denial seen).
+type ExhaustOutcome = (Vec<String>, bool);
+
+/// Collected qualification artifacts assembled before writing evidence.
+struct Collected {
+    /// Accepted overlays per consumer gateway.
+    overlays: Overlays,
+    /// All recorded HTTP probes.
+    results: Vec<HttpResult>,
+    /// Regional distribution of admitted requests.
+    distribution: BTreeMap<String, u32>,
+    /// Scenario outcomes.
+    scenarios: Vec<ScenarioResult>,
+}
+
+/// Results and ledger observations from one synchronized burst.
+struct ConcurrentEvidence {
+    /// Number of successful inference responses.
+    admitted: usize,
+    /// Highest simultaneous reservation count observed.
+    max_active: u64,
+    /// Highest simultaneous reserved-token total observed.
+    max_active_tokens: u64,
+    /// Every response from the burst.
+    results: Vec<HttpResult>,
+}
+
+/// Quota observations collected around a consumer restart.
+struct RestartEvidence {
+    /// Shared quota entries before restarting consumer A.
+    before: u64,
+    /// Shared quota entries after consumer A becomes ready again.
+    after: u64,
+    /// Consumer B's quota outcome before consumer A restarts.
+    peer_before: Outcome,
+    /// Consumer B's quota outcome after consumer A restarts.
+    peer_after: Outcome,
+    /// HTTP status returned by the restarted consumer A.
+    restarted_status: u16,
+    /// Classified quota outcome returned by the restarted consumer A.
+    restarted_outcome: Outcome,
+}
+
+impl RestartEvidence {
+    /// Whether both replicas continued to observe the exhausted shared window.
+    fn passed(&self) -> bool {
+        self.before > 0
+            && self.after >= self.before
+            && self.peer_before == Outcome::QuotaDenied
+            && self.peer_after == Outcome::QuotaDenied
+            && self.restarted_outcome == Outcome::QuotaDenied
+    }
+
+    /// Convert the observations into structured scenario facts.
+    fn facts(&self) -> BTreeMap<String, serde_json::Value> {
+        BTreeMap::from([
+            ("quota_entries_before".to_owned(), serde_json::json!(self.before)),
+            ("quota_entries_after".to_owned(), serde_json::json!(self.after)),
+            (
+                "peer_before_restart_outcome".to_owned(),
+                serde_json::json!(format!("{:?}", self.peer_before)),
+            ),
+            (
+                "peer_after_restart_outcome".to_owned(),
+                serde_json::json!(format!("{:?}", self.peer_after)),
+            ),
+            (
+                "restarted_consumer_status".to_owned(),
+                serde_json::json!(self.restarted_status),
+            ),
+            (
+                "post_restart_outcome".to_owned(),
+                serde_json::json!(format!("{:?}", self.restarted_outcome)),
+            ),
+        ])
+    }
+}
+
+/// Shared session context passed to orchestration helpers.
+struct Session {
+    /// Path to the `praxis-forge` binary.
+    forge: PathBuf,
+    /// Resolved (materialized) Forge config.
+    config: PathBuf,
+    /// Evidence output directory.
+    evidence: PathBuf,
+    /// Image tag deployed.
+    image_tag: String,
+    /// When false, clusters are torn down on drop/exit.
+    keep: bool,
+}
+
+/// Best-effort cleanup on early return. Drop does NOT run on SIGKILL or the
+/// default SIGINT handler; teardown on those paths is not guaranteed.
+struct CleanupGuard<'guard> {
+    /// Borrowed session used to invoke `forge down`.
+    session: &'guard Session,
+    /// When false, drop tears down clusters.
+    disarmed: bool,
+}
+
+impl Drop for CleanupGuard<'_> {
+    fn drop(&mut self) {
+        if !self.disarmed && !self.session.keep {
+            drop(teardown(self.session));
+        }
+    }
+}
+
+/// Kubernetes context for a cluster.
+fn context_for(cluster: &str) -> String {
+    format!("kind-{CLUSTER_PREFIX}-{cluster}")
+}
+
+/// Run a command under a hard `timeout`, capturing output and checking status.
+fn run_timed(program: &str, args: &[&str], secs: u64) -> Result<Output, Box<dyn std::error::Error>> {
+    let output = spawn_timed(program, args, secs)?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    Err(format!(
+        "{program} {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+    .into())
+}
+
+/// Run a command under a hard `timeout` without asserting success.
+fn spawn_timed(program: &str, args: &[&str], secs: u64) -> Result<Output, Box<dyn std::error::Error>> {
+    let deadline = format!("{}s", secs.max(1));
+    let output = Command::new("timeout")
+        .args(["--signal=TERM", "--kill-after=10s", &deadline, program])
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    Ok(output)
+}
+
+/// Run `kubectl` against a cluster's namespace, checking success.
+fn kubectl(cluster: &str, args: &[&str], secs: u64) -> Result<Output, Box<dyn std::error::Error>> {
+    let context = context_for(cluster);
+    let mut full = vec!["--context", &context, "-n", NAMESPACE];
+    full.extend_from_slice(args);
+    run_timed("kubectl", &full, secs)
+}
+
+/// Run `kubectl` while preserving non-zero command output for assertions that
+/// distinguish a protocol response from a network timeout.
+fn kubectl_unchecked(cluster: &str, args: &[&str], secs: u64) -> Result<Output, Box<dyn std::error::Error>> {
+    let context = context_for(cluster);
+    let mut full = vec!["--context", &context, "-n", NAMESPACE];
+    full.extend_from_slice(args);
+    spawn_timed("kubectl", &full, secs)
+}
+
+/// Verify the required external tools exist.
+fn require_tools() -> Result<(), Box<dyn std::error::Error>> {
+    for tool in ["kubectl", "kind", "timeout", "docker"] {
+        let found = Command::new("sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .status()?;
+        if !found.success() {
+            return Err(format!("required tool is unavailable: {tool}").into());
+        }
+    }
+    Ok(())
+}
+
+/// Verify that the local AI image declares the feature set required by this
+/// topology. Gateway startup still validates the actual filter registration;
+/// this label provides an actionable failure before clusters are created.
+fn verify_gateway_image_features(tag: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let image = format!("praxis-ai:{tag}");
+    let format = format!("{{{{ index .Config.Labels \"{GATEWAY_FEATURES_LABEL}\" }}}}");
+    let output = run_timed("docker", &["image", "inspect", "--format", &format, &image], 30)?;
+    let declared = String::from_utf8(output.stdout)?.trim().to_owned();
+    if declares_required_gateway_features(&declared) {
+        return Ok(());
+    }
+    Err(format!(
+        "{image} must declare OCI label {GATEWAY_FEATURES_LABEL}={REQUIRED_GATEWAY_FEATURES}; found {declared:?}. Build the AI image with the required Cargo features before running qualification"
+    )
+    .into())
+}
+
+/// Whether a comma-separated image label includes every required feature.
+fn declares_required_gateway_features(declared: &str) -> bool {
+    REQUIRED_GATEWAY_FEATURES
+        .split(',')
+        .all(|required| declared.split(',').map(str::trim).any(|feature| feature == required))
+}
+
+/// Resolve the evidence directory, defaulting beside the Forge config.
+fn resolve_evidence_dir(options: &Options) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = &options.evidence_dir {
+        return Ok(path.clone());
+    }
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let parent = options.forge_config.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(format!("evidence-token-rate-limit-{stamp}")))
+}
+
+/// Poll `condition` until it yields a value or the timeout elapses.
+fn poll_until<F, T>(timeout: Duration, interval: Duration, condition: F) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: Fn() -> Result<Option<T>, Box<dyn std::error::Error>>,
+{
+    let start = Instant::now();
+    loop {
+        if let Some(value) = condition()? {
+            return Ok(value);
+        }
+        if start.elapsed() >= timeout {
+            return Err("timeout waiting for condition".into());
+        }
+        std::thread::park_timeout(interval);
+    }
+}
+
+/// curl arguments applying the given credential shape (curl encodes basic-auth).
+fn credential_args(credential: Credential) -> Vec<String> {
+    match credential {
+        Credential::Valid => vec!["-u".to_owned(), format!("{ALICE_USER}:{ALICE_PASS}")],
+        Credential::WrongPassword => vec!["-u".to_owned(), format!("{ALICE_USER}:wrong")],
+        Credential::Missing => Vec::new(),
+        Credential::Malformed => vec!["-H".to_owned(), "Authorization: Basic not-valid-base64".to_owned()],
+    }
+}
+
+/// Classify a status code into a quota/auth outcome.
+fn classify(status: u16) -> Outcome {
+    match status {
+        200 => Outcome::Admitted,
+        429 => Outcome::QuotaDenied,
+        503 => Outcome::FailClosed,
+        401 => Outcome::Unauthorized,
+        _ => Outcome::Other,
+    }
+}
+
+/// Parse curl header-dump (`-D -`) output into status and provider site.
+///
+/// The status is read from the last `HTTP/<v> <code>` status line, never from a
+/// `-w` trailer: `kubectl run --rm` appends a `pod "..." deleted` message with no
+/// separating newline, which would corrupt a trailing status code.
+fn parse_probe_output(raw: &str) -> (u16, Option<String>) {
+    let status = raw
+        .lines()
+        .rfind(|line| line.starts_with("HTTP/"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    let site = raw.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(PROVIDER_SITE_HEADER)
+            .then(|| value.trim().to_owned())
+    });
+    (status, site)
+}
+
+/// Build curl arguments for a data-plane probe.
+fn curl_args(url: &str, credential: Credential, body: &str) -> Vec<String> {
+    let mut args = vec![
+        "curl".to_owned(),
+        "-sS".to_owned(),
+        "--max-time".to_owned(),
+        "20".to_owned(),
+        "-o".to_owned(),
+        "/dev/null".to_owned(),
+        "-D".to_owned(),
+        "-".to_owned(),
+        "-H".to_owned(),
+        "Content-Type: application/json".to_owned(),
+    ];
+    args.extend(credential_args(credential));
+    args.extend(["--data".to_owned(), body.to_owned(), url.to_owned()]);
+    args
+}
+
+/// Pod-security overrides for an ephemeral curl pod in a restricted namespace.
+fn curl_pod_overrides(pod: &str, args: &[String]) -> String {
+    let tail: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    serde_json::json!({
+        "spec": {
+            "automountServiceAccountToken": false,
+            "securityContext": { "runAsNonRoot": true, "seccompProfile": { "type": "RuntimeDefault" } },
+            "containers": [{
+                "name": pod, "image": CURL_IMAGE, "command": ["curl"], "args": tail,
+                "securityContext": {
+                    "runAsUser": 1000, "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true, "capabilities": { "drop": ["ALL"] }
+                }
+            }]
+        }
+    })
+    .to_string()
+}
+
+/// Run one ephemeral curl pod and return its captured output.
+fn run_curl_pod(cluster: &str, label: &str, args: &[String]) -> Result<Output, Box<dyn std::error::Error>> {
+    let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let prefix = label.get(..label.len().min(36)).unwrap_or(label);
+    let pod = format!("{prefix}-{sequence}");
+    let overrides = curl_pod_overrides(&pod, args);
+    let context = context_for(cluster);
+    let run_args = [
+        "run",
+        &pod,
+        &format!("--image={CURL_IMAGE}"),
+        "--context",
+        &context,
+        "-n",
+        NAMESPACE,
+        "--rm",
+        "-i",
+        "--restart=Never",
+        "--pod-running-timeout=60s",
+        "--overrides",
+        &overrides,
+    ];
+    spawn_timed("kubectl", &run_args, 90)
+}
+
+/// Alternate consumer gateway by index without slice indexing.
+fn consumer_for(index: usize) -> &'static str {
+    if index.is_multiple_of(2) {
+        CONSUMER_A
+    } else {
+        CONSUMER_B
+    }
+}
+
+/// Consumer service URL for the inference route.
+fn consumer_url(gateway: &str) -> String {
+    format!("http://{gateway}.{NAMESPACE}.svc.cluster.local:{CONSUMER_PORT}{INFERENCE_PATH}")
+}
+
+/// Issue one inference probe against a consumer gateway and record it.
+fn probe(label: &str, gateway: &str, credential: Credential) -> Result<HttpResult, Box<dyn std::error::Error>> {
+    let url = consumer_url(gateway);
+    let args = curl_args(&url, credential, REQUEST_BODY);
+    let output = run_curl_pod("west", label, &args)?;
+    let (status, provider_site) = parse_probe_output(&String::from_utf8_lossy(&output.stdout));
+    Ok(HttpResult {
+        label: label.to_owned(),
+        status,
+        provider_site,
+    })
+}
+
+/// Restricted long-lived curl pod used to remove pod scheduling from the
+/// concurrency measurement.
+#[expect(
+    clippy::too_many_lines,
+    reason = "pod creation, restricted security, and readiness form one lifecycle"
+)]
+fn create_concurrency_client(index: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let pod = format!("quota-concurrent-{index}-{sequence}");
+    let overrides = serde_json::json!({
+        "spec": {
+            "automountServiceAccountToken": false,
+            "securityContext": {
+                "runAsNonRoot": true,
+                "runAsUser": 1000,
+                "seccompProfile": { "type": "RuntimeDefault" }
+            },
+            "containers": [{
+                "name": pod,
+                "image": CURL_IMAGE,
+                "command": ["sleep", "300"],
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "runAsUser": 1000,
+                    "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true,
+                    "capabilities": { "drop": ["ALL"] }
+                }
+            }]
+        }
+    })
+    .to_string();
+    kubectl(
+        "west",
+        &[
+            "run",
+            &pod,
+            &format!("--image={CURL_IMAGE}"),
+            "--restart=Never",
+            "--overrides",
+            &overrides,
+            "--command",
+            "--",
+            "sleep",
+            "300",
+        ],
+        60,
+    )?;
+    let ready = poll_until(Duration::from_secs(60), Duration::from_secs(1), || {
+        let output = kubectl("west", &["get", "pod", &pod, "-o", "json"], 20)?;
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let running = value.pointer("/status/phase").and_then(serde_json::Value::as_str) == Some("Running");
+        let container_ready = value
+            .pointer("/status/containerStatuses/0/ready")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        Ok((running && container_ready).then_some(()))
+    });
+    if let Err(error) = ready {
+        drop(kubectl(
+            "west",
+            &["delete", "pod", &pod, "--ignore-not-found=true", "--wait=true"],
+            30,
+        ));
+        return Err(error);
+    }
+    Ok(pod)
+}
+
+/// Issue one request from an already-running concurrency client.
+fn exec_concurrency_probe(pod: &str, label: &str, gateway: &str) -> Result<HttpResult, Box<dyn std::error::Error>> {
+    let url = consumer_url(gateway);
+    let curl = curl_args(&url, Credential::Valid, REQUEST_BODY);
+    let mut args = vec!["exec", pod, "--"];
+    args.extend(curl.iter().map(String::as_str));
+    let output = kubectl("west", &args, 30)?;
+    let raw = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (status, provider_site) = parse_probe_output(&raw);
+    Ok(HttpResult {
+        label: label.to_owned(),
+        status,
+        provider_site,
+    })
+}
+
+/// Best-effort cleanup for pre-created concurrency clients on every exit path.
+struct ConcurrencyClients(Vec<String>);
+
+impl Drop for ConcurrencyClients {
+    fn drop(&mut self) {
+        for pod in &self.0 {
+            drop(kubectl(
+                "west",
+                &["delete", "pod", pod, "--ignore-not-found=true", "--wait=true"],
+                30,
+            ));
+        }
+    }
+}
+
+/// Run a `valkey-cli` command inside the Valkey pod; never logs the password.
+fn valkey_cli(query: &str, secs: u64) -> Result<String, Box<dyn std::error::Error>> {
+    let script = format!("valkey-cli -a \"${{VALKEY_PASSWORD}}\" --no-auth-warning {query}");
+    let output = kubectl(
+        "west",
+        &["exec", &format!("deploy/{VALKEY_DEPLOY}"), "--", "sh", "-c", &script],
+        secs,
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Count settled quota entries in the shared sliding window.
+///
+/// The limiter stores each identity's admitted requests in a `...:settled` sorted
+/// set; its cardinality is the trailing-window occupancy. Counter keys
+/// (`active-count`, `reservation-seq`) and the `:keys` index are intentionally
+/// excluded so this reflects real window consumption.
+fn quota_entries() -> Result<u64, Box<dyn std::error::Error>> {
+    let keys = valkey_cli(&format!("--scan --pattern \"{QUOTA_KEY_PREFIX}*:settled\""), 30)?;
+    let mut total: u64 = 0;
+    for key in keys.lines().filter(|line| !line.trim().is_empty()) {
+        let card = valkey_cli(&format!("zcard \"{key}\""), 20)?;
+        total = total.saturating_add(card.trim().parse::<u64>().unwrap_or(0));
+    }
+    Ok(total)
+}
+
+/// Sum actual settled charges from the encoded sorted-set members.
+fn settled_tokens() -> Result<u64, Box<dyn std::error::Error>> {
+    let keys = valkey_cli(&format!("--scan --pattern \"{QUOTA_KEY_PREFIX}*:settled\""), 30)?;
+    let mut total = 0;
+    for key in keys.lines().filter(|line| !line.trim().is_empty()) {
+        let members = valkey_cli(&format!("zrange \"{key}\" 0 -1"), 20)?;
+        for member in members.lines().filter(|line| !line.trim().is_empty()) {
+            if let Some(actual) = member.rsplit(':').next() {
+                total += actual.parse::<u64>().unwrap_or(0);
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Observe the backend's atomic namespace-wide active reservation count.
+/// Every rule reservation in this topology uses the same fixed estimate, so
+/// the reserved-token total is derived without a slower key scan. Settled
+/// entries alone cannot distinguish a refund from a request never admitted.
+fn active_reservations() -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    let value = valkey_cli(&format!("get \"{QUOTA_KEY_PREFIX}:active-count\""), 20)?;
+    let count = value.trim().parse::<u64>().unwrap_or(0);
+    let tokens = count.saturating_mul(u64::from(RESERVED_TOKENS));
+    Ok((count, tokens))
+}
+
+/// Deploy `forge up` (cluster creation only; stacks are applied per phase).
+fn forge_up(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    let config = session.config.to_string_lossy().into_owned();
+    let forge = session.forge.to_string_lossy().into_owned();
+    run_timed(&forge, &["--config", &config, "--non-interactive", "up"], 600)?;
+    Ok(())
+}
+
+/// Load one image into every Kind cluster with an explicit pull-free load.
+fn load_image(image: &str) -> Result<(), Box<dyn std::error::Error>> {
+    for cluster in CLUSTERS {
+        let name = format!("{CLUSTER_PREFIX}-{cluster}");
+        run_timed("kind", &["load", "docker-image", image, "--name", &name], 300)?;
+    }
+    Ok(())
+}
+
+/// Load every immutable image referenced by the topology into all clusters.
+fn load_images(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    let tag = &session.image_tag;
+    load_image(&format!("praxis-ai:{tag}"))?;
+    load_image(&format!("grid-operator:{tag}"))?;
+    load_image(&format!("grid-overlay-sync:{tag}"))?;
+    load_image(&crate::env::image_overrides::vcr_image())?;
+    Ok(())
+}
+
+/// Apply a single Forge stack to one cluster.
+fn apply_stack(session: &Session, cluster: &str, stack: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = session.config.to_string_lossy().into_owned();
+    let forge = session.forge.to_string_lossy().into_owned();
+    run_timed(
+        &forge,
+        &[
+            "--config",
+            &config,
+            "--non-interactive",
+            "stack",
+            "apply",
+            cluster,
+            stack,
+        ],
+        300,
+    )?;
+    Ok(())
+}
+
+/// Apply a per-site stack (named `<site>-<suffix>`) across all clusters.
+fn apply_per_site(session: &Session, suffix: &str) -> Result<(), Box<dyn std::error::Error>> {
+    for cluster in CLUSTERS {
+        apply_stack(session, cluster, &format!("{cluster}{suffix}"))?;
+    }
+    Ok(())
+}
+
+/// Apply a shared stack (same name) across all clusters.
+fn apply_shared(session: &Session, stack: &str) -> Result<(), Box<dyn std::error::Error>> {
+    for cluster in CLUSTERS {
+        apply_stack(session, cluster, stack)?;
+    }
+    Ok(())
+}
+
+/// Verify a Service load-balancer IP capture is populated for a cluster.
+fn verify_lb_ip(cluster: &str, service: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let jsonpath = "jsonpath={.status.loadBalancer.ingress[0].ip}";
+    let out = kubectl(cluster, &["get", "svc", service, "-o", jsonpath], 60)?;
+    let ip = String::from_utf8_lossy(&out.stdout);
+    if ip.trim().is_empty() {
+        return Err(format!("{cluster}/{service} has no load-balancer IP").into());
+    }
+    Ok(())
+}
+
+/// Apply operator base and confirm each site published a SWIM IP.
+fn deploy_operator_bases(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    apply_per_site(session, "-operator-base")?;
+    for cluster in CLUSTERS {
+        verify_lb_ip(cluster, "grid-operator-swim")?;
+    }
+    Ok(())
+}
+
+/// Apply provider gateways and confirm each site published its gateway IP.
+fn deploy_provider_gateways(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    apply_shared(session, "provider-gateway")?;
+    for cluster in CLUSTERS {
+        verify_lb_ip(cluster, "provider-gateway")?;
+    }
+    Ok(())
+}
+
+/// Apply Grid sites and trust in the required order (peer pins before self-pin).
+fn deploy_sites_and_trust(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    apply_per_site(session, "-site")?;
+    apply_per_site(session, "-trust-bootstrap")?;
+    apply_shared(session, "site-trust-bootstrap")?;
+    Ok(())
+}
+
+/// Apply the west-only Valkey and both consumer gateways.
+fn deploy_consumers(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    apply_stack(session, "west", "valkey")?;
+    apply_stack(session, "west", "consumer-west-a")?;
+    apply_stack(session, "west", "consumer-west-b")?;
+    Ok(())
+}
+
+/// Emit a progress line to stderr (never includes secrets).
+fn note(message: &str) {
+    eprintln!("[token-rate-limit] {message}");
+}
+
+/// Deploy the whole topology in explicit dependency order.
+fn deploy(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    note("forge up (clusters + network)");
+    forge_up(session)?;
+    note("loading immutable images into all clusters");
+    load_images(session)?;
+    note("phase: metallb");
+    apply_shared(session, "metallb")?;
+    note("phase: operator bases + SWIM captures");
+    deploy_operator_bases(session)?;
+    note("phase: operator seeds");
+    apply_per_site(session, "-operator-seed")?;
+    note("phase: vcr backends + provider boundary");
+    apply_shared(session, "vcr-backend")?;
+    apply_shared(session, "provider-boundary")?;
+    note("phase: provider gateways + captures");
+    deploy_provider_gateways(session)?;
+    note("phase: sites + trust");
+    deploy_sites_and_trust(session)?;
+    note("phase: valkey + consumers");
+    deploy_consumers(session)?;
+    wait_for_consumers()?;
+    Ok(())
+}
+
+/// Wait for both consumer gateway deployments to become available.
+fn wait_for_consumers() -> Result<(), Box<dyn std::error::Error>> {
+    let context = context_for("west");
+    for gateway in CONSUMERS {
+        crate::env::kubectl::wait_for_rollout_ns(&context, gateway, NAMESPACE, "deployment")?;
+    }
+    Ok(())
+}
+
+/// Read and parse one consumer gateway's accepted overlay `ConfigMap`.
+fn read_overlay(gateway: &str) -> Result<OverlayView, Box<dyn std::error::Error>> {
+    let name = format!("grid-overlay-{CLUSTER_PREFIX}-{gateway}");
+    let out = kubectl("west", &["get", "configmap", &name, "-o", "json"], 30)?;
+    let map: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    parse_overlay(&map)
+}
+
+/// Parse the routing overlay JSON embedded in a `ConfigMap` value.
+fn parse_overlay(config_map: &serde_json::Value) -> Result<OverlayView, Box<dyn std::error::Error>> {
+    let raw = config_map
+        .get("data")
+        .and_then(|data| data.get("routing-overlay.json"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("overlay ConfigMap lacks routing-overlay.json")?;
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let overlay = value.get("overlay").ok_or("overlay payload missing")?;
+    let candidates = overlay.get("candidates").ok_or("overlay lacks candidates")?;
+    let candidates: Vec<OverlayCandidate> = serde_json::from_value(candidates.clone())?;
+    let revision = json_str(&value, &["revision", "value"]).ok_or("overlay lacks revision")?;
+    let policy = json_str(overlay, &["selection_policy", "mode"]).ok_or("overlay lacks policy")?;
+    Ok(OverlayView {
+        revision,
+        selection_policy: policy,
+        candidates,
+    })
+}
+
+/// Follow a JSON path of object keys to a string leaf.
+fn json_str(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(key)?;
+    }
+    current.as_str().map(str::to_owned)
+}
+
+/// Confirm an overlay has three round-robin candidates spanning all sites.
+fn validate_overlay(view: &OverlayView) -> Result<(), Box<dyn std::error::Error>> {
+    if view.selection_policy != "roundRobin" || view.candidates.len() != 3 {
+        return Err("overlay must contain three roundRobin candidates".into());
+    }
+    let sites: Vec<&str> = view.candidates.iter().map(|c| c.site.as_str()).collect();
+    let missing = CLUSTERS.iter().any(|site| !sites.contains(site));
+    let unstable = view
+        .candidates
+        .iter()
+        .any(|c| c.stable_id.is_empty() || c.selection_group != 0);
+    if missing || unstable {
+        return Err("overlay candidates lack stable per-site group-zero identities".into());
+    }
+    Ok(())
+}
+
+/// Wait until both consumer overlays converge on three valid candidates.
+fn await_overlay_convergence() -> Result<Overlays, Box<dyn std::error::Error>> {
+    poll_until(Duration::from_secs(240), Duration::from_secs(5), || {
+        let mut views: Overlays = BTreeMap::new();
+        for gateway in CONSUMERS {
+            match read_overlay(gateway).and_then(|view| validate_overlay(&view).map(|()| view)) {
+                Ok(view) => {
+                    views.insert(gateway.to_owned(), view);
+                },
+                Err(_) => return Ok(None),
+            }
+        }
+        Ok(Some(views))
+    })
+}
+
+/// Build a passed/failed scenario result.
+fn scenario(name: &str, passed: bool, detail: String, facts: BTreeMap<String, serde_json::Value>) -> ScenarioResult {
+    ScenarioResult {
+        name: name.to_owned(),
+        passed,
+        detail,
+        facts,
+    }
+}
+
+/// Record a probe into the shared results log and return its outcome.
+fn record(results: &mut Vec<HttpResult>, result: HttpResult) -> Outcome {
+    let outcome = classify(result.status);
+    results.push(result);
+    outcome
+}
+
+/// Scenario: valid Alice auth is admitted on both gateways with attribution.
+fn scenario_valid_auth(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+    let mut facts = BTreeMap::new();
+    let mut ok = true;
+    for gateway in CONSUMERS {
+        let result = probe(&format!("valid-{gateway}"), gateway, Credential::Valid)?;
+        let site = result.provider_site.clone();
+        let admitted = record(results, result) == Outcome::Admitted;
+        facts.insert(
+            gateway.to_owned(),
+            serde_json::json!({ "admitted": admitted, "site": site }),
+        );
+        ok = ok && admitted && site.is_some();
+    }
+    Ok(scenario(
+        "valid_auth",
+        ok,
+        "Alice admitted with regional attribution".to_owned(),
+        facts,
+    ))
+}
+
+/// Issue one probe, record it, and return its classified outcome.
+fn probe_and_record(
+    results: &mut Vec<HttpResult>,
+    label: &str,
+    gateway: &str,
+    credential: Credential,
+) -> Result<Outcome, Box<dyn std::error::Error>> {
+    let result = probe(label, gateway, credential)?;
+    Ok(record(results, result))
+}
+
+/// Scenario: missing and malformed auth are rejected before any reservation.
+fn scenario_auth_rejection(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+    let before = quota_entries()?;
+    let outcomes = [
+        probe_and_record(results, "missing-auth", CONSUMER_A, Credential::Missing)?,
+        probe_and_record(results, "malformed-auth", CONSUMER_A, Credential::Malformed)?,
+        probe_and_record(results, "wrong-password", CONSUMER_A, Credential::WrongPassword)?,
+    ];
+    let after = quota_entries()?;
+    let all_401 = outcomes.iter().all(|outcome| *outcome == Outcome::Unauthorized);
+    let statuses = outcomes
+        .iter()
+        .map(|outcome| format!("{outcome:?}"))
+        .collect::<Vec<_>>();
+    let facts = BTreeMap::from([
+        ("statuses".to_owned(), serde_json::json!(statuses)),
+        (
+            "quota_entries_delta".to_owned(),
+            serde_json::json!(after.saturating_sub(before)),
+        ),
+    ]);
+    let detail = "bad auth rejected without reserving quota".to_owned();
+    Ok(scenario("auth_rejection", all_401 && after <= before, detail, facts))
+}
+
+/// Scenario: readiness/probe traffic does not consume the inference quota.
+fn scenario_probe_no_quota() -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+    let before = quota_entries()?;
+    std::thread::park_timeout(Duration::from_secs(15));
+    let after = quota_entries()?;
+    let spec = kubectl(
+        "west",
+        &[
+            "get",
+            "deploy",
+            CONSUMER_A,
+            "-o",
+            "jsonpath={.spec.template.spec.containers[0].readinessProbe}",
+        ],
+        30,
+    )?;
+    let probe_spec = String::from_utf8_lossy(&spec.stdout).trim().to_owned();
+    let facts = BTreeMap::from([
+        ("quota_entries_before".to_owned(), serde_json::json!(before)),
+        ("quota_entries_after".to_owned(), serde_json::json!(after)),
+        ("readiness_probe".to_owned(), serde_json::json!(probe_spec)),
+    ]);
+    Ok(scenario(
+        "probe_no_quota",
+        after == before,
+        "quota state unchanged across a probe-only interval (no reservation)".to_owned(),
+        facts,
+    ))
+}
+
+/// Exhaust the shared budget from one gateway; return admitted provider sites.
+fn exhaust_budget(results: &mut Vec<HttpResult>) -> Result<ExhaustOutcome, Box<dyn std::error::Error>> {
+    let attempts = (CAPACITY_TOKENS / RESERVED_TOKENS).saturating_add(4);
+    let mut sites = Vec::new();
+    let mut saw_denied = false;
+    for index in 0..attempts {
+        let gateway = consumer_for(index as usize);
+        let result = probe(&format!("exhaust-{index}"), gateway, Credential::Valid)?;
+        if let Some(site) = result.provider_site.clone() {
+            sites.push(site);
+        }
+        if record(results, result) == Outcome::QuotaDenied {
+            saw_denied = true;
+        }
+    }
+    Ok((sites, saw_denied))
+}
+
+/// Scenario: both gateways share one Alice budget and route across all sites.
+fn scenario_shared_budget(
+    results: &mut Vec<HttpResult>,
+    distribution: &mut BTreeMap<String, u32>,
+) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+    reset_window();
+    let (sites, saw_denied) = exhaust_budget(results)?;
+    for site in &sites {
+        *distribution.entry(site.clone()).or_insert(0) += 1;
+    }
+    let denied_b = classify(probe("shared-b-after-exhaust", CONSUMER_B, Credential::Valid)?.status);
+    let all_sites = CLUSTERS.iter().all(|site| distribution.contains_key(*site));
+    let facts = BTreeMap::from([
+        ("distribution".to_owned(), serde_json::json!(distribution)),
+        (
+            "second_gateway_denied".to_owned(),
+            serde_json::json!(denied_b == Outcome::QuotaDenied),
+        ),
+    ]);
+    let passed = saw_denied && all_sites && denied_b == Outcome::QuotaDenied;
+    Ok(scenario(
+        "shared_budget_and_distribution",
+        passed,
+        "shared budget; routed across sites".to_owned(),
+        facts,
+    ))
+}
+
+/// Fire `count` concurrent valid probes and sample the shared reservation
+/// ledger while they overlap. Every client pod is Running before the barrier
+/// releases its request, removing pod scheduling from the measurement.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded concurrent probe lifecycle is kept together"
+)]
+fn concurrent_admitted(count: usize) -> Result<ConcurrentEvidence, Box<dyn std::error::Error>> {
+    let mut clients = ConcurrencyClients(Vec::with_capacity(count));
+    for index in 0..count {
+        clients.0.push(create_concurrency_client(index)?);
+    }
+    let barrier = Arc::new(Barrier::new(count + 1));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = clients
+        .0
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, pod)| {
+            let gateway = consumer_for(index).to_owned();
+            let barrier = Arc::clone(&barrier);
+            let completed = Arc::clone(&completed);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let result = exec_concurrency_probe(&pod, &format!("concurrent-{index}"), &gateway)
+                    .map_err(|error| error.to_string());
+                completed.fetch_add(1, Ordering::Relaxed);
+                result
+            })
+        })
+        .collect();
+    barrier.wait();
+    let start = Instant::now();
+    let mut max_active = 0;
+    let mut max_active_tokens = 0;
+    while completed.load(Ordering::Relaxed) < count {
+        let (active, tokens) = active_reservations()?;
+        max_active = max_active.max(active);
+        max_active_tokens = max_active_tokens.max(tokens);
+        if start.elapsed() >= Duration::from_secs(90) {
+            return Err("concurrent probes did not complete within 90s".into());
+        }
+        std::thread::park_timeout(Duration::from_millis(50));
+    }
+    let mut admitted: usize = 0;
+    let mut results = Vec::with_capacity(count);
+    for handle in handles {
+        let joined = match handle.join() {
+            Ok(inner) => inner,
+            Err(_panic) => return Err("concurrent probe thread panicked".into()),
+        };
+        let result = joined?;
+        if classify(result.status) == Outcome::Admitted {
+            admitted = admitted.saturating_add(1);
+        }
+        results.push(result);
+    }
+    Ok(ConcurrentEvidence {
+        admitted,
+        max_active,
+        max_active_tokens,
+        results,
+    })
+}
+
+/// Scenario: concurrent reservations never admit more than the window allows.
+///
+/// A concurrent burst is evaluated from the reservation ledger, not from a
+/// 60/15 arithmetic assumption. Completed requests may reconcile below their
+/// reservation and refund capacity, so five successful responses alone do not
+/// prove over-admission.
+fn scenario_concurrency(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+    reset_window();
+    let burst = 8;
+    let concurrent = concurrent_admitted(burst)?;
+    results.extend(concurrent.results);
+    let settled = settled_tokens()?;
+    let facts = BTreeMap::from([
+        ("concurrent_burst".to_owned(), serde_json::json!(burst)),
+        ("concurrent_admitted".to_owned(), serde_json::json!(concurrent.admitted)),
+        (
+            "max_active_reservations".to_owned(),
+            serde_json::json!(concurrent.max_active),
+        ),
+        (
+            "max_active_reserved_tokens".to_owned(),
+            serde_json::json!(concurrent.max_active_tokens),
+        ),
+        ("settled_actual_tokens".to_owned(), serde_json::json!(settled)),
+    ]);
+    let passed = concurrent.admitted >= 1
+        && concurrent.admitted < burst
+        && concurrent.max_active >= 2
+        && concurrent.max_active_tokens > u64::from(RESERVED_TOKENS)
+        && concurrent.max_active_tokens <= u64::from(CAPACITY_TOKENS)
+        && settled <= u64::from(CAPACITY_TOKENS);
+    Ok(scenario(
+        "concurrency_no_over_admission",
+        passed,
+        "no over-admission under load".to_owned(),
+        facts,
+    ))
+}
+
+/// Poll until a fresh valid request is admitted after natural window expiry.
+fn await_window_reset() -> Result<(), Box<dyn std::error::Error>> {
+    let timeout = Duration::from_secs(WINDOW_SECS.saturating_add(90));
+    poll_until(timeout, Duration::from_secs(5), || {
+        let result = probe("window-probe", CONSUMER_A, Credential::Valid)?;
+        Ok((classify(result.status) == Outcome::Admitted).then_some(()))
+    })
+}
+
+/// Scenario: the sliding window recovers admission naturally (no mutation).
+fn scenario_window_expiry(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+    reset_window();
+    exhaust_budget(results)?;
+    let start = Instant::now();
+    let recovered = await_window_reset().is_ok();
+    let facts = BTreeMap::from([(
+        "recovery_seconds".to_owned(),
+        serde_json::json!(start.elapsed().as_secs()),
+    )]);
+    Ok(scenario(
+        "window_expiry_recovery",
+        recovered,
+        "admission recovered after real expiry".to_owned(),
+        facts,
+    ))
+}
+
+/// Scenario: restarting a consumer preserves Valkey-backed quota state.
+fn scenario_restart_persistence(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+    reset_window();
+    exhaust_budget(results)?;
+    let before = quota_entries()?;
+    let peer_before = probe("peer-before-restart", CONSUMER_B, Credential::Valid)?;
+    let peer_before_outcome = classify(peer_before.status);
+    record(results, peer_before);
+    restart_consumer(CONSUMER_A)?;
+    let after = quota_entries()?;
+    let peer_after = probe("peer-after-restart", CONSUMER_B, Credential::Valid)?;
+    let peer_after_outcome = classify(peer_after.status);
+    record(results, peer_after);
+    let post_restart = probe("restarted-consumer", CONSUMER_A, Credential::Valid)?;
+    let post_restart_status = post_restart.status;
+    let post_restart_outcome = classify(post_restart.status);
+    record(results, post_restart);
+    let evidence = RestartEvidence {
+        before,
+        after,
+        peer_before: peer_before_outcome,
+        peer_after: peer_after_outcome,
+        restarted_status: post_restart_status,
+        restarted_outcome: post_restart_outcome,
+    };
+    Ok(scenario(
+        "restart_persistence",
+        evidence.passed(),
+        "shared exhausted quota remained visible during and after consumer restart".to_owned(),
+        evidence.facts(),
+    ))
+}
+
+/// Restart one west consumer and wait for the namespace-scoped rollout.
+fn restart_consumer(consumer: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = context_for("west");
+    kubectl("west", &["rollout", "restart", &format!("deployment/{consumer}")], 60)?;
+    crate::env::kubectl::wait_for_rollout_ns(&context, consumer, NAMESPACE, "deployment")
+}
+
+/// Scale the Valkey deployment to a replica count and wait for rollout.
+fn scale_valkey(replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+    kubectl(
+        "west",
+        &[
+            "scale",
+            &format!("deploy/{VALKEY_DEPLOY}"),
+            &format!("--replicas={replicas}"),
+        ],
+        60,
+    )?;
+    if replicas == 0 {
+        return kubectl(
+            "west",
+            &[
+                "wait",
+                "--for=delete",
+                "pod",
+                "-l",
+                "app.kubernetes.io/name=valkey",
+                "--timeout=120s",
+            ],
+            130,
+        )
+        .map(drop);
+    }
+    let context = context_for("west");
+    crate::env::kubectl::wait_for_rollout_ns(&context, VALKEY_DEPLOY, NAMESPACE, "deployment")
+}
+
+/// Scenario: Valkey outage fails closed (503) and recovery restores service.
+fn scenario_valkey_outage(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+    await_window_reset()?;
+    scale_valkey(0)?;
+    let outage = probe("valkey-down", CONSUMER_A, Credential::Valid)?;
+    let provider_not_contacted = outage.provider_site.is_none();
+    let failed_closed = classify(outage.status) == Outcome::FailClosed && provider_not_contacted;
+    record(results, outage);
+    scale_valkey(1)?;
+    let recovered = await_window_reset().is_ok();
+    let facts = BTreeMap::from([
+        ("failed_closed".to_owned(), serde_json::json!(failed_closed)),
+        (
+            "provider_not_contacted".to_owned(),
+            serde_json::json!(provider_not_contacted),
+        ),
+        ("recovered".to_owned(), serde_json::json!(recovered)),
+    ]);
+    Ok(scenario(
+        "valkey_outage_fail_closed",
+        failed_closed && recovered,
+        "fail-closed then recovered".to_owned(),
+        facts,
+    ))
+}
+
+/// Create a long-lived, restricted probe pod. Keeping it alive lets the
+/// qualification independently prove admission, Running, DNS, and network
+/// behavior instead of treating a rejected `kubectl run --rm` as a policy hit.
+#[expect(
+    clippy::too_many_lines,
+    reason = "probe creation, evidence, and idempotent deletion form one lifecycle"
+)]
+fn network_probe_pod(
+    label: &str,
+    allowed: bool,
+) -> Result<BTreeMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
+    let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let pod = format!("{label}-{sequence}");
+    let context = context_for("west");
+    let overrides = serde_json::json!({
+        "spec": {
+            "automountServiceAccountToken": false,
+            "securityContext": {
+                "runAsNonRoot": true,
+                "runAsUser": 1000,
+                "seccompProfile": { "type": "RuntimeDefault" }
+            },
+            "containers": [{
+                "name": pod,
+                "image": CURL_IMAGE,
+                "command": ["sleep", "300"],
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "runAsUser": 1000,
+                    "allowPrivilegeEscalation": false,
+                    "capabilities": { "drop": ["ALL"] }
+                }
+            }]
+        }
+    })
+    .to_string();
+    let labels = if allowed {
+        "grid.praxis-proxy.io/quota-client=true"
+    } else {
+        "qualification=network-policy-negative"
+    };
+    let run_args = [
+        "run",
+        &pod,
+        &format!("--image={CURL_IMAGE}"),
+        "--context",
+        &context,
+        "-n",
+        NAMESPACE,
+        "--restart=Never",
+        "--labels",
+        labels,
+        "--overrides",
+        &overrides,
+        "--command",
+        "--",
+        "sleep",
+        "300",
+    ];
+    run_timed("kubectl", &run_args, 60)?;
+    let phase = poll_until(Duration::from_secs(60), Duration::from_secs(2), || {
+        let output = kubectl("west", &["get", "pod", &pod, "-o", "json"], 20)?;
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        Ok((value.pointer("/status/phase").and_then(serde_json::Value::as_str) == Some("Running")).then_some(value))
+    });
+    let mut facts = BTreeMap::new();
+    let running = phase.is_ok();
+    facts.insert("pod".to_owned(), serde_json::json!(pod));
+    facts.insert("running".to_owned(), serde_json::json!(running));
+    if running {
+        let dns = kubectl(
+            "west",
+            &["exec", &pod, "--", "nslookup", "valkey.grid-system.svc.cluster.local"],
+            20,
+        );
+        let dns_ok = dns.as_ref().is_ok_and(|output| output.status.success());
+        facts.insert("dns_succeeded".to_owned(), serde_json::json!(dns_ok));
+        let connect = kubectl_unchecked(
+            "west",
+            &[
+                "exec",
+                &pod,
+                "--",
+                "sh",
+                "-c",
+                "printf '*1\\r\\n$4\\r\\nPING\\r\\n' | curl -sS --connect-timeout 3 --max-time 5 --upload-file - telnet://valkey.grid-system.svc.cluster.local:6379",
+            ],
+            20,
+        );
+        let connection_output = connect.as_ref().map_or_else(ToString::to_string, |output| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .trim()
+            .to_owned()
+        });
+        let command_succeeded = connect.as_ref().is_ok_and(|output| output.status.success());
+        let connect_ok = redis_connection_reached(command_succeeded, &connection_output);
+        facts.insert("connection_allowed".to_owned(), serde_json::json!(connect_ok));
+        facts.insert("connection_output".to_owned(), serde_json::json!(connection_output));
+        facts.insert(
+            "policy_expectation_met".to_owned(),
+            serde_json::json!(dns_ok && (connect_ok == allowed)),
+        );
+    }
+    let deleted = kubectl(
+        "west",
+        &["delete", "pod", &pod, "--ignore-not-found=true", "--wait=true"],
+        60,
+    )
+    .is_ok();
+    facts.insert("pod_deleted".to_owned(), serde_json::json!(deleted));
+    Ok(facts)
+}
+
+/// A Redis protocol response proves the `NetworkPolicy` allowed the connection,
+/// even when curl later times out waiting for the persistent socket to close.
+fn redis_connection_reached(command_succeeded: bool, output: &str) -> bool {
+    command_succeeded || output.contains("+PONG") || output.contains("-NOAUTH")
+}
+
+/// Scenario: restricted unlabeled traffic is denied and an allowed quota
+/// client can connect. Admission, image, and DNS failures never count as a
+/// `NetworkPolicy` success.
+fn scenario_network_policy() -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+    let negative = network_probe_pod("np-negative", false)?;
+    let positive = network_probe_pod("np-positive", true)?;
+    let blocked = negative
+        .get("policy_expectation_met")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let positive_control = positive
+        .get("policy_expectation_met")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let facts = BTreeMap::from([
+        ("unauthorized_probe".to_owned(), serde_json::to_value(negative)?),
+        ("permitted_quota_client".to_owned(), serde_json::to_value(positive)?),
+        ("blocked".to_owned(), serde_json::json!(blocked)),
+        ("positive_control".to_owned(), serde_json::json!(positive_control)),
+    ]);
+    Ok(scenario(
+        "network_policy_denies_unauthorized",
+        blocked && positive_control,
+        "unlabeled pod denied while permitted quota client connects".to_owned(),
+        facts,
+    ))
+}
+
+/// Tear down all clusters via `forge down`.
+fn teardown(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    let config = session.config.to_string_lossy().into_owned();
+    let forge = session.forge.to_string_lossy().into_owned();
+    run_timed(&forge, &["--config", &config, "--non-interactive", "down"], 300)?;
+    Ok(())
+}
+
+/// Write a value as pretty JSON with a trailing newline.
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = File::create(path)?;
+    serde_json::to_writer_pretty(&mut file, value)?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Materialize the Forge config with the requested image tag and verify it.
+fn materialize(options: &Options) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let tag = options
+        .image_tag
+        .as_deref()
+        .ok_or("--image-tag is required for a Never-pull run")?;
+    let content = fs::read_to_string(&options.forge_config)?;
+    let mut config: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    apply_image_tag(&mut config, tag);
+    let rendered = serde_yaml::to_string(&config)?;
+    let parent = options
+        .forge_config
+        .parent()
+        .ok_or("Forge config must have a parent directory")?;
+    let resolved = parent.join(".forge.resolved.yaml");
+    fs::write(&resolved, rendered)?;
+    verify_resolved_tag(&resolved, tag)?;
+    Ok(resolved)
+}
+
+/// Rewrite every cluster's image properties to the local `tag` under Never.
+fn apply_image_tag(config: &mut serde_yaml::Value, tag: &str) {
+    let clusters = config
+        .get_mut("spec")
+        .and_then(|spec| spec.get_mut("clusters"))
+        .and_then(serde_yaml::Value::as_sequence_mut);
+    let Some(clusters) = clusters else {
+        return;
+    };
+    for cluster in clusters {
+        if let Some(props) = cluster
+            .get_mut("properties")
+            .and_then(serde_yaml::Value::as_mapping_mut)
+        {
+            set_image_properties(props, tag);
+        }
+    }
+}
+
+/// Set the image repo/tag/pull-policy properties for one cluster.
+fn set_image_properties(props: &mut serde_yaml::Mapping, tag: &str) {
+    let pairs = [
+        ("gatewayImage", format!("praxis-ai:{tag}")),
+        ("gatewayImageRepo", "praxis-ai".to_owned()),
+        ("gatewayImageTag", tag.to_owned()),
+        ("operatorImage", format!("grid-operator:{tag}")),
+        ("operatorImageRepo", "grid-operator".to_owned()),
+        ("operatorImageTag", tag.to_owned()),
+        ("overlaySyncImage", format!("grid-overlay-sync:{tag}")),
+        ("overlaySyncImageRepo", "grid-overlay-sync".to_owned()),
+        ("overlaySyncImageTag", tag.to_owned()),
+        ("imagePullPolicy", "Never".to_owned()),
+    ];
+    for (key, value) in pairs {
+        props.insert(
+            serde_yaml::Value::String(key.to_owned()),
+            serde_yaml::Value::String(value),
+        );
+    }
+}
+
+/// Verify every managed image reference in the resolved config carries `tag`.
+fn verify_resolved_tag(resolved: &Path, tag: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(resolved)?;
+    for repo in ["praxis-ai", "grid-operator", "grid-overlay-sync"] {
+        if !content.contains(&format!("{repo}:{tag}")) {
+            return Err(format!("resolved config missing {repo}:{tag} (image mismatch under Never)").into());
+        }
+    }
+    Ok(())
+}
+
+/// Execute every qualification scenario, collecting evidence.
+///
+/// A scenario that hits an operational error is recorded as a failed scenario
+/// (with the error in its detail) rather than aborting the run, so evidence is
+/// always written and no failure is hidden.
+fn run_scenarios(results: &mut Vec<HttpResult>, distribution: &mut BTreeMap<String, u32>) -> Vec<ScenarioResult> {
+    vec![
+        guarded("probe_no_quota", scenario_probe_no_quota()),
+        guarded("valid_auth", scenario_valid_auth(results)),
+        guarded("auth_rejection", scenario_auth_rejection(results)),
+        guarded(
+            "shared_budget_and_distribution",
+            scenario_shared_budget(results, distribution),
+        ),
+        guarded("concurrency_no_over_admission", scenario_concurrency(results)),
+        guarded("window_expiry_recovery", scenario_window_expiry(results)),
+        guarded("restart_persistence", scenario_restart_persistence(results)),
+        guarded("valkey_outage_fail_closed", scenario_valkey_outage(results)),
+        guarded("network_policy_denies_unauthorized", scenario_network_policy()),
+    ]
+}
+
+/// Convert a scenario outcome into a logged result; errors become failures.
+fn guarded(name: &str, outcome: Result<ScenarioResult, Box<dyn std::error::Error>>) -> ScenarioResult {
+    match outcome {
+        Ok(result) => logged(result),
+        Err(error) => logged(scenario(
+            name,
+            false,
+            format!("scenario error: {error}"),
+            BTreeMap::new(),
+        )),
+    }
+}
+
+/// Log a completed scenario's outcome and pass it through.
+fn logged(result: ScenarioResult) -> ScenarioResult {
+    note(&format!(
+        "scenario {}: {}",
+        result.name,
+        if result.passed { "PASS" } else { "FAIL" }
+    ));
+    result
+}
+
+/// Assemble and persist the evidence document plus a human summary.
+fn persist_evidence(
+    session: &Session,
+    collected: Collected,
+    cleanup_succeeded: Option<bool>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let all_passed = collected.scenarios.iter().all(|scenario| scenario.passed);
+    let summary = summarize(&collected.scenarios, &collected.distribution);
+    let evidence = Evidence {
+        schema_version: "1",
+        topology: CLUSTER_PREFIX,
+        image_tag: session.image_tag.clone(),
+        required_gateway_features: REQUIRED_GATEWAY_FEATURES,
+        resolved_config: session.config.to_string_lossy().into_owned(),
+        overlays: collected.overlays,
+        http_results: collected.results,
+        distribution: collected.distribution,
+        scenarios: collected.scenarios,
+        cleanup_succeeded,
+    };
+    write_json(&session.evidence.join("results.json"), &evidence)?;
+    fs::write(session.evidence.join("summary.txt"), summary)?;
+    Ok(all_passed)
+}
+
+/// Build a concise human-readable summary.
+fn summarize(scenarios: &[ScenarioResult], distribution: &BTreeMap<String, u32>) -> String {
+    let mut lines = vec!["grid-token-rate-limit qualification".to_owned(), String::new()];
+    for scenario in scenarios {
+        let mark = if scenario.passed { "PASS" } else { "FAIL" };
+        lines.push(format!("[{mark}] {}: {}", scenario.name, scenario.detail));
+    }
+    lines.push(String::new());
+    lines.push(format!("provider distribution: {distribution:?}"));
+    lines.join("\n")
+}
+
+/// Entry point for `cargo xtask env run-grid-token-rate-limit-qualification`.
+///
+/// # Errors
+/// Returns an error if setup, deployment, a scenario, or evidence writing fails.
+pub(crate) fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
+    let session = prepare(options)?;
+    note(&format!("required Praxis AI features: {REQUIRED_GATEWAY_FEATURES}"));
+    note(&format!(
+        "verifying praxis-ai:{} label {GATEWAY_FEATURES_LABEL}",
+        session.image_tag
+    ));
+    verify_gateway_image_features(&session.image_tag)?;
+    let mut guard = CleanupGuard {
+        session: &session,
+        disarmed: false,
+    };
+    let collected = qualify(&session)?;
+    guard.disarmed = true;
+    let cleanup = if session.keep {
+        None
+    } else {
+        Some(teardown(&session).is_ok())
+    };
+    let passed = persist_evidence(&session, collected, cleanup)?;
+    if passed {
+        return Ok(());
+    }
+    Err("one or more qualification scenarios failed; see evidence".into())
+}
+
+/// Validate tooling, materialize the config, and build the session.
+fn prepare(options: &Options) -> Result<Session, Box<dyn std::error::Error>> {
+    require_tools()?;
+    let evidence = resolve_evidence_dir(options)?;
+    fs::create_dir_all(&evidence)?;
+    let config = materialize(options)?;
+    let forge = PathBuf::from(std::env::var_os("FORGE_BIN").unwrap_or_else(|| "target/debug/praxis-forge".into()));
+    Ok(Session {
+        forge,
+        config,
+        evidence,
+        image_tag: options.image_tag.clone().unwrap_or_default(),
+        keep: options.keep,
+    })
+}
+
+/// Deploy the topology, await convergence, warm the data plane, run scenarios.
+fn qualify(session: &Session) -> Result<Collected, Box<dyn std::error::Error>> {
+    deploy(session)?;
+    let overlays = await_overlay_convergence()?;
+    let mut results = Vec::new();
+    note("warming data plane (both gateways must return 200 + provider-site)");
+    await_data_plane_ready(&mut results)?;
+    let mut distribution = BTreeMap::new();
+    let scenarios = run_scenarios(&mut results, &mut distribution);
+    Ok(Collected {
+        overlays,
+        results,
+        distribution,
+        scenarios,
+    })
+}
+
+/// Poll bounded authenticated requests until each gateway returns 200 with a
+/// valid provider-site header. Every intermediate status is recorded as
+/// evidence; a persistent non-ready state fails the qualification (it is never
+/// hidden or treated as normal). This readiness gate is distinct from overlay
+/// convergence; the overlay existing does not mean routing is live.
+fn await_data_plane_ready(results: &mut Vec<HttpResult>) -> Result<(), Box<dyn std::error::Error>> {
+    for gateway in CONSUMERS {
+        let start = Instant::now();
+        loop {
+            let result = probe("warmup", gateway, Credential::Valid)?;
+            let ready = classify(result.status) == Outcome::Admitted && result.provider_site.is_some();
+            note(&format!(
+                "warmup {gateway}: status={} site={:?}",
+                result.status, result.provider_site
+            ));
+            results.push(result);
+            if ready {
+                break;
+            }
+            if start.elapsed() >= Duration::from_secs(300) {
+                return Err(format!("gateway {gateway} not ready (200 + provider-site) within 300s").into());
+            }
+            std::thread::park_timeout(Duration::from_secs(5));
+        }
+    }
+    Ok(())
+}
+
+/// Wait for the sliding window to fully age so the next request starts clean.
+///
+/// The limiter prunes each identity's settled sorted set lazily, only when a
+/// request arrives, so an idle poll for zero entries never completes. Waiting
+/// one full window plus a margin guarantees the next request prunes every prior
+/// entry. This is a genuine time condition, not a pollable readiness signal, and
+/// it never mutates Valkey state.
+fn reset_window() {
+    let deadline = Duration::from_secs(WINDOW_SECS.saturating_add(5));
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        std::thread::park_timeout(deadline.saturating_sub(start.elapsed()));
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_status_and_provider_site_despite_kubectl_pod_deleted_suffix() {
+        let raw = "HTTP/1.1 200 OK\r\nX-Grid-Provider-Site: central\r\nConnection: close\r\n\r\npod \"probe-7\" deleted from grid-system namespace\n";
+        let (status, site) = parse_probe_output(raw);
+        assert_eq!(status, 200);
+        assert_eq!(site.as_deref(), Some("central"));
+    }
+
+    #[test]
+    fn denied_request_has_status_but_no_provider_site() {
+        let raw = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n\r\npod \"probe-8\" deleted from grid-system namespace\n";
+        let (status, site) = parse_probe_output(raw);
+        assert_eq!(status, 429);
+        assert_eq!(site, None);
+    }
+
+    #[test]
+    fn classifies_status_codes() {
+        assert_eq!(classify(200), Outcome::Admitted);
+        assert_eq!(classify(429), Outcome::QuotaDenied);
+        assert_eq!(classify(503), Outcome::FailClosed);
+        assert_eq!(classify(401), Outcome::Unauthorized);
+        assert_eq!(classify(418), Outcome::Other);
+    }
+
+    #[test]
+    fn gateway_feature_label_requires_quota_and_basic_auth() {
+        assert!(declares_required_gateway_features(REQUIRED_GATEWAY_FEATURES));
+        assert!(declares_required_gateway_features(
+            "http-callout-filter,praxis-filter/basic-auth-filter,token-rate-limit-filter"
+        ));
+        assert!(!declares_required_gateway_features("token-rate-limit-filter"));
+        assert!(!declares_required_gateway_features("praxis-filter/basic-auth-filter"));
+    }
+
+    #[test]
+    fn missing_credential_sends_no_auth_args() {
+        assert!(credential_args(Credential::Missing).is_empty());
+        assert_eq!(
+            credential_args(Credential::Valid),
+            vec!["-u".to_owned(), "alice:alice-secret".to_owned()]
+        );
+        assert!(credential_args(Credential::Malformed).contains(&"Authorization: Basic not-valid-base64".to_owned()));
+    }
+
+    #[test]
+    fn curl_pod_overrides_meet_restricted_pod_security() {
+        let overrides: serde_json::Value = serde_json::from_str(&curl_pod_overrides(
+            "probe",
+            &curl_args("http://example.test", Credential::Missing, REQUEST_BODY),
+        ))
+        .unwrap();
+        assert_eq!(
+            overrides.pointer("/spec/securityContext/runAsNonRoot"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            overrides.pointer("/spec/securityContext/seccompProfile/type"),
+            Some(&serde_json::json!("RuntimeDefault"))
+        );
+        assert_eq!(
+            overrides.pointer("/spec/containers/0/securityContext/runAsUser"),
+            Some(&serde_json::json!(1000))
+        );
+        assert_eq!(
+            overrides.pointer("/spec/containers/0/securityContext/allowPrivilegeEscalation"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            overrides.pointer("/spec/containers/0/securityContext/capabilities/drop/0"),
+            Some(&serde_json::json!("ALL"))
+        );
+    }
+
+    #[test]
+    fn redis_response_proves_connectivity_despite_curl_timeout() {
+        assert!(redis_connection_reached(false, "-NOAUTH Authentication required"));
+        assert!(redis_connection_reached(false, "+PONG"));
+        assert!(!redis_connection_reached(
+            false,
+            "curl: (28) Connection timed out after 3000 milliseconds"
+        ));
+    }
+
+    #[test]
+    fn overlay_requires_three_group_zero_sites() {
+        let view = OverlayView {
+            revision: "r".into(),
+            selection_policy: "roundRobin".into(),
+            candidates: CLUSTERS
+                .iter()
+                .map(|site| OverlayCandidate {
+                    site: (*site).into(),
+                    stable_id: format!("id-{site}"),
+                    selection_group: 0,
+                })
+                .collect(),
+        };
+        validate_overlay(&view).unwrap();
+    }
+
+    #[test]
+    fn overlay_rejects_wrong_policy_or_missing_site() {
+        let view = OverlayView {
+            revision: "r".into(),
+            selection_policy: "deterministic".into(),
+            candidates: Vec::new(),
+        };
+        validate_overlay(&view).unwrap_err();
+    }
+
+    #[test]
+    fn http_result_round_trips() {
+        let result = HttpResult {
+            label: "x".into(),
+            status: 429,
+            provider_site: None,
+        };
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert_eq!(serde_json::from_str::<HttpResult>(&encoded).unwrap(), result);
+    }
+}
