@@ -33,6 +33,9 @@
 
 ## Demos
 
+- [Provider Traffic Selection](../tests/e2e/topologies/grid-provider-traffic/README.md) —
+  runnable three-cluster topology for Grid selection groups and request-time
+  round-robin provider choice.
 - [Grid QuickStarts](https://github.com/praxis-proxy/demos) — deployable
   demonstrations with automated runtime proofs of routing, failover, security
   boundaries, and provider lifecycle.

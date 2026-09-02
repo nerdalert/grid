@@ -1002,10 +1002,8 @@ pub(crate) enum Action {
     /// Create the focused provider-gateway traffic demo, then prove equal
     /// selection across its active provider group.
     RunGridProviderTrafficDemo {
-        /// Path to the public or internal Forge environment config file.
-        /// This is required because the focused demo currently lives in the
-        /// public demos repository rather than the Grid source tree.
-        #[arg(long)]
+        /// Path to the Forge environment config file.
+        #[arg(long, default_value = "tests/e2e/topologies/grid-provider-traffic/forge.yaml")]
         forge_config: PathBuf,
         /// Demo mode and teardown options. Only `--quick` is supported.
         #[command(flatten)]

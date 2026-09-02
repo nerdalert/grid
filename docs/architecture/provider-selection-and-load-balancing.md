@@ -10,23 +10,16 @@ Grid and Praxis divide provider routing into two parts:
 This separation keeps Kubernetes, Grid reconciliation, EPP metrics, and remote
 coordination out of the request hot path.
 
-```text
-Client
-  |
-  v
-Consumer gateway
-  |
-  v
-intelligent_route
-  |
-  v
-First viable selection group
-  +--> Provider gateway A
-  +--> Provider gateway B
-  `--> Provider gateway C
-
-Lower-priority group
-  `--> Provider gateway D
+```mermaid
+flowchart LR
+    client[Client] --> consumer[Consumer gateway]
+    consumer --> route[intelligent_route]
+    route --> active[First viable selection group]
+    active --> a[Provider gateway A]
+    active --> b[Provider gateway B]
+    active --> c[Provider gateway C]
+    route -. not used while group 0 is viable .-> fallback[Lower-priority group]
+    fallback --> d[Provider gateway D]
 ```
 
 A, B, and C can share active traffic when the selected policy permits it. D is
@@ -61,25 +54,17 @@ The three policy fields answer different questions:
 
 ## The decision sequence
 
-```text
-Request for a capability
-  |
-  v
-Eligibility and admission
-  |
-  v
-Routing policy orders candidates and creates priority groups
-  |
-  v
-Session-affinity lookup
-  +-- permitted existing binding -> reuse its provider
-  `-- no usable binding -> find the first viable group
-                            |
-                            v
-                          apply the configured selection mode
-                              +-- deterministic mode
-                              +-- roundRobin mode
-                              `-- random mode
+```mermaid
+flowchart TD
+    request[Request for a capability] --> eligible[Eligibility and admission]
+    eligible --> groups[Order candidates and create priority groups]
+    groups --> affinity{Permitted affinity binding?}
+    affinity -->|yes| reuse[Reuse bound provider]
+    affinity -->|no| viable[Find first viable group]
+    viable --> mode{Selection mode}
+    mode --> deterministic[Deterministic]
+    mode --> roundRobin[Round-robin]
+    mode --> random[Random]
 ```
 
 Scores contribute to candidate ordering. They do not create groups. The
@@ -341,13 +326,11 @@ split when sessions generate different amounts of traffic.
 The design supports multiple consumer gateways. Each gateway receives an
 accepted overlay snapshot and keeps its own local selection state:
 
-```text
-                 Grid overlay
-                /            \
-               v              v
-      Consumer gateway 1   Consumer gateway 2
-        local counter        local counter
-          A -> B -> C          A -> B -> C
+```mermaid
+flowchart TB
+    overlay[Accepted Grid overlay]
+    overlay --> one[Consumer gateway 1<br/>local cursor: A to B to C]
+    overlay --> two[Consumer gateway 2<br/>local cursor: A to B to C]
 ```
 
 Counters are not coordinated globally. Each gateway can produce a balanced
@@ -357,23 +340,16 @@ a different coordination design and would add hot-path trade-offs.
 
 ## Overlay lifecycle and re-ranking
 
-```text
-Provider health and optional EPP metrics
-  |
-  v
-Grid operator reconciliation
-  | eligibility, admission, ordering, scores, groups, selection policy
-  v
-Content-addressed routing overlay
-  |
-  v
-overlay-sync validation and publication
-  |
-  v
-Praxis validates and atomically loads a snapshot
-  | precomputed group index and local selection state
-  v
-Request-time selection from memory
+```mermaid
+flowchart TD
+    signals[Provider health and optional EPP metrics]
+    reconcile[Grid operator reconciliation<br/>eligibility, admission, ordering,<br/>scores, groups, selection policy]
+    overlay[Content-addressed routing overlay]
+    publish[Overlay validation and publication]
+    snapshot[Praxis atomically loads snapshot<br/>group index + local selection state]
+    request[Request-time selection from memory]
+
+    signals --> reconcile --> overlay --> publish --> snapshot --> request
 ```
 
 Reconciliation is triggered by watched provider, site, and network changes,
@@ -381,8 +357,8 @@ remote Grid state, and the periodic `metricsRefreshInterval`. The default
 periodic cadence is 300 seconds for plaintext metrics; TLS-protected metrics
 use a 60-second safety cap. A configured interval must be at least one second.
 The interval controls observation and overlay publication, not request-path
-latency. A demo or operator can cause an earlier reconcile through a real
-watched resource change.
+latency. An operator can cause an earlier reconcile through a real watched
+resource change.
 
 After an overlay is accepted, requests do not call Grid, Kubernetes,
 ConfigMaps, EPP, Prometheus, or a remote scoring service. An unchanged semantic
@@ -430,13 +406,3 @@ normalization, capacity semantics, missing-metric behavior, bounds, and
 stability controls. It must not be inferred from score, rank, metric presence,
 or candidate count, and it must not change admission, locality,
 authorization, freshness, or group boundaries.
-
-## Demonstration reference
-
-The [Grid provider-selection research spike](https://github.com/praxis-proxy/grid/issues/31)
-describes the focused provider-traffic demonstration: one consumer gateway,
-three provider gateways, one active group, `noMetrics`, `roundRobin`, 60
-successful requests, exact 20/20/20 attribution, and a stable overlay during
-the measured window. That proof demonstrates equal selection, not weighted
-routing, coordinated round-robin across multiple consumers, retry behavior,
-or fallback groups unless separate evidence is provided.
