@@ -16,6 +16,7 @@ pub(crate) mod kubectl;
 pub(crate) mod llmd_pool_metrics_demo;
 pub(crate) mod operator;
 pub(crate) mod operator_overlay;
+pub(crate) mod provider_traffic_demo;
 pub(crate) mod providers;
 pub(crate) mod trust;
 pub(crate) mod verify;
@@ -997,6 +998,17 @@ pub(crate) enum Action {
         #[arg(long)]
         kv_cache: bool,
     },
+
+    /// Create the focused provider-gateway traffic demo, then prove equal
+    /// selection across its active provider group.
+    RunGridProviderTrafficDemo {
+        /// Path to the Forge environment config file.
+        #[arg(long, default_value = "tests/e2e/topologies/grid-provider-traffic/forge.yaml")]
+        forge_config: PathBuf,
+        /// Demo mode and teardown options. Only `--quick` is supported.
+        #[command(flatten)]
+        options: GlbDemoOptions,
+    },
 }
 
 #[cfg(test)]
@@ -1122,6 +1134,9 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             metrics_mtls,
             kv_cache,
         } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
+        Action::RunGridProviderTrafficDemo { forge_config, options } => {
+            provider_traffic_demo::run(forge_config, options)
+        },
     }
 }
 

@@ -5,7 +5,7 @@ metadata:
   namespace: grid-system
   labels:
     app.kubernetes.io/name: vllm-vcr
-    app.kubernetes.io/part-of: grid-combined-site
+    app.kubernetes.io/part-of: grid-provider-traffic
 spec:
   replicas: 1
   selector:
@@ -105,7 +105,7 @@ metadata:
   namespace: grid-system
   labels:
     app.kubernetes.io/name: vllm-vcr
-    app.kubernetes.io/part-of: grid-combined-site
+    app.kubernetes.io/part-of: grid-provider-traffic
 spec:
   type: ClusterIP
   selector:

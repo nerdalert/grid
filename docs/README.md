@@ -9,6 +9,9 @@
 - [Routing](architecture/routing.md) — versioned overlay contract, revision
   lifecycle, candidate ordering, `intelligent_route`, `peer_identity_trust`, and
   provider-side request forwarding.
+- [Provider Selection and Load Balancing](architecture/provider-selection-and-load-balancing.md) —
+  eligibility, routing groups, scoring, selection modes, affinity, and
+  overlay lifecycle.
 - [Scoring](architecture/scoring.md) — operator-side candidate scoring,
   metrics input, and request-time scoring boundaries.
 - [Auth and Policy](architecture/auth.md) — provider authentication strategies,
@@ -30,6 +33,9 @@
 
 ## Demos
 
+- [Provider Traffic Selection](../tests/e2e/topologies/grid-provider-traffic/README.md) —
+  runnable three-cluster topology for Grid selection groups and request-time
+  round-robin provider choice.
 - [Grid QuickStarts](https://github.com/praxis-proxy/demos) — deployable
   demonstrations with automated runtime proofs of routing, failover, security
   boundaries, and provider lifecycle.

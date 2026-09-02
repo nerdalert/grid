@@ -2,24 +2,24 @@ apiVersion: forge.praxis.dev/v1alpha1
 kind: Environment
 
 metadata:
-  name: grid-combined-site
+  name: grid-provider-traffic
 
 spec:
   runtime:
     provider: docker
-    clusterPrefix: grid-combined
+    clusterPrefix: grid-provider-traffic
 
   network:
     crossCluster: true
-    dnsZone: grid-combined.test
+    dnsZone: grid-provider-traffic.test
 
   clusters:
-    - name: west
-      stacks: [metallb, west-operator-base, vcr-backend, west-site, provider-gateway, consumer-gateway]
+    - name: provider-a
+      stacks: [metallb, provider-a-operator-base, vcr-backend, provider-a-site, provider-gateway, consumer-gateway]
       properties:
-        region: west
+        region: provider-a
         role: combined
-        siteName: west
+        siteName: provider-a
         gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
@@ -29,12 +29,12 @@ spec:
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.3"
 
-    - name: central
-      stacks: [metallb, central-operator-base, vcr-backend, central-site, provider-gateway, consumer-gateway]
+    - name: provider-b
+      stacks: [metallb, provider-b-operator-base, vcr-backend, provider-b-site, provider-gateway]
       properties:
-        region: central
+        region: provider-b
         role: combined
-        siteName: central
+        siteName: provider-b
         gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
@@ -44,12 +44,12 @@ spec:
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.3"
 
-    - name: east
-      stacks: [metallb, east-operator-base, vcr-backend, east-site, provider-gateway, consumer-gateway]
+    - name: provider-c
+      stacks: [metallb, provider-c-operator-base, vcr-backend, provider-c-site, provider-gateway]
       properties:
-        region: east
+        region: provider-c
         role: combined
-        siteName: east
+        siteName: provider-c
         gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
@@ -74,7 +74,7 @@ spec:
         - type: metallb-auto-pool
           name: forge-pool
 
-    west-operator-base:
+    provider-a-operator-base:
       description: West Grid operator initial deployment with SWIM LoadBalancer
       steps:
         - type: helm
@@ -88,7 +88,7 @@ spec:
               tag: "{{ cluster.properties.operatorImageTag }}"
               pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
             swim:
-              siteName: "west"
+              siteName: "provider-a"
               seeds: ""
               service:
                 enabled: true
@@ -109,7 +109,7 @@ spec:
           timeout: "60s"
           interval: "2s"
 
-    central-operator-base:
+    provider-b-operator-base:
       description: Central Grid operator initial deployment with SWIM LoadBalancer
       steps:
         - type: helm
@@ -123,7 +123,7 @@ spec:
               tag: "{{ cluster.properties.operatorImageTag }}"
               pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
             swim:
-              siteName: "central"
+              siteName: "provider-b"
               seeds: ""
               service:
                 enabled: true
@@ -144,7 +144,7 @@ spec:
           timeout: "60s"
           interval: "2s"
 
-    east-operator-base:
+    provider-c-operator-base:
       description: East Grid operator initial deployment with SWIM LoadBalancer
       steps:
         - type: helm
@@ -158,7 +158,7 @@ spec:
               tag: "{{ cluster.properties.operatorImageTag }}"
               pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
             swim:
-              siteName: "east"
+              siteName: "provider-c"
               seeds: ""
               service:
                 enabled: true
@@ -194,7 +194,7 @@ spec:
           condition: available
           timeout: "120s"
 
-    west-site:
+    provider-a-site:
       description: West combined site with Grid CRs via grid-site chart
       steps:
         - type: helm
@@ -206,10 +206,10 @@ spec:
             commonLabels:
               grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
-              name: grid-combined-site
-              gridId: grid-combined-site-v1
-              region: west
-              zone: west-1
+              name: grid-provider-traffic
+              gridId: grid-provider-traffic-v1
+              region: provider-a
+              zone: provider-a-1
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: noMetrics
@@ -229,21 +229,21 @@ spec:
               gatewayRefs:
                 - name: consumer-gateway
                   namespace: grid-system
-                  localSiteName: west
+                  localSiteName: provider-a
             gridSite:
-              name: west
-              region: west
-              zone: west-1
-              providerSiteLabel: west
+              name: provider-a
+              region: provider-a
+              zone: provider-a-1
+              providerSiteLabel: provider-a
             inferenceProviders:
-              - name: vcr-west-provider
-                gridNetworkRef: grid-combined-site
+              - name: vcr-provider-a-provider
+                gridNetworkRef: grid-provider-traffic
                 providerKind: vllm-vcr
                 backendKind: local
-                endpoint: "http://vcr-inference-west.grid-system.svc.cluster.local:8000"
+                endpoint: "http://vcr-inference-provider-a.grid-system.svc.cluster.local:8000"
                 siteSelector:
                   matchLabels:
-                    grid.praxis-proxy.io/provider-site: west
+                    grid.praxis-proxy.io/provider-site: provider-a
                 accessPolicy:
                   siteSelector:
                     matchLabels: {}
@@ -257,7 +257,7 @@ spec:
                   interval: "30s"
                   timeout: "5s"
 
-    central-site:
+    provider-b-site:
       description: Central combined site with Grid CRs via grid-site chart
       steps:
         - type: helm
@@ -269,10 +269,10 @@ spec:
             commonLabels:
               grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
-              name: grid-combined-site
-              gridId: grid-combined-site-v1
-              region: central
-              zone: central-1
+              name: grid-provider-traffic
+              gridId: grid-provider-traffic-v1
+              region: provider-b
+              zone: provider-b-1
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: noMetrics
@@ -292,21 +292,21 @@ spec:
               gatewayRefs:
                 - name: consumer-gateway
                   namespace: grid-system
-                  localSiteName: central
+                  localSiteName: provider-b
             gridSite:
-              name: central
-              region: central
-              zone: central-1
-              providerSiteLabel: central
+              name: provider-b
+              region: provider-b
+              zone: provider-b-1
+              providerSiteLabel: provider-b
             inferenceProviders:
-              - name: vcr-central-provider
-                gridNetworkRef: grid-combined-site
+              - name: vcr-provider-b-provider
+                gridNetworkRef: grid-provider-traffic
                 providerKind: vllm-vcr
                 backendKind: local
-                endpoint: "http://vcr-inference-central.grid-system.svc.cluster.local:8000"
+                endpoint: "http://vcr-inference-provider-b.grid-system.svc.cluster.local:8000"
                 siteSelector:
                   matchLabels:
-                    grid.praxis-proxy.io/provider-site: central
+                    grid.praxis-proxy.io/provider-site: provider-b
                 accessPolicy:
                   siteSelector:
                     matchLabels: {}
@@ -320,7 +320,7 @@ spec:
                   interval: "30s"
                   timeout: "5s"
 
-    east-site:
+    provider-c-site:
       description: East combined site with Grid CRs via grid-site chart
       steps:
         - type: helm
@@ -332,10 +332,10 @@ spec:
             commonLabels:
               grid.praxis-proxy.io/auto-discover-sites: "true"
             gridNetwork:
-              name: grid-combined-site
-              gridId: grid-combined-site-v1
-              region: east
-              zone: east-1
+              name: grid-provider-traffic
+              gridId: grid-provider-traffic-v1
+              region: provider-c
+              zone: provider-c-1
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: noMetrics
@@ -355,21 +355,21 @@ spec:
               gatewayRefs:
                 - name: consumer-gateway
                   namespace: grid-system
-                  localSiteName: east
+                  localSiteName: provider-c
             gridSite:
-              name: east
-              region: east
-              zone: east-1
-              providerSiteLabel: east
+              name: provider-c
+              region: provider-c
+              zone: provider-c-1
+              providerSiteLabel: provider-c
             inferenceProviders:
-              - name: vcr-east-provider
-                gridNetworkRef: grid-combined-site
+              - name: vcr-provider-c-provider
+                gridNetworkRef: grid-provider-traffic
                 providerKind: vllm-vcr
                 backendKind: local
-                endpoint: "http://vcr-inference-east.grid-system.svc.cluster.local:8000"
+                endpoint: "http://vcr-inference-provider-c.grid-system.svc.cluster.local:8000"
                 siteSelector:
                   matchLabels:
-                    grid.praxis-proxy.io/provider-site: east
+                    grid.praxis-proxy.io/provider-site: provider-c
                 accessPolicy:
                   siteSelector:
                     matchLabels: {}
@@ -459,11 +459,11 @@ spec:
             - bash
             - -c
             - >-
-              kubectl --context kind-grid-combined-{{ cluster.name }} -n grid-system
+              kubectl --context kind-grid-provider-traffic-{{ cluster.name }} -n grid-system
               create configmap consumer-gateway-config
               --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
               --dry-run=client -o yaml |
-              kubectl --context kind-grid-combined-{{ cluster.name }} apply -f -
+              kubectl --context kind-grid-provider-traffic-{{ cluster.name }} apply -f -
         - type: helm
           release: consumer-gateway
           chart: charts/praxis-gateway
@@ -491,7 +491,7 @@ spec:
               type: "LoadBalancer"
             overlay:
               enabled: true
-              existingConfigMap: "grid-overlay-grid-combined-site-consumer-gateway"
+              existingConfigMap: "grid-overlay-grid-provider-traffic-consumer-gateway"
             tls:
               enabled: true
               existingSecret: "consumer-gateway-tls"

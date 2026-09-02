@@ -42,6 +42,11 @@
       "expected": "accept",
       "revision": "75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"
     },
+    "valid-selection-policy.json": {
+      "content_digest": "d3321586b5e414b8bd80c07a9d16ac10dce38d6810e3591a8526a6bdd0639007",
+      "expected": "accept",
+      "revision": "d3321586b5e414b8bd80c07a9d16ac10dce38d6810e3591a8526a6bdd0639007"
+    },
     "malformed-envelope.json": {
       "expected": "reject",
       "reason": "malformed_structure"
