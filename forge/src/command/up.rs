@@ -75,9 +75,11 @@ fn ensure_network(
             dry_run: true,
         }));
     }
+    let existed_before_up = networking::network_exists(ctx.runner, binary, &net_name)?;
     networking::create_network(ctx.runner, binary, &net_name, env_name)?;
     let cidr = networking::inspect_network_cidr(ctx.runner, binary, &net_name)?;
     set_network_active(state, &net_name, &cidr);
+    state.network_created_by_forge = !existed_before_up;
     Ok(Some(NetworkSetup {
         name: net_name,
         dry_run: false,

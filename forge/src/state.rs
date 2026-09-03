@@ -48,6 +48,10 @@ pub struct ForgeState {
     /// Managed container network state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkState>,
+    /// Whether Forge created the currently tracked network during `up`.
+    /// A false value is the safe backward-compatible default for older state.
+    #[serde(default)]
+    pub network_created_by_forge: bool,
     /// Detected container runtime name, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
@@ -234,6 +238,7 @@ pub fn empty() -> ForgeState {
         services: Vec::new(),
         stacks: Vec::new(),
         network: None,
+        network_created_by_forge: false,
         runtime: None,
         config_digest: None,
         last_operation: None,

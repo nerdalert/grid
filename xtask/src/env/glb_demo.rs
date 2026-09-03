@@ -2234,7 +2234,8 @@ fn load_local_images_if_required(
     let operator = image_overrides::demo_operator_image(ingress_mode);
     let gateway = image_overrides::demo_gateway_image(ingress_mode);
     let vcr = image_overrides::vcr_image();
-    for image in [&operator, &gateway, &vcr] {
+    let probe = "curlimages/curl:8.10.1";
+    for image in [&operator, &gateway, &vcr, &probe.to_owned()] {
         require_local_image(image)?;
     }
     let gateway_clusters = match ingress_mode {
@@ -2249,6 +2250,7 @@ fn load_local_images_if_required(
     }
     for cluster in PROVIDER_CLUSTERS {
         run_forge(forge, config, &["cluster", "load-image", cluster, &vcr])?;
+        run_forge(forge, config, &["cluster", "load-image", cluster, probe])?;
     }
     Ok(())
 }

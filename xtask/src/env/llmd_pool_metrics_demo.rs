@@ -119,10 +119,10 @@ const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
 /// combined-site demo. Both require the `peer_identity_trust`,
 /// `provider_route`, `credential_inject`, and `intelligent_route` filters
 /// which are built into the published Grid AI rollup.
-const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3";
+const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.3.0";
 
 /// Default operator image tag.
-const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.3";
+const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
 
 /// Default EPP image reference required by this demo.
 const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0";
@@ -131,7 +131,7 @@ const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9
 const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
 
 /// Default overlay-sync sidecar image tag.
-const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "ghcr.io/praxis-proxy/grid-overlay-sync:v0.1.3";
+const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "ghcr.io/praxis-proxy/grid-overlay-sync:v0.1.4";
 
 /// Default nginx image for the metrics TLS reverse proxy sidecar.
 const DEFAULT_NGINX_IMAGE: &str = "docker.io/library/nginx:1.27.4-alpine";
@@ -528,7 +528,14 @@ fn prepare_setup(
     let images = resolve_images(metrics_transport)?;
     verify_images(&images)?;
 
-    let resolved_config = materialize_config(forge_config, metrics_transport, scoring_flavor, images.nginx.as_deref())?;
+    let resolved_config = materialize_config_with_images(
+        forge_config,
+        metrics_transport,
+        scoring_flavor,
+        images.nginx.as_deref(),
+        Some(&images),
+    )?;
+    verify_materialized_images(&resolved_config, &images)?;
     let forge_bin = glb::resolve_forge_binary()
         .ok_or("praxis-forge binary not found")?
         .into();
@@ -2189,8 +2196,8 @@ fn wait_for_overlay_convergence() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Load pre-built images into Kind clusters in local-image mode.
 ///
-/// Uses the forge-expected tags (created by [`tag_images_for_forge`]) since
-/// the forge manifests and Helm values reference those names.
+/// Uses the exact resolved image references so `imagePullPolicy: Never`
+/// references the image that was actually loaded into each Kind node.
 fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
     if uses_registry_images() {
         eprintln!("  [OK] Registry image mode: skipped local Kind image loading");
@@ -2198,11 +2205,11 @@ fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::e
     }
 
     let mut tags: Vec<&str> = vec![
-        "grid-operator:llmd-pool-metrics-demo",
-        "grid-overlay-sync:llmd-pool-metrics-demo",
-        "praxis-ai:llmd-pool-metrics-demo",
-        "llm-d-epp:llmd-pool-metrics-demo",
-        "vllm-vcr:llmd-pool-metrics-demo",
+        &context.images.operator,
+        &context.images.overlay_sync,
+        &context.images.gateway,
+        &context.images.epp,
+        &context.images.vcr,
     ];
     if let Some(nginx) = &context.images.nginx {
         tags.push(nginx);
@@ -2334,15 +2341,92 @@ fn run_forge_stack(
 /// When `scoring_flavor` is `KvCachePressure`, additionally swaps both
 /// sites' `GridNetwork.spec.scoringPolicy.strategy` from the template's
 /// default `queueDepth` to `kvCachePressure`.
+#[cfg(test)]
 fn materialize_config(
     forge_config: &Path,
     metrics_transport: MetricsTransport,
     scoring_flavor: ScoringFlavor,
     nginx_image: Option<&str>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    materialize_config_with_images(forge_config, metrics_transport, scoring_flavor, nginx_image, None)
+}
+
+/// Materialize a Forge config and inject all explicitly selected images.
+///
+/// The llm-d topology has image values in cluster properties and in the
+/// overlay-sync sidecar values. Keeping this injection here ensures the image
+/// references used by Forge, Kind loading, and the environment variables are
+/// identical before any cluster is created.
+fn materialize_config_with_images(
+    forge_config: &Path,
+    metrics_transport: MetricsTransport,
+    scoring_flavor: ScoringFlavor,
+    nginx_image: Option<&str>,
+    images: Option<&ResolvedImages>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = forge_config.parent().unwrap_or_else(|| Path::new("."));
     let resolved = dir.join(".forge.resolved.yaml");
     let mut result = fs::read_to_string(forge_config)?;
+    if let Some(images) = images {
+        let image_pull_policy =
+            std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
+        if image_pull_policy != "IfNotPresent" {
+            result = checked_replace(
+                &result,
+                "imagePullPolicy: IfNotPresent",
+                &format!("imagePullPolicy: {image_pull_policy}"),
+                2,
+                "image pull policy",
+            )?;
+        }
+        for (role, selected, default) in [
+            ("gateway", images.gateway.as_str(), DEFAULT_GATEWAY_IMAGE),
+            ("operator", images.operator.as_str(), DEFAULT_OPERATOR_IMAGE),
+            ("epp", images.epp.as_str(), DEFAULT_EPP_IMAGE),
+            ("vcr", images.vcr.as_str(), DEFAULT_VCR_IMAGE),
+            ("overlay-sync", images.overlay_sync.as_str(), DEFAULT_OVERLAY_SYNC_IMAGE),
+        ] {
+            let (repository, tag) = split_image_reference(selected)?;
+            let (default_repository, default_tag) = split_image_reference(default)?;
+            if selected != default {
+                if role != "overlay-sync" {
+                    result = checked_replace(&result, default, selected, 2, &format!("{role} image reference"))?;
+                }
+                let property = match role {
+                    "gateway" => "gatewayImage",
+                    "operator" => "operatorImage",
+                    "epp" => "eppImage",
+                    "vcr" => "vcrImage",
+                    "overlay-sync" => "overlay-sync",
+                    _ => unreachable!(),
+                };
+                let repo_property = if role == "overlay-sync" {
+                    "repository".to_owned()
+                } else {
+                    format!("{property}Repo")
+                };
+                let tag_property = if role == "overlay-sync" {
+                    "tag".to_owned()
+                } else {
+                    format!("{property}Tag")
+                };
+                result = checked_replace(
+                    &result,
+                    &format!("{repo_property}: \"{default_repository}\""),
+                    &format!("{repo_property}: \"{repository}\""),
+                    if role == "overlay-sync" { 1 } else { 2 },
+                    &format!("{role} image repository"),
+                )?;
+                result = checked_replace(
+                    &result,
+                    &format!("{tag_property}: \"{default_tag}\""),
+                    &format!("{tag_property}: \"{tag}\""),
+                    if role == "overlay-sync" { 1 } else { 2 },
+                    &format!("{role} image tag"),
+                )?;
+            }
+        }
+    }
     for cluster in CLUSTERS {
         let provider_name = format!("llmd-{cluster}-provider");
         let candidate_id = fnv1a_hex8(&format!("inference_model/{VCR_MODEL}/{cluster}/{provider_name}"));
@@ -2440,6 +2524,67 @@ fn materialize_config(
 
     fs::write(&resolved, result)?;
     Ok(resolved)
+}
+
+/// Split a registry image reference into repository and tag.
+fn split_image_reference(image: &str) -> Result<(&str, &str), Box<dyn std::error::Error>> {
+    let (repository, tag) = image
+        .rsplit_once(':')
+        .ok_or_else(|| format!("image reference {image:?} has no tag"))?;
+    if repository.is_empty() || tag.is_empty() || tag.contains('/') {
+        return Err(format!("image reference {image:?} must contain a repository and tag").into());
+    }
+    Ok((repository, tag))
+}
+
+/// Verify every selected image occurs in the resolved Forge source.
+fn verify_materialized_images(path: &Path, images: &ResolvedImages) -> Result<(), Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)?;
+    let expected = [
+        ("gateway", images.gateway.as_str()),
+        ("operator", images.operator.as_str()),
+        ("epp", images.epp.as_str()),
+        ("vcr", images.vcr.as_str()),
+        ("overlay-sync", images.overlay_sync.as_str()),
+    ];
+    for (role, image) in expected {
+        let (repository, tag) = split_image_reference(image)?;
+        let (repo_property, tag_property, expected_count) = if role == "overlay-sync" {
+            ("repository", "tag", 1)
+        } else {
+            let property = match role {
+                "gateway" => "gatewayImage",
+                "operator" => "operatorImage",
+                "epp" => "eppImage",
+                "vcr" => "vcrImage",
+                _ => unreachable!(),
+            };
+            // These fields occur once per cluster.
+            (property, property, 2)
+        };
+        let repository_key = if role == "overlay-sync" {
+            repo_property.to_owned()
+        } else {
+            format!("{repo_property}Repo")
+        };
+        let tag_key = if role == "overlay-sync" {
+            tag_property.to_owned()
+        } else {
+            format!("{tag_property}Tag")
+        };
+        let repository_count = content.matches(&format!("{repository_key}: \"{repository}\"")).count();
+        let tag_count = content.matches(&format!("{tag_key}: \"{tag}\"")).count();
+        if repository_count != expected_count || tag_count != expected_count {
+            return Err(format!(
+                "resolved Forge config is missing {role} image {image:?} (repository matches: {repository_count}, tag matches: {tag_count})"
+            )
+            .into());
+        }
+    }
+    if !uses_registry_images() && !content.contains("imagePullPolicy: Never") {
+        return Err("resolved Forge config does not set imagePullPolicy: Never for local image mode".into());
+    }
+    Ok(())
 }
 
 /// Replace `needle` in `content`, failing if the match count differs from `expected`.

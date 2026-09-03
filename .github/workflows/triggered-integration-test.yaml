@@ -38,10 +38,10 @@ env:
   KUBECTL_VERSION: v1.32.3
   # The gateway image MUST be pinned by digest for reproducible evidence.
   # To obtain the digest for a new tag:
-  #   docker pull ghcr.io/praxis-proxy/grid-ai-rollup:<tag>
-  #   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/praxis-proxy/grid-ai-rollup:<tag>
-  GATEWAY_IMAGE_REF: ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3
-  GATEWAY_IMAGE_DIGEST: sha256:e5bdea9071f76533ab61714eeef6067c7449d0e9d811c221aa940cf3cdf9719f
+  #   docker pull ghcr.io/praxis-proxy/ai:<tag>
+  #   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/praxis-proxy/ai:<tag>
+  GATEWAY_IMAGE_REF: ghcr.io/praxis-proxy/ai:0.3.0
+  GATEWAY_IMAGE_DIGEST: sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8
   # Pinned identity/date/message-suffix for the local PR-merge reconstruction
   # in resolve-source's "Resolve source" step and glb-e2e's "Reconstruct PR
   # merge" step (see grid#66). Both jobs build a merge commit from the same

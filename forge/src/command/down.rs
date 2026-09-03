@@ -183,6 +183,8 @@ struct NetworkTeardown {
     name: String,
     /// Whether this was a dry-run skip.
     dry_run: bool,
+    /// Whether the network was removed by this operation.
+    removed: bool,
 }
 
 /// Remove the environment network if one is tracked in state.
@@ -194,10 +196,19 @@ fn remove_env_network(
         Some(ns) if ns.phase != NetworkPhase::Gone => ns.clone(),
         _ => return Ok(None),
     };
+    if !state.network_created_by_forge {
+        verify_pre_existing_network(ctx, state, &net.name)?;
+        return Ok(Some(NetworkTeardown {
+            name: net.name,
+            dry_run: false,
+            removed: false,
+        }));
+    }
     if ctx.dry_run {
         return Ok(Some(NetworkTeardown {
             name: net.name,
             dry_run: true,
+            removed: false,
         }));
     }
     let binary = resolve_binary(ctx, state)?;
@@ -207,7 +218,27 @@ fn remove_env_network(
     Ok(Some(NetworkTeardown {
         name: net.name,
         dry_run: false,
+        removed: true,
     }))
+}
+
+/// Verify that a network marked as pre-existing is still present before
+/// reporting that it was preserved.
+fn verify_pre_existing_network(
+    ctx: &ForgeContext<'_>,
+    state: &state::ForgeState,
+    name: &str,
+) -> Result<(), ForgeError> {
+    if ctx.dry_run {
+        return Ok(());
+    }
+    let binary = resolve_binary(ctx, state)?;
+    if networking::network_exists(ctx.runner, &binary, name)? {
+        return Ok(());
+    }
+    Err(ForgeError::State(format!(
+        "pre-existing network '{name}' is no longer present; refusing to report preservation"
+    )))
 }
 
 /// Get the runtime binary from state or by re-detecting.
@@ -271,7 +302,7 @@ fn render_json(
     if let (Some(n), Some(obj)) = (net, data.as_object_mut()) {
         obj.insert(
             "network".to_owned(),
-            serde_json::json!({ "name": n.name, "dryRun": n.dry_run }),
+            serde_json::json!({ "name": n.name, "dryRun": n.dry_run, "removed": n.removed }),
         );
     }
     let envelope = output::success(data);
@@ -329,7 +360,10 @@ fn format_net_text(n: &NetworkTeardown) -> String {
     if n.dry_run {
         return format!("would remove network '{}'", n.name);
     }
-    format!("removed network '{}'", n.name)
+    if n.removed {
+        return format!("removed network '{}'", n.name);
+    }
+    format!("preserved pre-existing network '{}'", n.name)
 }
 
 /// Format a single result as text.
@@ -451,6 +485,11 @@ spec:
 
     /// Pre-populate state with a running cluster and active network.
     fn seed_state_with_network(state_dir: &std::path::Path) {
+        seed_state_with_network_ownership(state_dir, true);
+    }
+
+    /// Pre-populate state with a running cluster and explicit network ownership.
+    fn seed_state_with_network_ownership(state_dir: &std::path::Path, created_by_forge: bool) {
         let mut st = state::empty();
         st.runtime = Some("docker".to_owned());
         st.clusters.push(ClusterState {
@@ -465,6 +504,7 @@ spec:
             cidr: None,
             cluster_pools: Vec::new(),
         });
+        st.network_created_by_forge = created_by_forge;
         state::save(state_dir, &st).unwrap_or_else(|_| std::process::abort());
     }
 
@@ -549,5 +589,36 @@ spec:
             text.contains("would remove network"),
             "should report would remove network: {text}"
         );
+    }
+
+    #[test]
+    fn down_preserves_pre_existing_network() {
+        let dir = test_dir();
+        seed_state_with_network_ownership(dir.path(), false);
+        let config = test_config();
+        let mut runner = MockRunner::new();
+        runner.respond("kind", ok());
+        runner.respond("docker network inspect test-net", ok());
+        let ctx = ForgeContext {
+            runner: &runner,
+            config: &config,
+            state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+            format: OutputFormat::Text,
+            dry_run: false,
+        };
+        let mut buf = Vec::new();
+        run(&ctx, false, &mut buf).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            !runner.was_called("network rm"),
+            "pre-existing network must be preserved"
+        );
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("preserved pre-existing network"),
+            "should report preservation: {text}"
+        );
+        let state = state::load(dir.path()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(state.network.as_ref().map(|n| &n.phase), Some(&NetworkPhase::Active));
     }
 }

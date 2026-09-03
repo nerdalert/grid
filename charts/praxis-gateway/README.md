@@ -18,7 +18,7 @@ release ownership exist. Do not treat this as a permanent Grid responsibility.
 - Kubernetes >= 1.26
 - Helm >= 3.12
 - A Praxis configuration ConfigMap already created in the target namespace
-- A compatible Grid AI gateway image (default: Grid v0.1.3 rollup)
+- A compatible Praxis AI gateway image (default: Praxis AI 0.3.0)
 
 ## Install
 
@@ -34,9 +34,16 @@ helm install edge-gateway charts/praxis-gateway \
   --set config.existingConfigMap=edge-gateway-config
 ```
 
-The default image is the Grid v0.1.3 AI gateway rollup. Override
+The default image is the official Praxis AI 0.3.0 gateway. Override
 `image.repository`, `image.tag`, or `image.digest` to install another compatible
 gateway image. Prefer a digest when reproducing a validated deployment.
+
+The standard Praxis AI 0.3.0 image supports Grid provider selection and load
+balancing. It does not include the optional `token-rate-limit-filter` and
+`praxis-filter/basic-auth-filter` features required by the distributed token
+quota qualification. That qualification requires an explicitly supplied Praxis
+AI image built with both features; Grid does not publish a replacement AI
+rollup.
 
 The chart uses [Semantic Versioning](https://semver.org/). Its `version`
 identifies the chart package, while `appVersion` identifies the default Praxis
@@ -47,8 +54,8 @@ AI image; these values may advance independently.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `replicaCount` | int | `1` | Gateway replicas. |
-| `image.repository` | string | `ghcr.io/praxis-proxy/grid-ai-rollup` | Image repository. |
-| `image.tag` | string | `""` | Image tag. Defaults to chart `appVersion` (`v0.1.3`). |
+| `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
+| `image.tag` | string | `0.3.0` | Image tag. |
 | `image.digest` | string | `""` | Immutable digest (sha256:…). When set, tag is ignored. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |

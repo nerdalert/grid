@@ -1875,6 +1875,14 @@ fn check_one_backend_network_boundary(
         target,
         mode,
     )?;
+    if allowed.phase != "Running" && allowed.phase != "Succeeded" {
+        return Err(format!(
+            "{provider}/{instance}: allowed probe did not reach Running; phase={}, diagnostics={}",
+            allowed.phase,
+            safe_truncate_str(&allowed.diagnostics, 512)
+        )
+        .into());
+    }
     if allowed.phase != "Succeeded" || !allowed.logs.contains("tcp-probe=connected") {
         return Err(format!(
             "{provider}/{instance}: allowed backend probe did not connect (phase={}, logs={})",
@@ -1885,6 +1893,14 @@ fn check_one_backend_network_boundary(
     }
 
     let denied = run_probe_pod(context, &denied_name, None, target, mode)?;
+    if denied.phase != "Running" && denied.phase != "Succeeded" && denied.phase != "Failed" {
+        return Err(format!(
+            "{provider}/{instance}: unlabeled probe did not reach Running; this is not NetworkPolicy evidence; phase={}, diagnostics={}",
+            denied.phase,
+            safe_truncate_str(&denied.diagnostics, 512)
+        )
+        .into());
+    }
     if denied.phase != "Failed"
         || !(denied.logs.contains("tcp-probe=timeout") || denied.logs.contains("tcp-probe=connect-failed"))
     {
@@ -1905,6 +1921,57 @@ struct NetworkPolicyProbe {
     phase: String,
     /// Bounded probe output.
     logs: String,
+    /// Pod status and scheduling events captured when the probe cannot finish.
+    diagnostics: String,
+}
+
+/// Capture bounded pod status and scheduling events for a non-terminal probe.
+#[expect(
+    clippy::too_many_lines,
+    reason = "pod status and event diagnostics are captured as one bounded evidence record"
+)]
+fn probe_diagnostics(context: &str, name: &str) -> String {
+    let status = Command::new("timeout")
+        .args([
+            "15s",
+            "kubectl",
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "pod",
+            name,
+            "-o",
+            "json",
+        ])
+        .output();
+    let events = Command::new("timeout")
+        .args([
+            "15s",
+            "kubectl",
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "events",
+            "--field-selector",
+            &format!("involvedObject.name={name}"),
+            "-o",
+            "wide",
+        ])
+        .output();
+    let render = |output: Result<std::process::Output, std::io::Error>| match output {
+        Ok(output) => format!(
+            "stdout={} stderr={} status={}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stdout).trim(), 1200),
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 600),
+            output.status
+        ),
+        Err(error) => format!("command error={error}"),
+    };
+    format!("pod={}; events={}", render(status), render(events))
 }
 
 /// Delete a fixed-name probe pod without failing cleanup.
@@ -1951,6 +2018,7 @@ fn run_probe_pod(
     // command. VCR replaces that image, so use a small public curl image and
     // preserve the same terminal evidence contract for the policy assertion.
     let probe_image = "curlimages/curl:8.10.1";
+    let probe_script = "if curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' \"http://$1\" >/dev/null 2>&1; then echo tcp-probe=connected; exit 0; else echo tcp-probe=connect-failed; exit 1; fi";
     command.args([
         "--context",
         context,
@@ -1965,17 +2033,31 @@ fn run_probe_pod(
         ),
         "--restart=Never",
     ]);
+    let overrides = serde_json::json!({
+        "apiVersion": "v1",
+        "spec": {
+            "securityContext": {
+                "runAsNonRoot": true,
+                "runAsUser": 1000,
+                "seccompProfile": {"type": "RuntimeDefault"}
+            },
+            "containers": [{
+                "name": name,
+                "image": probe_image,
+                "imagePullPolicy": crate::env::image_overrides::demo_image_pull_policy(mode),
+                "command": ["sh", "-c", probe_script],
+                "args": ["curl-probe", target],
+                "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "capabilities": {"drop": ["ALL"]}
+                }
+            }]
+        }
+    });
+    command.args(["--overrides", &overrides.to_string()]);
     if let Some(value) = labels {
         command.arg(format!("--labels={value}"));
     }
-    command.args([
-        "--",
-        "sh",
-        "-c",
-        "if curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' \"http://$1\" >/dev/null 2>&1; then echo tcp-probe=connected; exit 0; else echo tcp-probe=connect-failed; exit 1; fi",
-        "curl-probe",
-        target,
-    ]);
     let output = command.output()?;
     if !output.status.success() {
         return Err(format!(
@@ -1992,7 +2074,11 @@ fn run_probe_pod(
             break phase;
         }
         if Instant::now() >= deadline {
-            return Err(format!("probe pod {name} did not finish; last phase={phase}").into());
+            return Ok(NetworkPolicyProbe {
+                phase,
+                logs: String::new(),
+                diagnostics: probe_diagnostics(context, name),
+            });
         }
         thread::sleep(Duration::from_millis(250));
     };
@@ -2008,6 +2094,7 @@ fn run_probe_pod(
     Ok(NetworkPolicyProbe {
         phase,
         logs: safe_truncate_str(logs.trim(), 512),
+        diagnostics: String::new(),
     })
 }
 

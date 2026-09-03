@@ -169,13 +169,19 @@ topology:
 token-rate-limit-filter,praxis-filter/basic-auth-filter
 ```
 
+> **Published-image limitation:** The standard
+> `ghcr.io/praxis-proxy/ai:0.3.0` image does not contain these optional
+> filters because they are experimental, so it cannot run this qualification.
+> Supply a feature-enabled Praxis AI image explicitly. Grid publishes no
+> alternate AI rollup.
+
 The second entry enables Basic Auth in AI's released `praxis-filter`
 dependency. It does not require a Praxis source checkout, Cargo patch, Git
 revision, or fork pin. Build AI from its own clean source tree and committed
 lockfile. Basic Auth stores the qualification credential in configuration and
 is not the production identity mechanism proposed by Grid issue 101.
 
-AI's current `Containerfile` does not expose a Cargo-feature build argument.
+AI v0.3.0's `Containerfile` does not expose a Cargo-feature build argument.
 Prepare a temporary Containerfile outside the AI worktree that adds the exact
 feature expression to both build-stage `cargo build` commands, then label the
 result so the qualification can verify its contract before creating clusters:

@@ -88,23 +88,39 @@ cross-cluster discovery.
 
 Prerequisites are Docker, Kind, `kubectl`, Helm, OpenSSL, Rust, and an AI source
 checkout next to or otherwise accessible from this Grid checkout. The runner
-uses `imagePullPolicy: Never` and requires these exact local image references:
+uses `imagePullPolicy: Never` by default. The names below are local-development
+defaults; release validation should provide unique references through the
+`GRID_XTASK_*_IMAGE` environment variables:
 
 - `grid-operator:single-cluster-qualification`
 - `grid-overlay-sync:single-cluster-qualification`
 - `praxis-ai:single-cluster-qualification`
 - `ghcr.io/neuralmagic/vllm-vcr:vllm0.23`
 
+Supported overrides are `GRID_XTASK_GATEWAY_IMAGE`,
+`GRID_XTASK_OPERATOR_IMAGE`, `GRID_XTASK_OVERLAY_SYNC_IMAGE`,
+`GRID_XTASK_VCR_IMAGE`, and `GRID_XTASK_IMAGE_PULL_POLICY`. Explicit image
+references are materialized into the Forge configuration, loaded into Kind
+when the policy is `Never`, and recorded in qualification evidence. The runner
+fails before deployment if an explicit reference is malformed, missing, or
+absent from the materialized configuration.
+
 Build Forge and the Grid images from this checkout:
 
 ```console
 cargo build -p forge
 
+export GRID_XTASK_GATEWAY_IMAGE=praxis-ai:single-cluster-qualification-$RUN_ID
+export GRID_XTASK_OPERATOR_IMAGE=grid-operator:single-cluster-qualification-$RUN_ID
+export GRID_XTASK_OVERLAY_SYNC_IMAGE=grid-overlay-sync:single-cluster-qualification-$RUN_ID
+export GRID_XTASK_VCR_IMAGE=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
+export GRID_XTASK_IMAGE_PULL_POLICY=Never
+
 docker build -f deploy/operator/Containerfile \
-  -t grid-operator:single-cluster-qualification .
+  -t "$GRID_XTASK_OPERATOR_IMAGE" .
 
 docker build -f overlay-sync/Containerfile \
-  -t grid-overlay-sync:single-cluster-qualification .
+  -t "$GRID_XTASK_OVERLAY_SYNC_IMAGE" .
 ```
 
 Build the gateway from a clean Praxis AI checkout. This qualification uses the
@@ -113,7 +129,7 @@ quota filters:
 
 ```console
 docker build -f Containerfile \
-  -t praxis-ai:single-cluster-qualification .
+  -t "$GRID_XTASK_GATEWAY_IMAGE" .
 ```
 
 Pull the pinned simulator image, validate the topology, and run focused static
