@@ -1,4 +1,4 @@
-# grid-llmd-pool-metrics — Internal E2E Topology
+# grid-llmd-pool-metrics — Deterministic llm-d pool-metrics qualification
 
 Internal test fixture for the Grid llm-d pool-metrics E2E scenario.
 
@@ -10,9 +10,22 @@ cargo xtask env run-grid-llmd-pool-metrics-demo \
   --quick --teardown
 ```
 
-The default configuration pulls
-`ghcr.io/praxis-proxy/ai:0.3.0`, which contains the provider-side
-filters used by this topology. For local development, set
+The qualification uses upstream `llm-d-inference-sim` as the inference
+backend. Its startup `fake-metrics.waiting-requests` value is mounted from a
+ConfigMap. The runner updates that persistent configuration and rolls the
+simulator pods, so a restart cannot lose the requested value. The deterministic
+state sequence is `0 -> 9 -> 0` for queue depth and `0.0 -> 0.95 -> 0.0`
+for KV-cache pressure.
+
+Grid still performs real EPP metric scraping, score/rank computation, overlay
+publication, overlay-sync projection, Praxis configuration loading, and
+request routing. It does not generate pressure by sending request floods; the
+separate real EPP/VCR smoke coverage remains useful for availability and
+provider-boundary checks.
+
+The default gateway image is
+`ghcr.io/praxis-proxy/ai:0.3.0`, which contains the provider-side filters used
+by this topology. For local development, set
 `GRID_XTASK_GATEWAY_IMAGE` to an AI image containing
 [`provider_route`](https://github.com/praxis-proxy/ai/pull/386) and set
 `GRID_XTASK_IMAGE_PULL_POLICY=Never` explicitly.
@@ -31,9 +44,8 @@ filters used by this topology. For local development, set
 
 - Two-cluster llm-d pool topology with EPP telemetry
 - Score-first routing based on live queue-depth and KV-cache utilization
-- A-to-B-to-A capacity failover under simulated pressure ramp, with either
-  the queue-depth (default) or kv-cache-pressure (`--kv-cache`) scoring
-  strategy
+- A-to-B-to-A capacity failover from deterministic simulator metrics, using
+  queue depth by default or KV-cache pressure with `--kv-cache`
 - mTLS metrics scraping through the nginx TLS proxy
 - Provider boundary and credential isolation
 

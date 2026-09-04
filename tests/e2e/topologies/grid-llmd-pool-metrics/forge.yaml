@@ -23,7 +23,7 @@ spec:
         gatewayImage: "ghcr.io/praxis-proxy/ai:0.3.0"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.4"
         eppImage: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0"
-        vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
+        vcrImage: "llm-d-inference-sim:deterministic"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/ai"
         gatewayImageTag: "0.3.0"
@@ -31,8 +31,8 @@ spec:
         operatorImageTag: "v0.1.4"
         eppImageRepo: "ghcr.io/llm-d/llm-d-router-endpoint-picker"
         eppImageTag: "v0.9.0"
-        vcrImageRepo: "ghcr.io/neuralmagic/vllm-vcr"
-        vcrImageTag: "vllm0.23"
+        vcrImageRepo: "llm-d-inference-sim"
+        vcrImageTag: "deterministic"
         poolName: pool-a
 
     - name: pool-b
@@ -44,7 +44,7 @@ spec:
         gatewayImage: "ghcr.io/praxis-proxy/ai:0.3.0"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.4"
         eppImage: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0"
-        vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
+        vcrImage: "llm-d-inference-sim:deterministic"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/ai"
         gatewayImageTag: "0.3.0"
@@ -52,8 +52,8 @@ spec:
         operatorImageTag: "v0.1.4"
         eppImageRepo: "ghcr.io/llm-d/llm-d-router-endpoint-picker"
         eppImageTag: "v0.9.0"
-        vcrImageRepo: "ghcr.io/neuralmagic/vllm-vcr"
-        vcrImageTag: "vllm0.23"
+        vcrImageRepo: "llm-d-inference-sim"
+        vcrImageTag: "deterministic"
         poolName: pool-b
 
   stacks:
@@ -142,7 +142,7 @@ spec:
           interval: "2s"
 
     llmd-pool-a:
-      description: vllm-vcr inference backends and EPP for pool-a
+      description: deterministic llm-d-sim inference backends and EPP for pool-a
       steps:
         - type: manifest
           path: resources/common/grid-system-namespace.yaml
@@ -156,8 +156,6 @@ spec:
           path: resources/pool-a/inferencepool.yaml
         - type: manifest
           path: resources/pool-a/epp-deployment.yaml
-        - type: manifest
-          path: resources/pool-a/pressure-generator.yaml
         - type: wait
           resource: deployment/vcr-1
           namespace: grid-system
@@ -182,7 +180,7 @@ spec:
           interval: "2s"
 
     llmd-pool-b:
-      description: vllm-vcr inference backends and EPP for pool-b
+      description: deterministic llm-d-sim inference backends and EPP for pool-b
       steps:
         - type: manifest
           path: resources/common/grid-system-namespace.yaml
@@ -264,7 +262,7 @@ spec:
             inferenceProviders:
               - name: llmd-pool-a-provider
                 gridNetworkRef: grid-llmd-pool-metrics
-                providerKind: vllm-vcr
+                providerKind: llm-d-inference-sim
                 backendKind: local
                 endpoint: "http://vcr-service.grid-system.svc.cluster.local:8000"
                 siteSelector:
@@ -339,7 +337,7 @@ spec:
             inferenceProviders:
               - name: llmd-pool-b-provider
                 gridNetworkRef: grid-llmd-pool-metrics
-                providerKind: vllm-vcr
+                providerKind: llm-d-inference-sim
                 backendKind: local
                 endpoint: "http://vcr-service.grid-system.svc.cluster.local:8000"
                 siteSelector:
