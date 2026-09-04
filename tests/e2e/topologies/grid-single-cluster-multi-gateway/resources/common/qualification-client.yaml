@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qualification-client
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/name: qualification-client
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: qualification-client
+      image: curlimages/curl:8.12.1
+      command: ["sleep", "3600"]
+      securityContext:
+        runAsUser: 100
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]

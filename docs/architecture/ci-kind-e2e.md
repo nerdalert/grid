@@ -11,6 +11,7 @@ validation suite.
 | Unit | Operator, scoring, xtask, and parser tests | Validates controller logic, overlay rendering, scoring, metrics handling, and harness helpers without Kind. |
 | Smoke Kind | Single-topology operator routing validation | Proves the operator can reconcile resources, render an overlay, and drive a consumer gateway in Kind. |
 | Multi-cluster Kind | SWIM, CRDT, stale GC, metrics routing, and credential validation | Proves the distributed control-plane paths across multiple Kind clusters. |
+| Single-cluster multi-gateway Kind | Shared-site overlays, independent consumer processes, provider attribution, and gateway failure behavior | Proves that multiple gateways can share one Kubernetes control plane without implying cross-cluster behavior. |
 
 ## Gate implementation
 
@@ -25,6 +26,22 @@ Sequence:
 3. `verify-swim-membership` and `verify-swim-state` for distributed membership
    validation.
 4. Full two-provider suite for nightly or release validation.
+
+## Single-cluster multi-gateway coverage
+
+The `run-grid-single-cluster-multi-gateway-qualification` command uses one Kind
+cluster, one Grid operator, one GridNetwork, and one GridSite named `single`, with
+two consumer gateways and three provider gateways. It is distinct from both a
+single gateway smoke test and the multi-cluster provider-traffic qualification:
+the single-cluster test shares one site, Kubernetes control plane, and overlay
+state, while the multi-cluster test exercises multiple sites connected through
+SWIM. Provider-selection cursors remain local to each Praxis process. The
+qualification must prove accepted and serving overlay revisions, per-consumer
+attributed traffic, provider withdrawal and restoration, consumer failure, and
+positive and negative security probes before it can report success.
+
+Topology and execution details are maintained in the
+[single-cluster topology README](../../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md).
 
 ## Multi-cluster coverage set
 
