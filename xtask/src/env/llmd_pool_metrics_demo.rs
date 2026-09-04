@@ -1,8 +1,8 @@
 //! llm-d pool-metrics routing demo orchestration.
 //!
 //! Deploys two Kind clusters, each running an llm-d EPP backed by two
-//! vllm-vcr inference backends. Grid scrapes EPP pool-level metrics and
-//! adjusts routing when controlled HTTP load changes one pool's state.
+//! deterministic llm-d-sim inference backends. Grid scrapes EPP pool-level
+//! metrics and adjusts routing when persistent simulator configuration changes.
 #![expect(
     clippy::string_slice,
     clippy::too_many_lines,
@@ -64,7 +64,7 @@ const SETUP_PHASES_MTLS: usize = 11;
 /// Number of setup phases in direct-HTTP mode (no metrics TLS secrets phase).
 const SETUP_PHASES_DIRECT: usize = 10;
 
-/// Primary model name served by vllm-vcr inference backends.
+/// Primary model name served by the deterministic llm-d-sim backends.
 const VCR_MODEL: &str = "Qwen/Qwen3-0.6B";
 
 /// Data-plane convergence timeout for overlay propagation.
@@ -100,15 +100,10 @@ const KV_CACHE_PRESSURE_THRESHOLD: f64 = 0.1;
 /// phase-detection threshold. Extracted from the original inline literal.
 const RECOVERY_QUEUE_THRESHOLD: f64 = 3.0;
 
-/// Pressure generator Deployment name.
-const PRESSURE_GENERATOR_DEPLOYMENT: &str = "pressure-generator";
-
-/// Number of pressure generator replicas during the pressure phase.
-///
-/// With 4 workers per pod, 6 replicas = 24 concurrent requests. This
-/// reliably pushes pool-a queue past 3.5/4, triggering the rank flip
-/// even when pool-b's SWIM-propagated overlay scores are stale.
-const PRESSURE_REPLICAS: u32 = 6;
+/// Deterministic simulator Deployments representing the pool endpoints.
+const SIMULATOR_DEPLOYMENTS: &[&str] = &["vcr-1", "vcr-2"];
+/// Persistent simulator ConfigMap containing startup fake metrics.
+const SIMULATOR_CONFIGMAP: &str = "vcr-1-config";
 
 /// GridNetwork resource name.
 const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
@@ -127,8 +122,8 @@ const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4"
 /// Default EPP image reference required by this demo.
 const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0";
 
-/// Default vllm-vcr image reference required by this demo.
-const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
+/// Default deterministic llm-d-sim image reference required by this demo.
+const DEFAULT_VCR_IMAGE: &str = "llm-d-inference-sim:deterministic";
 
 /// Default overlay-sync sidecar image tag.
 const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "ghcr.io/praxis-proxy/grid-overlay-sync:v0.1.4";
@@ -177,7 +172,7 @@ impl MetricsTransport {
 /// Which of Grid's real scoring signals drives routing in this demo run.
 ///
 /// Selected via the `--kv-cache` CLI flag. Both flavors share the same
-/// pressure generator and the same overlay score-breakdown display (both
+/// simulator metric transitions and the same overlay score-breakdown display (both
 /// `queue_depth` and `kv_cache` are always shown); only the operator's
 /// `GridNetwork.spec.scoringPolicy.strategy` — and therefore which raw
 /// signal actually produces the `score`/`rank` that drives the A\u{2192}B flip —
@@ -242,7 +237,7 @@ struct ResolvedImages {
     operator: String,
     /// llm-d EPP image.
     epp: String,
-    /// vllm-vcr inference backend image.
+    /// Deterministic llm-d-sim inference backend image.
     vcr: String,
     /// Grid overlay-sync sidecar image.
     overlay_sync: String,
@@ -361,20 +356,6 @@ struct InferenceResponse {
     demo_attribution: String,
 }
 
-/// Aggregated request counts from pressure generator pods.
-struct PressureStats {
-    /// Total requests sent.
-    total: u64,
-    /// Successful (HTTP 200) requests.
-    ok: u64,
-    /// Failed requests.
-    fail: u64,
-    /// Requests attributed to pool-a.
-    a_reqs: u64,
-    /// Requests attributed to pool-b.
-    b_reqs: u64,
-}
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -469,6 +450,7 @@ pub(crate) fn run(
     let images = collect_image_evidence(&context.images)?;
     let success = run_error.is_none();
 
+    write_transition_timeline(&evidence_dir, &proof_results, context.scoring_flavor, wall_secs)?;
     let evidence = Evidence {
         schema_version: EVIDENCE_SCHEMA_VERSION.to_owned(),
         mode: format!("{mode:?}").to_lowercase(),
@@ -513,6 +495,43 @@ pub(crate) fn run(
     } else {
         Err(run_error.unwrap().into())
     }
+}
+
+/// Write one machine-readable record per deterministic phase. The detailed
+/// observations remain in `evidence.json`; this JSONL companion makes phase
+/// ordering and requested simulator values easy to consume without parsing
+/// human output.
+fn write_transition_timeline(
+    evidence_dir: &Path,
+    proofs: &BTreeMap<String, ProofResult>,
+    scoring_flavor: ScoringFlavor,
+    wall_secs: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let phases = [
+        ("baseline", 0_u32, "baseline"),
+        ("pressure", 9_u32, "pressure_and_flip"),
+        ("recovery", 0_u32, "recovery"),
+    ];
+    let mut lines = Vec::new();
+    for (phase, requested_pressure, proof_name) in phases {
+        let proof = proofs.get(proof_name);
+        let (waiting_requests, kv_cache_usage) = simulator_metrics(requested_pressure, scoring_flavor);
+        lines.push(serde_json::json!({
+            "phase": phase,
+            "requested_waiting_requests": waiting_requests,
+            "requested_kv_cache_usage": kv_cache_usage,
+            "proof_success": proof.is_some_and(|result| result.success),
+            "wall_elapsed_seconds": wall_secs,
+            "observations": proof.map_or_else(Vec::new, |result| result.observations.clone()),
+        }));
+    }
+    let content = lines
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(evidence_dir.join("timeline.jsonl"), format!("{content}\n"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -634,7 +653,7 @@ fn tag_images_for_forge(images: &ResolvedImages) -> Result<(), Box<dyn std::erro
         (&images.gateway, "praxis-ai:llmd-pool-metrics-demo"),
         (&images.operator, "grid-operator:llmd-pool-metrics-demo"),
         (&images.epp, "llm-d-epp:llmd-pool-metrics-demo"),
-        (&images.vcr, "vllm-vcr:llmd-pool-metrics-demo"),
+        (&images.vcr, "llm-d-inference-sim:deterministic"),
         (&images.overlay_sync, "grid-overlay-sync:llmd-pool-metrics-demo"),
     ];
     for (source, target) in forge_expected {
@@ -744,7 +763,11 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
 
     // Phase 7/8: Deploy VCR backends and EPP
     eprintln!();
-    eprintln!("[SETUP {}/{}] Deploying vllm-vcr backends and EPP", next(), total);
+    eprintln!(
+        "[SETUP {}/{}] Deploying deterministic llm-d-sim backends and EPP",
+        next(),
+        total
+    );
     for cluster in CLUSTERS {
         let llmd_stack = format!("llmd-{cluster}");
         run_forge_stack(&context.forge_bin, &context.resolved_config, cluster, &llmd_stack)?;
@@ -997,28 +1020,27 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
     observations.push("precondition: pool-a rank=0 at entry".to_owned());
 
     eprintln!();
-    eprintln!("  [PRESSURE] Starting pressure generator through the consumer gateway");
-    eprintln!("    replicas:    {PRESSURE_REPLICAS}");
-    eprintln!("    workers:     4 per replica (total {})", PRESSURE_REPLICAS * 4);
-    eprintln!("    gateway:     consumer-gateway.grid-system:8080");
-    eprintln!("    model:       {VCR_MODEL}");
-    eprintln!("    max_tokens:  64");
-    if let Err(e) = scale_pressure_generator("pool-a", PRESSURE_REPLICAS) {
-        observations.push(format!("pressure generator scale-up failed: {e}"));
+    eprintln!(
+        "  [PRESSURE] Persisting deterministic llm-d-sim {} pressure and rolling Pool A",
+        context.scoring_flavor.label()
+    );
+    if let Err(e) = set_simulator_waiting_requests("pool-a", 9, context.scoring_flavor, mtls) {
+        observations.push(format!("simulator pressure rollout failed: {e}"));
         return ProofResult {
             success: false,
-            description: "Pressure & flip: pressure generator failed to start".to_owned(),
+            description: "Pressure & flip: simulator failed to report the requested metric".to_owned(),
             observations,
         };
     }
     observations.push(format!(
-        "pressure generator scaled to {PRESSURE_REPLICAS} replicas (gateway-routed)"
+        "llm-d-sim {} pressure set through persistent Deployment configuration",
+        context.scoring_flavor.label()
     ));
 
     eprintln!();
     eprintln!("  Live Metrics Table");
     eprintln!("    Queue/KV/Score/Rank: derived from the Grid overlay (production scoring engine)");
-    eprintln!("    A_REQ/B_REQ:        cumulative gateway attribution counts from pressure pods");
+    eprintln!("    pressure source:     llm-d-sim /metrics (persistent fake-metrics)");
     eprintln!("    LAST_ROUTE:         most recent confirmed request destination");
     print_live_table_header();
     let deadline = Instant::now() + DATA_PLANE_WAIT;
@@ -1039,7 +1061,6 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
         let updated_candidates = read_overlay_candidates("pool-a");
         let row_a = build_scorecard_row("Cluster A", &updated_candidates, "pool-a", &epp_a);
         let row_b = build_scorecard_row("Cluster B", &updated_candidates, "pool-b", &epp_b);
-        let stats = read_pressure_stats("pool-a");
         let score_gap = row_b.score - row_a.score;
 
         let phase = if row_b.rank == 0 && row_a.rank > 0 {
@@ -1062,7 +1083,6 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
             elapsed: table_start.elapsed(),
             phase,
             rows: (&row_a, &row_b),
-            stats: &stats,
             last_route: &last_route,
         });
 
@@ -1081,10 +1101,6 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
                 };
                 if resp.provider_gateway.contains("pool-b") && resp.demo_attribution.contains("pool-b") {
                     eprintln!("  [TRAFFIC SHIFT] Request attributed to pool-b");
-                    eprintln!(
-                        "    load stats: total={} ok={} fail={} | a={} b={}",
-                        stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
-                    );
                     print_scorecard_with_cause(
                         "FAILOVER",
                         &[&row_a, &row_b],
@@ -1104,10 +1120,6 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
                         "attribution: gateway={} provider={}",
                         resp.provider_gateway, resp.demo_attribution
                     ));
-                    observations.push(format!(
-                        "load stats: total={} ok={} fail={} a={} b={}",
-                        stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
-                    ));
                     observations
                         .push("Grid rerouted: gateway-routed load caused A\u{2192}B preference change".to_owned());
                     return ProofResult {
@@ -1123,11 +1135,6 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
         std::thread::sleep(Duration::from_secs(2));
     }
 
-    let stats = read_pressure_stats("pool-a");
-    observations.push(format!(
-        "final load stats: total={} ok={} fail={} a={} b={}",
-        stats.total, stats.ok, stats.fail, stats.a_reqs, stats.b_reqs
-    ));
     observations.push("A\u{2192}B flip did not converge in data plane within timeout".to_owned());
     ProofResult {
         success: false,
@@ -1142,26 +1149,18 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
     let mut observations = Vec::new();
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
 
-    let final_stats = read_pressure_stats("pool-a");
     eprintln!();
-    eprintln!("  [RECOVERY] Stopping pressure generator");
-    eprintln!(
-        "    final load: total={} ok={} fail={} | pool-a={} pool-b={}",
-        final_stats.total, final_stats.ok, final_stats.fail, final_stats.a_reqs, final_stats.b_reqs
-    );
-    if let Err(e) = scale_pressure_generator("pool-a", 0) {
-        observations.push(format!("pressure generator scale-down failed: {e}"));
+    eprintln!("  [RECOVERY] Persisting llm-d-sim waiting-requests=0 and rolling Pool A");
+    if let Err(e) = set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls) {
+        observations.push(format!("simulator recovery rollout failed: {e}"));
         return ProofResult {
             success: false,
-            description: "Recovery: pressure generator failed to stop".to_owned(),
+            description: "Recovery: simulator failed to report waiting-requests=0".to_owned(),
             observations,
         };
     }
-    observations.push("pressure generator scaled to 0 replicas".to_owned());
-    observations.push(format!(
-        "final load stats: total={} ok={} fail={} a={} b={}",
-        final_stats.total, final_stats.ok, final_stats.fail, final_stats.a_reqs, final_stats.b_reqs
-    ));
+    observations
+        .push("llm-d-sim waiting-requests restored to 0 through persistent Deployment configuration".to_owned());
 
     eprintln!("  [RECOVERY] Pressure stopped; waiting for Pool A to drain and regain rank 0");
 
@@ -1191,7 +1190,6 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
             elapsed: table_start.elapsed(),
             phase: "RECOVERY",
             rows: (&row_a, &row_b),
-            stats: &final_stats,
             last_route: &last_route,
         });
 
@@ -1249,89 +1247,130 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
 // Pressure generator
 // ---------------------------------------------------------------------------
 
-/// Scale the pressure-generator Deployment on a cluster.
-fn scale_pressure_generator(cluster: &str, replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+/// Persist a deterministic queue value, then roll the simulator pods so the
+/// value is read from startup configuration rather than an in-memory admin
+/// endpoint. The EPP metric and overlay checks remain the authoritative
+/// downstream observations.
+fn set_simulator_waiting_requests(
+    cluster: &str,
+    waiting_requests: u32,
+    scoring_flavor: ScoringFlavor,
+    mtls: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = kind_context(cluster);
-    let status = Command::new("kubectl")
-        .args([
-            "--context",
-            &ctx,
-            "-n",
-            GRID_SYSTEM_NS,
-            "scale",
-            &format!("deployment/{PRESSURE_GENERATOR_DEPLOYMENT}"),
-            &format!("--replicas={replicas}"),
-        ])
-        .status()?;
-    if !status.success() {
-        return Err(format!("failed to scale {PRESSURE_GENERATOR_DEPLOYMENT} to {replicas}").into());
-    }
-    if replicas > 0 {
-        let wait = Command::new("kubectl")
+    let (waiting_requests, kv_cache_usage) = simulator_metrics(waiting_requests, scoring_flavor);
+    let config = simulator_config(waiting_requests, kv_cache_usage);
+    kubectl::apply_manifest(&ctx, &config)
+        .map_err(|e| format!("apply persistent simulator config on {cluster}: {e}"))?;
+
+    for deployment in SIMULATOR_DEPLOYMENTS {
+        let before = deployment_generation(&ctx, deployment)?;
+        let patch = serde_json::json!({
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "grid.praxis-proxy.io/fake-waiting-requests": waiting_requests.to_string()
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let output = Command::new("kubectl")
             .args([
                 "--context",
                 &ctx,
                 "-n",
                 GRID_SYSTEM_NS,
-                "rollout",
-                "status",
-                &format!("deployment/{PRESSURE_GENERATOR_DEPLOYMENT}"),
-                "--timeout=60s",
+                "patch",
+                &format!("deployment/{deployment}"),
+                "--type=merge",
+                "-p",
+                &patch,
             ])
-            .status()?;
-        if !wait.success() {
-            return Err("pressure generator pods did not become ready".into());
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "patch simulator deployment/{deployment}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
         }
+        let after = deployment_generation(&ctx, deployment)?;
+        if after <= before {
+            return Err(format!("deployment/{deployment} generation did not change ({before} -> {after})").into());
+        }
+        kubectl::wait_for_rollout_ns(&ctx, deployment, GRID_SYSTEM_NS, cluster)
+            .map_err(|e| format!("wait for simulator deployment/{deployment} rollout: {e}"))?;
     }
-    eprintln!("  [OK] {cluster}: pressure-generator scaled to {replicas}");
-    Ok(())
+
+    let deadline = Instant::now() + DATA_PLANE_WAIT;
+    while Instant::now() < deadline {
+        let config_text = get_configmap_data_key(&ctx, GRID_SYSTEM_NS, SIMULATOR_CONFIGMAP, "config.yaml");
+        if config_text
+            .as_deref()
+            .is_ok_and(|text| text.contains(&format!("waiting-requests: {waiting_requests}")))
+            && kubectl_exec_epp_metrics(cluster, mtls)
+                .ok()
+                .and_then(|text| parse_required_epp_metrics(&text).ok())
+                .is_some_and(|metrics| {
+                    (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
+                        && (metrics.kv_cache - kv_cache_usage).abs() < f64::EPSILON
+                })
+        {
+            eprintln!("  [OK] {cluster}: simulator waiting-requests={waiting_requests} is live in EPP metrics");
+            return Ok(());
+        }
+        std::thread::sleep(DATA_PLANE_INTERVAL);
+    }
+    Err(format!("{cluster}: simulator did not expose waiting-requests={waiting_requests} within timeout").into())
 }
 
-/// Read aggregated pressure stats from all pressure generator pods.
-///
-/// Each pod prints `STATS total ok fail a b` lines to stdout every 2s.
-/// This reads the last line from each pod and sums the counts.
-fn read_pressure_stats(cluster: &str) -> PressureStats {
-    let ctx = kind_context(cluster);
+/// Render the complete simulator startup configuration for a queue value.
+fn simulator_config(waiting_requests: u32, kv_cache_usage: f64) -> String {
+    format!(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {SIMULATOR_CONFIGMAP}\n  namespace: {GRID_SYSTEM_NS}\ndata:\n  config.yaml: |\n    port: 8000\n    model: {VCR_MODEL}\n    served-model-name: [{VCR_MODEL}]\n    mode: echo\n    fake-metrics:\n      waiting-requests: {waiting_requests}\n      kv-cache-usage: {kv_cache_usage}\n"
+    )
+}
+
+/// Select deterministic simulator metrics for the active scoring strategy.
+fn simulator_metrics(pressure: u32, scoring_flavor: ScoringFlavor) -> (u32, f64) {
+    if pressure == 0 {
+        return (0, 0.0);
+    }
+    match scoring_flavor {
+        ScoringFlavor::QueueDepth => (pressure, 0.0),
+        ScoringFlavor::KvCachePressure => (0, 0.95),
+    }
+}
+
+/// Read a Deployment generation before and after a deterministic simulator
+/// configuration change.
+fn deployment_generation(context: &str, deployment: &str) -> Result<i64, Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
         .args([
             "--context",
-            &ctx,
+            context,
             "-n",
             GRID_SYSTEM_NS,
-            "logs",
-            "-l",
-            &format!("app={PRESSURE_GENERATOR_DEPLOYMENT}"),
-            "--tail=1",
+            "get",
+            &format!("deployment/{deployment}"),
+            "-o",
+            "jsonpath={.metadata.generation}",
         ])
-        .output();
-    let mut stats = PressureStats {
-        total: 0,
-        ok: 0,
-        fail: 0,
-        a_reqs: 0,
-        b_reqs: 0,
-    };
-    let Ok(out) = output else {
-        return stats;
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("STATS ") {
-            let mut parts = rest.split_whitespace();
-            let t = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            let o = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            let f = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            let a = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            let b = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            stats.total += t;
-            stats.ok += o;
-            stats.fail += f;
-            stats.a_reqs += a;
-            stats.b_reqs += b;
-        }
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "read deployment/{deployment} generation: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
     }
-    stats
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i64>()
+        .map_err(|e| format!("invalid deployment/{deployment} generation: {e}").into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1435,10 +1474,19 @@ fn parse_epp_metrics(text: &str) -> EppMetrics {
     }
 }
 
+/// Parse required pool metrics without treating a failed scrape as zero.
+fn parse_required_epp_metrics(text: &str) -> Result<EppMetrics, Box<dyn std::error::Error>> {
+    let queue_size = first_prom_value(text, EPP_QUEUE_SIZE_METRICS)
+        .ok_or("required queue metric is absent from the simulator/EPP scrape")?;
+    let kv_cache = first_prom_value(text, EPP_KV_CACHE_METRICS)
+        .ok_or("required KV-cache metric is absent from the simulator/EPP scrape")?;
+    Ok(EppMetrics { queue_size, kv_cache })
+}
+
 /// Whether the pressure phase should be announced/entered for the given
 /// scoring flavor.
 ///
-/// Both metrics typically rise together under the pressure generator's
+/// Both metrics typically rise together under deterministic simulator pressure.
 /// synthetic load, but the announced phase must key off the signal that
 /// actually drives the active `GridNetwork` scoring strategy — otherwise a
 /// `kvCachePressure` run could narrate "queue pressure" while queue depth
@@ -1627,20 +1675,8 @@ fn print_scorecard_with_cause(
 fn print_live_table_header() {
     eprintln!();
     eprintln!(
-        "  {:<6} {:<11} {:>7} {:>5} {:>7} {:>6}  {:>7} {:>5} {:>7} {:>6}  {:>5} {:>5} {:>10}",
-        "TIME",
-        "PHASE",
-        "A_QUEUE",
-        "A_KV",
-        "A_SCORE",
-        "A_RANK",
-        "B_QUEUE",
-        "B_KV",
-        "B_SCORE",
-        "B_RANK",
-        "A_REQ",
-        "B_REQ",
-        "LAST_ROUTE"
+        "  {:<6} {:<11} {:>7} {:>5} {:>7} {:>6}  {:>7} {:>5} {:>7} {:>6}  {:>10}",
+        "TIME", "PHASE", "A_QUEUE", "A_KV", "A_SCORE", "A_RANK", "B_QUEUE", "B_KV", "B_SCORE", "B_RANK", "LAST_ROUTE"
     );
 }
 
@@ -1652,8 +1688,6 @@ struct LiveTableRow<'row> {
     phase: &'row str,
     /// Scorecard rows for pool-a and pool-b.
     rows: (&'row ScorecardRow, &'row ScorecardRow),
-    /// Pressure generator attribution stats.
-    stats: &'row PressureStats,
     /// Last probe request attribution.
     last_route: &'row str,
 }
@@ -1664,20 +1698,8 @@ fn print_live_table_row(row: &LiveTableRow<'_>) {
     let time_str = format!("{:02}:{:02}", secs / 60, secs % 60);
     let (a, b) = row.rows;
     eprintln!(
-        "  {:<6} {:<11} {:>7.1} {:>.2} {:>7.2} {:>6}  {:>7.1} {:>.2} {:>7.2} {:>6}  {:>5} {:>5} {:>10}",
-        time_str,
-        row.phase,
-        a.queue,
-        a.kv_cache,
-        a.score,
-        a.rank,
-        b.queue,
-        b.kv_cache,
-        b.score,
-        b.rank,
-        row.stats.a_reqs,
-        row.stats.b_reqs,
-        row.last_route,
+        "  {:<6} {:<11} {:>7.1} {:>.2} {:>7.2} {:>6}  {:>7.1} {:>.2} {:>7.2} {:>6}  {:>10}",
+        time_str, row.phase, a.queue, a.kv_cache, a.score, a.rank, b.queue, b.kv_cache, b.score, b.rank, row.last_route,
     );
 }
 
@@ -2425,6 +2447,31 @@ fn materialize_config_with_images(
                     &format!("{role} image tag"),
                 )?;
             }
+        }
+
+        // The simulator image is also embedded in the checked-in backend
+        // manifests. Materialize those manifests so an explicit override is
+        // the exact image loaded into Kind; do not rely on a host-only alias.
+        for pool in CLUSTERS {
+            let source = dir.join(format!("resources/{pool}/vcr-deployment.yaml"));
+            let resolved_name = format!(".forge.resolved.{pool}-vcr-deployment.yaml");
+            let destination = dir.join(&resolved_name);
+            let manifest = fs::read_to_string(&source)?;
+            let resolved_manifest = checked_replace(
+                &manifest,
+                DEFAULT_VCR_IMAGE,
+                &images.vcr,
+                2,
+                &format!("{pool} simulator image"),
+            )?;
+            fs::write(&destination, resolved_manifest)?;
+            result = checked_replace(
+                &result,
+                &format!("resources/{pool}/vcr-deployment.yaml"),
+                &resolved_name,
+                1,
+                &format!("{pool} simulator deployment path"),
+            )?;
         }
     }
     for cluster in CLUSTERS {
@@ -3913,6 +3960,50 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         let text = "some_other_metric 1.0\n";
         let val = extract_prom_value(text, "inference_pool_average_queue_size");
         assert_eq!(val, None, "expected None for missing metric");
+    }
+
+    #[test]
+    fn simulator_config_persists_zero_queue_value() {
+        let config = simulator_config(0, 0.0);
+        assert!(config.contains("fake-metrics:"));
+        assert!(config.contains("waiting-requests: 0"));
+        assert!(config.contains("kv-cache-usage: 0"));
+    }
+
+    #[test]
+    fn simulator_config_persists_pressure_queue_value() {
+        let config = simulator_config(9, 0.0);
+        assert!(config.contains("waiting-requests: 9"));
+        assert!(!config.contains("pressure-generator"));
+    }
+
+    #[test]
+    fn kv_cache_pressure_sets_only_the_selected_signal() {
+        let (queue, kv_cache) = simulator_metrics(9, ScoringFlavor::KvCachePressure);
+        let config = simulator_config(queue, kv_cache);
+        assert!(config.contains("waiting-requests: 0"));
+        assert!(config.contains("kv-cache-usage: 0.95"));
+    }
+
+    #[test]
+    fn queue_pressure_sets_only_the_selected_signal() {
+        let (queue, kv_cache) = simulator_metrics(9, ScoringFlavor::QueueDepth);
+        assert_eq!(queue, 9);
+        assert!(kv_cache.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn required_metric_parser_rejects_missing_scrape() {
+        assert!(parse_required_epp_metrics("").is_err());
+    }
+
+    #[test]
+    fn required_metric_parser_reads_exact_queue_and_kv_values() {
+        let text = "llm_d_epp_average_queue_size{name=\"pool-a\"} 9\n\
+                    llm_d_epp_average_kv_cache_utilization{name=\"pool-a\"} 0\n";
+        let metrics = parse_required_epp_metrics(text).unwrap();
+        assert!((metrics.queue_size - 9.0).abs() < f64::EPSILON);
+        assert!(metrics.kv_cache.abs() < f64::EPSILON);
     }
 
     #[test]
