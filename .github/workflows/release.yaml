@@ -24,8 +24,10 @@ permissions: {}
 env:
   CARGO_TERM_COLOR: always
   NIGHTLY_RUSTFMT: nightly-2026-03-28
-  AI_ROLLUP_IMAGE_NAME: ghcr.io/praxis-proxy/grid-ai-rollup
-  AI_ROLLUP_SOURCE_SHA: c68149502d991d51daaff8d6bf96c18704aeb38d
+  OFFICIAL_AI_IMAGE_NAME: ghcr.io/praxis-proxy/ai
+  OFFICIAL_AI_IMAGE_TAG: 0.3.0
+  OFFICIAL_AI_IMAGE_DIGEST: sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8
+  OFFICIAL_AI_SOURCE_SHA: b44360afb4100c5543b1180ac8df16e482978fc8
   OPERATOR_IMAGE_NAME: ghcr.io/praxis-proxy/grid-operator
   MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
   OVERLAY_SYNC_IMAGE_NAME: ghcr.io/praxis-proxy/grid-overlay-sync
@@ -138,7 +140,7 @@ jobs:
       operator_digest: ${{ steps.operator.outputs.digest }}
       mock_providers_digest: ${{ steps.mock_providers.outputs.digest }}
       overlay_sync_digest: ${{ steps.overlay_sync.outputs.digest }}
-      ai_rollup_digest: ${{ steps.ai_rollup.outputs.digest }}
+      official_ai_digest: ${{ steps.official_ai.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -155,32 +157,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Verify official Grid AI rollup
-        id: ai_rollup
-        env:
-          TAG: ${{ needs.validate.outputs.tag }}
+      - name: Verify official Praxis AI image
+        id: official_ai
         run: |
           set -euo pipefail
-          RELEASE_REF="${AI_ROLLUP_IMAGE_NAME}:${TAG}"
-          SOURCE_REF="${AI_ROLLUP_IMAGE_NAME}:sha-${AI_ROLLUP_SOURCE_SHA}"
-          RELEASE_DIGEST=$(docker buildx imagetools inspect "${RELEASE_REF}" \
-            --format '{{.Manifest.Digest}}')
-          SOURCE_DIGEST=$(docker buildx imagetools inspect "${SOURCE_REF}" \
-            --format '{{.Manifest.Digest}}')
-          if [[ ! "${RELEASE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ || \
-                ! "${SOURCE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Could not resolve official AI rollup digests"
+          IMAGE_REF="${OFFICIAL_AI_IMAGE_NAME}:${OFFICIAL_AI_IMAGE_TAG}"
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE_REF}" | awk '$1 == "Digest:" { print $2; exit }')
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not resolve official AI image digest"
             exit 1
           fi
-          if [[ "${RELEASE_DIGEST}" != "${SOURCE_DIGEST}" ]]; then
-            echo "::error::Official AI rollup tags resolve to different digests"
-            echo "::error::${RELEASE_REF}: ${RELEASE_DIGEST}"
-            echo "::error::${SOURCE_REF}:  ${SOURCE_DIGEST}"
+          if [[ "${DIGEST}" != "${OFFICIAL_AI_IMAGE_DIGEST}" ]]; then
+            echo "::error::Official AI tag no longer resolves to the pinned digest"
             exit 1
           fi
-          echo "digest=${RELEASE_DIGEST}" >> "${GITHUB_OUTPUT}"
-          echo "Verified ${RELEASE_REF}@${RELEASE_DIGEST}"
-          echo "Verified ${SOURCE_REF}@${SOURCE_DIGEST}"
+          IMMUTABLE_REF="${OFFICIAL_AI_IMAGE_NAME}@${DIGEST}"
+          docker pull "${IMMUTABLE_REF}"
+          SOURCE=$(docker image inspect "${IMMUTABLE_REF}" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')
+          REVISION=$(docker image inspect "${IMMUTABLE_REF}" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          VERSION=$(docker image inspect "${IMMUTABLE_REF}" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')
+          if [[ "${SOURCE}" != "https://github.com/praxis-proxy/ai" || \
+                "${REVISION}" != "${OFFICIAL_AI_SOURCE_SHA}" || \
+                "${VERSION}" != "${OFFICIAL_AI_IMAGE_TAG}" ]]; then
+            echo "::error::Official AI image provenance does not match the pinned release"
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "Verified ${IMAGE_REF}@${DIGEST} (${REVISION})"
 
       - name: Build and push operator
         id: operator
@@ -275,8 +278,12 @@ jobs:
               echo "::error::${chart} version ($CHART_VERSION) != tag version ($VERSION)"
               exit 1
             fi
-            if [ "$CHART_APP_VERSION" != "$TAG" ]; then
-              echo "::error::${chart} appVersion ($CHART_APP_VERSION) != release tag ($TAG)"
+            EXPECTED_APP_VERSION="$TAG"
+            if [ "$chart" = praxis-gateway ]; then
+              EXPECTED_APP_VERSION="$OFFICIAL_AI_IMAGE_TAG"
+            fi
+            if [ "$CHART_APP_VERSION" != "$EXPECTED_APP_VERSION" ]; then
+              echo "::error::${chart} appVersion ($CHART_APP_VERSION) != expected application version ($EXPECTED_APP_VERSION)"
               exit 1
             fi
           done
@@ -345,7 +352,7 @@ jobs:
           OPERATOR_DIGEST: ${{ needs.container.outputs.operator_digest }}
           MOCK_PROVIDERS_DIGEST: ${{ needs.container.outputs.mock_providers_digest }}
           OVERLAY_SYNC_DIGEST: ${{ needs.container.outputs.overlay_sync_digest }}
-          AI_ROLLUP_DIGEST: ${{ needs.container.outputs.ai_rollup_digest }}
+          OFFICIAL_AI_DIGEST: ${{ needs.container.outputs.official_ai_digest }}
           CHART_DIGEST: ${{ needs.chart.outputs.chart_digest }}
           SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
           VERSION: ${{ needs.validate.outputs.version }}
@@ -354,7 +361,7 @@ jobs:
           ## Container Images
 
           \`\`\`text
-          ${AI_ROLLUP_IMAGE_NAME}:${VERSION}@${AI_ROLLUP_DIGEST}
+          ${OFFICIAL_AI_IMAGE_NAME}:${OFFICIAL_AI_IMAGE_TAG}@${OFFICIAL_AI_DIGEST}
           ${OPERATOR_IMAGE_NAME}@${OPERATOR_DIGEST}
           ${MOCK_PROVIDERS_IMAGE_NAME}@${MOCK_PROVIDERS_DIGEST}
           ${OVERLAY_SYNC_IMAGE_NAME}@${OVERLAY_SYNC_DIGEST}
@@ -380,10 +387,18 @@ jobs:
           \`\`\`
 
           The Grid images were built from \`${SOURCE_SHA}\`. The Praxis AI
-          rollup was built from
-          \`praxis-proxy/ai@${AI_ROLLUP_SOURCE_SHA}\` and
-          \`praxis-proxy/praxis@0d3347c634ab4e09d882c02bf01767a1667c82db\`.
+          image was verified from the organization-owned image above at
+          \`praxis-proxy/ai@${OFFICIAL_AI_SOURCE_SHA}\`.
           Every reference above is immutable.
+
+          ## Distributed token quota image requirement
+
+          Grid publishes the routing topology and qualification for distributed
+          token quotas, but the standard Praxis AI ${OFFICIAL_AI_IMAGE_TAG}
+          container does not include the optional \`token-rate-limit-filter\`
+          and \`praxis-filter/basic-auth-filter\` features. Deployments using the
+          quota example must supply a Praxis AI image built with both features.
+          Grid does not publish a replacement AI rollup.
           EOF
 
       - name: Create GitHub release

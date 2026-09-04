@@ -11,7 +11,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     thread,
@@ -82,6 +82,7 @@ struct Evidence {
 struct Cleanup {
     forge: PathBuf,
     config: PathBuf,
+    resolved_config: PathBuf,
     enabled: bool,
 }
 
@@ -97,6 +98,7 @@ impl Drop for Cleanup {
                     .status(),
             );
         }
+        drop(fs::remove_file(&self.resolved_config));
     }
 }
 
@@ -235,12 +237,85 @@ fn capture_grid_state() -> Result<serde_json::Value, String> {
 }
 
 /// Images required by the topology's `Never` pull policy.
-const QUALIFICATION_IMAGES: [&str; 4] = [
-    "grid-operator:single-cluster-qualification",
-    "grid-overlay-sync:single-cluster-qualification",
-    "praxis-ai:single-cluster-qualification",
-    "ghcr.io/neuralmagic/vllm-vcr:vllm0.23",
-];
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ResolvedImages {
+    gateway: String,
+    operator: String,
+    overlay_sync: String,
+    vcr: String,
+    pull_policy: String,
+}
+
+const DEFAULT_GATEWAY_IMAGE: &str = "praxis-ai:single-cluster-qualification";
+const DEFAULT_OPERATOR_IMAGE: &str = "grid-operator:single-cluster-qualification";
+const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "grid-overlay-sync:single-cluster-qualification";
+const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
+
+fn resolved_images() -> Result<ResolvedImages, String> {
+    resolve_images(
+        env::var("GRID_XTASK_GATEWAY_IMAGE").ok(),
+        env::var("GRID_XTASK_OPERATOR_IMAGE").ok(),
+        env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").ok(),
+        env::var("GRID_XTASK_VCR_IMAGE").ok(),
+        env::var("GRID_XTASK_IMAGE_PULL_POLICY").ok(),
+    )
+}
+
+fn resolve_images(
+    gateway: Option<String>,
+    operator: Option<String>,
+    overlay_sync: Option<String>,
+    vcr: Option<String>,
+    pull_policy: Option<String>,
+) -> Result<ResolvedImages, String> {
+    let images = ResolvedImages {
+        gateway: gateway.unwrap_or_else(|| DEFAULT_GATEWAY_IMAGE.to_owned()),
+        operator: operator.unwrap_or_else(|| DEFAULT_OPERATOR_IMAGE.to_owned()),
+        overlay_sync: overlay_sync.unwrap_or_else(|| DEFAULT_OVERLAY_SYNC_IMAGE.to_owned()),
+        vcr: vcr.unwrap_or_else(|| DEFAULT_VCR_IMAGE.to_owned()),
+        pull_policy: pull_policy.unwrap_or_else(|| "Never".to_owned()),
+    };
+    if !matches!(images.pull_policy.as_str(), "Never" | "IfNotPresent" | "Always") {
+        return Err(format!(
+            "GRID_XTASK_IMAGE_PULL_POLICY has invalid value {:?}",
+            images.pull_policy
+        ));
+    }
+    for (name, image) in [
+        ("gateway", images.gateway.as_str()),
+        ("operator", images.operator.as_str()),
+        ("overlay-sync", images.overlay_sync.as_str()),
+        ("vcr", images.vcr.as_str()),
+    ] {
+        validate_image_reference(name, image)?;
+    }
+    Ok(images)
+}
+
+fn validate_image_reference(name: &str, image: &str) -> Result<(), String> {
+    if image.is_empty() || image.chars().any(char::is_whitespace) || image.starts_with('/') {
+        return Err(format!("{name} image reference is malformed: {image:?}"));
+    }
+    if image.contains('@') {
+        let (repository, digest) = image
+            .split_once('@')
+            .ok_or_else(|| format!("{name} image reference is malformed: {image:?}"))?;
+        if repository.is_empty() || !digest.starts_with("sha256:") || digest.len() <= "sha256:".len() {
+            return Err(format!("{name} image reference is malformed: {image:?}"));
+        }
+    } else {
+        let last_slash = image.rfind('/').unwrap_or(0);
+        let Some(colon) = image.rfind(':') else {
+            return Err(format!(
+                "{name} image reference must include a tag or digest: {image:?}"
+            ));
+        };
+        if colon <= last_slash || colon == image.len() - 1 {
+            return Err(format!("{name} image reference is malformed: {image:?}"));
+        }
+    }
+    Ok(())
+}
 
 /// Match a Docker reference against the repository and tag columns from `crictl`.
 fn node_has_image(listing: &str, image: &str) -> bool {
@@ -279,16 +354,31 @@ fn discover_node(kind_cluster: &str) -> Result<String, String> {
     clippy::too_many_lines,
     reason = "each image is inspected, loaded, and verified before deployment"
 )]
-fn load_and_verify_images() -> Result<(), String> {
-    let identity = cluster_identity();
-    let node = discover_node(&identity.kind_cluster)?;
-    for image in QUALIFICATION_IMAGES {
+fn load_and_verify_images(images: &ResolvedImages) -> Result<BTreeMap<String, serde_json::Value>, String> {
+    let image_names = [
+        ("gateway", images.gateway.as_str()),
+        ("operator", images.operator.as_str()),
+        ("overlay_sync", images.overlay_sync.as_str()),
+        ("vcr", images.vcr.as_str()),
+    ];
+    let mut metadata = BTreeMap::new();
+    for (role, image) in image_names {
         let mut inspect = Command::new("docker");
         inspect.args(["image", "inspect", image]);
         let output = command_output(&mut inspect, Duration::from_secs(30))?;
         if !output.status.success() {
             return Err(format!("required local image is missing: {image}"));
         }
+        let details: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("parse docker metadata for {image}: {error}"))?;
+        metadata.insert(role.to_owned(), details);
+    }
+    if images.pull_policy != "Never" {
+        return Ok(metadata);
+    }
+    let identity = cluster_identity();
+    let node = discover_node(&identity.kind_cluster)?;
+    for (_, image) in image_names {
         let mut load = Command::new("kind");
         load.args(["load", "docker-image", image, "--name", &identity.kind_cluster]);
         let load_output = command_output(&mut load, QUALIFICATION_TIMEOUT)?;
@@ -312,7 +402,48 @@ fn load_and_verify_images() -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(metadata)
+}
+
+/// Materialize the topology using the resolved image references.
+#[expect(
+    clippy::too_many_lines,
+    reason = "materialization validates the complete image contract at one boundary"
+)]
+fn materialize_config(forge_config: &Path, evidence_dir: &Path, images: &ResolvedImages) -> Result<PathBuf, String> {
+    let output = forge_config.parent().unwrap_or_else(|| Path::new(".")).join(format!(
+        ".grid-single-cluster-multi-gateway-{}.resolved.yaml",
+        std::process::id()
+    ));
+    let selected = super::forge_config::ImageOverrides {
+        gateway: images.gateway.clone(),
+        operator: images.operator.clone(),
+        overlay_sync: images.overlay_sync.clone(),
+        vcr: images.vcr.clone(),
+        pull_policy: images.pull_policy.clone(),
+    };
+    let resolved = super::forge_config::materialize_with_images(forge_config, Some(&output), &selected)
+        .map_err(|error| format!("materialize Forge configuration: {error}"))?;
+    fs::copy(&resolved, evidence_dir.join("resolved-forge.yaml"))
+        .map_err(|error| format!("copy materialized Forge configuration to evidence: {error}"))?;
+    let content =
+        fs::read_to_string(&resolved).map_err(|error| format!("read materialized Forge configuration: {error}"))?;
+    for (role, image) in [
+        ("gateway", images.gateway.as_str()),
+        ("operator", images.operator.as_str()),
+        ("overlay-sync", images.overlay_sync.as_str()),
+        ("vcr", images.vcr.as_str()),
+    ] {
+        if !content.contains(image) {
+            return Err(format!(
+                "materialized Forge configuration does not contain {role} image {image:?}"
+            ));
+        }
+    }
+    if !content.contains(&format!("imagePullPolicy: {}", images.pull_policy)) {
+        return Err("materialized Forge configuration does not contain the selected image pull policy".to_owned());
+    }
+    Ok(resolved)
 }
 
 /// Apply one Forge stack and preserve its complete bounded result.
@@ -780,13 +911,17 @@ pub(crate) fn run(forge_config: &Path, options: &Options) -> Result<(), Box<dyn 
     let evidence_dir = evidence_path(forge_config, options.evidence_dir.as_deref(), &run);
     fs::create_dir_all(&evidence_dir)?;
     let forge = super::glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?;
+    let images = resolved_images().map_err(|error| format!("resolve qualification images: {error}"))?;
+    let resolved_config = materialize_config(forge_config, &evidence_dir, &images)
+        .map_err(|error| format!("materialize qualification topology: {error}"))?;
     let source_revision = Command::new("git").args(["rev-parse", "HEAD"]).output().map_or_else(
         |_| "unknown".to_owned(),
         |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
     );
     let mut cleanup = Cleanup {
         forge: forge.clone().into(),
-        config: forge_config.to_path_buf(),
+        config: resolved_config.clone(),
+        resolved_config: resolved_config.clone(),
         enabled: !options.keep,
     };
     let mut scenarios = Vec::new();
@@ -801,15 +936,23 @@ pub(crate) fn run(forge_config: &Path, options: &Options) -> Result<(), Box<dyn 
             "nodeContainer": identity.node_container,
         }),
     );
+    observations.insert(
+        "resolved_images".to_owned(),
+        serde_json::to_value(&images).map_err(|error| format!("serialize resolved images: {error}"))?,
+    );
 
-    let up_result = forge_up(&forge, forge_config, &evidence_dir);
+    let up_result = forge_up(&forge, &resolved_config, &evidence_dir);
     if let Err(error) = &up_result {
         capture_setup_diagnostics(&evidence_dir);
         scenarios.push(scenario("forge-up", "BLOCKED", error.clone()));
     }
     if up_result.is_ok() {
-        let images_ready = match load_and_verify_images() {
-            Ok(()) => {
+        let images_ready = match load_and_verify_images(&images) {
+            Ok(metadata) => {
+                observations.insert(
+                    "image_metadata".to_owned(),
+                    serde_json::to_value(metadata).unwrap_or(serde_json::Value::Null),
+                );
                 scenarios.push(scenario(
                     "image-loading",
                     "PASS",
@@ -840,7 +983,7 @@ pub(crate) fn run(forge_config: &Path, options: &Options) -> Result<(), Box<dyn 
             .into_iter()
             .flatten()
         {
-            match apply_stack(&forge, forge_config, stack, &evidence_dir) {
+            match apply_stack(&forge, &resolved_config, stack, &evidence_dir) {
                 Ok(()) => scenarios.push(scenario(format!("stack/{stack}").as_str(), "PASS", "stack completed")),
                 Err(error) => {
                     stacks_ready = false;
@@ -1156,12 +1299,13 @@ pub(crate) fn run(forge_config: &Path, options: &Options) -> Result<(), Box<dyn 
     )?;
     if !options.keep {
         let mut down = Command::new(&forge);
-        down.args(["down", "--config"]).arg(forge_config);
+        down.args(["down", "--config"]).arg(&resolved_config);
         let output =
             command_output(&mut down, QUALIFICATION_TIMEOUT).map_err(|error| format!("cleanup failed: {error}"))?;
         if !output.status.success() {
             return Err(format!("cleanup failed: {}", String::from_utf8_lossy(&output.stderr)).into());
         }
+        drop(fs::remove_file(&resolved_config));
         cleanup.enabled = false;
     }
     if result == "PASS" {
@@ -1196,5 +1340,116 @@ mod tests {
         let listing = "IMAGE TAG IMAGE ID SIZE\ndocker.io/library/grid-operator single-cluster-qualification abc 1MB\n";
         assert!(node_has_image(listing, "grid-operator:single-cluster-qualification"));
         assert!(!node_has_image(listing, "grid-operator:other"));
+    }
+
+    #[test]
+    fn image_defaults_are_local_development_defaults() {
+        let images = resolve_images(None, None, None, None, None).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(images.gateway, DEFAULT_GATEWAY_IMAGE);
+        assert_eq!(images.operator, DEFAULT_OPERATOR_IMAGE);
+        assert_eq!(images.overlay_sync, DEFAULT_OVERLAY_SYNC_IMAGE);
+        assert_eq!(images.vcr, DEFAULT_VCR_IMAGE);
+        assert_eq!(images.pull_policy, "Never");
+    }
+
+    #[test]
+    fn explicit_image_overrides_are_all_preserved() {
+        let images = resolve_images(
+            Some("registry.example/ai:run-1".to_owned()),
+            Some("registry.example/grid-operator:run-1".to_owned()),
+            Some("registry.example/overlay-sync:run-1".to_owned()),
+            Some("registry.example/vcr:run-1".to_owned()),
+            Some("IfNotPresent".to_owned()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(images.gateway, "registry.example/ai:run-1");
+        assert_eq!(images.operator, "registry.example/grid-operator:run-1");
+        assert_eq!(images.overlay_sync, "registry.example/overlay-sync:run-1");
+        assert_eq!(images.vcr, "registry.example/vcr:run-1");
+        assert_eq!(images.pull_policy, "IfNotPresent");
+    }
+
+    #[test]
+    fn partial_overrides_keep_defaults_for_unset_roles() {
+        let images = resolve_images(
+            Some("registry.example/ai:run-2".to_owned()),
+            None,
+            None,
+            None,
+            Some("Never".to_owned()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(images.gateway, "registry.example/ai:run-2");
+        assert_eq!(images.operator, DEFAULT_OPERATOR_IMAGE);
+        assert_eq!(images.overlay_sync, DEFAULT_OVERLAY_SYNC_IMAGE);
+        assert_eq!(images.vcr, DEFAULT_VCR_IMAGE);
+    }
+
+    #[test]
+    fn malformed_image_references_are_rejected() {
+        for result in [
+            resolve_images(Some("/tmp/image".to_owned()), None, None, None, None),
+            resolve_images(Some("registry.example/ai".to_owned()), None, None, None, None),
+            resolve_images(Some("registry.example/ai: bad".to_owned()), None, None, None, None),
+            resolve_images(None, None, None, None, Some("Sometimes".to_owned())),
+        ] {
+            if result.is_ok() {
+                std::process::abort();
+            }
+        }
+    }
+
+    #[test]
+    fn image_evidence_serializes_all_resolved_values() {
+        let images = resolve_images(
+            Some("registry.example/ai:run-3".to_owned()),
+            Some("registry.example/operator:run-3".to_owned()),
+            Some("registry.example/sync:run-3".to_owned()),
+            Some("registry.example/vcr:run-3".to_owned()),
+            Some("Never".to_owned()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let evidence = serde_json::to_value(images).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            evidence.get("gateway"),
+            Some(&serde_json::json!("registry.example/ai:run-3"))
+        );
+        assert_eq!(
+            evidence.get("operator"),
+            Some(&serde_json::json!("registry.example/operator:run-3"))
+        );
+        assert_eq!(
+            evidence.get("overlay_sync"),
+            Some(&serde_json::json!("registry.example/sync:run-3"))
+        );
+        assert_eq!(
+            evidence.get("vcr"),
+            Some(&serde_json::json!("registry.example/vcr:run-3"))
+        );
+        assert_eq!(evidence.get("pull_policy"), Some(&serde_json::json!("Never")));
+    }
+
+    #[test]
+    fn materialized_config_contains_every_selected_image_and_policy() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/e2e/topologies/grid-single-cluster-multi-gateway");
+        let evidence = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let images = resolve_images(
+            Some("registry.example/ai:run-4".to_owned()),
+            Some("registry.example/operator:run-4".to_owned()),
+            Some("registry.example/sync:run-4".to_owned()),
+            Some("registry.example/vcr:run-4".to_owned()),
+            Some("Never".to_owned()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let resolved = materialize_config(&root.join("forge.yaml"), evidence.path(), &images).unwrap_or_else(|error| {
+            eprintln!("materialize test failed: {error}");
+            std::process::abort();
+        });
+        let content = fs::read_to_string(resolved).unwrap_or_else(|_| std::process::abort());
+        for image in [&images.gateway, &images.operator, &images.overlay_sync, &images.vcr] {
+            assert!(content.contains(image));
+        }
+        assert!(content.contains("imagePullPolicy: Never"));
     }
 }

@@ -1316,7 +1316,7 @@ The named demos (`grid-glb-demo`, `grid-combined-site`,
 `grid-llmd-pool-metrics`) do **not** need them — they override
 `GRID_XTASK_GATEWAY_IMAGE`/`GRID_XTASK_MOCK_EPP_IMAGE`
 (see `xtask/src/env/image_overrides.rs`) with published
-`ghcr.io/praxis-proxy/grid-ai-rollup` images and never build
+`ghcr.io/praxis-proxy/ai` images and never build
 from an AI repository checkout.
 
 As of this writing, neither `Containerfile.composed` nor a mock

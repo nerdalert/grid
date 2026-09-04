@@ -9,9 +9,47 @@ use super::image_overrides;
 
 /// Render a Forge environment with the explicitly selected demo images.
 pub(crate) fn materialize(source: &Path, output: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let images = ImageOverrides {
+        gateway: image_overrides::gateway_image(),
+        operator: image_overrides::operator_image(),
+        overlay_sync: image_overrides::overlay_sync_image(),
+        vcr: image_overrides::vcr_image(),
+        pull_policy: image_overrides::image_pull_policy(),
+    };
+    if images.pull_policy == "Never"
+        && (std::env::var_os("GRID_XTASK_GATEWAY_IMAGE").is_none()
+            || std::env::var_os("GRID_XTASK_OPERATOR_IMAGE").is_none()
+            || std::env::var_os("GRID_XTASK_OVERLAY_SYNC_IMAGE").is_none())
+    {
+        return Err("GRID_XTASK_GATEWAY_IMAGE, GRID_XTASK_OPERATOR_IMAGE, and GRID_XTASK_OVERLAY_SYNC_IMAGE are required when GRID_XTASK_IMAGE_PULL_POLICY=Never".into());
+    }
+    materialize_with_images(source, output, &images)
+}
+
+/// Image values to inject into a Forge configuration.
+#[derive(Debug, Clone)]
+pub(crate) struct ImageOverrides {
+    /// Gateway image reference.
+    pub(crate) gateway: String,
+    /// Grid operator image reference.
+    pub(crate) operator: String,
+    /// Overlay-sync image reference.
+    pub(crate) overlay_sync: String,
+    /// VCR image reference.
+    pub(crate) vcr: String,
+    /// Kubernetes image pull policy.
+    pub(crate) pull_policy: String,
+}
+
+/// Render a Forge environment with an explicit image set.
+pub(crate) fn materialize_with_images(
+    source: &Path,
+    output: Option<&Path>,
+    images: &ImageOverrides,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source)?;
     let mut config: serde_yaml::Value = serde_yaml::from_str(&content)?;
-    apply_image_overrides(&mut config)?;
+    apply_image_values(&mut config, images)?;
     let destination = output.map_or_else(
         || {
             source.with_file_name(format!(
@@ -25,25 +63,20 @@ pub(crate) fn materialize(source: &Path, output: Option<&Path>) -> Result<PathBu
     Ok(destination)
 }
 
+/// Apply explicit image values to every Forge cluster property.
 #[expect(
     clippy::too_many_lines,
     reason = "The bounded image-property rewrite is easiest to audit as one operation."
 )]
-/// Apply the selected image references to every Forge cluster property.
-fn apply_image_overrides(config: &mut serde_yaml::Value) -> Result<(), Box<dyn std::error::Error>> {
-    let pull_policy = image_overrides::image_pull_policy();
-    let gateway = image_overrides::gateway_image();
-    let operator = image_overrides::operator_image();
-    let overlay_sync = image_overrides::overlay_sync_image();
-    let vcr = image_overrides::vcr_image();
-
-    if pull_policy == "Never"
-        && (std::env::var_os("GRID_XTASK_GATEWAY_IMAGE").is_none()
-            || std::env::var_os("GRID_XTASK_OPERATOR_IMAGE").is_none()
-            || std::env::var_os("GRID_XTASK_OVERLAY_SYNC_IMAGE").is_none())
-    {
-        return Err("GRID_XTASK_GATEWAY_IMAGE, GRID_XTASK_OPERATOR_IMAGE, and GRID_XTASK_OVERLAY_SYNC_IMAGE are required when GRID_XTASK_IMAGE_PULL_POLICY=Never".into());
-    }
+fn apply_image_values(
+    config: &mut serde_yaml::Value,
+    images: &ImageOverrides,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pull_policy = images.pull_policy.clone();
+    let gateway = images.gateway.clone();
+    let operator = images.operator.clone();
+    let overlay_sync = images.overlay_sync.clone();
+    let vcr = images.vcr.clone();
 
     let (gateway_repo, gateway_tag) = parse_image_ref(&gateway);
     let (operator_repo, operator_tag) = parse_image_ref(&operator);

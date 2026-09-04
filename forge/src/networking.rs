@@ -96,7 +96,14 @@ pub fn remove_network(
 pub fn network_exists(runner: &dyn CommandRunner, binary: &str, net_name: &str) -> Result<bool, ForgeError> {
     let spec = inspect_spec(binary, net_name);
     let output = runner.run(&spec)?;
-    Ok(output.status == 0)
+    match output.status {
+        0 => Ok(true),
+        1 if output.stderr.to_ascii_lowercase().contains("not found") => Ok(false),
+        status => Err(ForgeError::Command {
+            program: format!("{binary} network inspect {net_name}"),
+            message: format!("exit code {status}: {}", output.stderr.trim()),
+        }),
+    }
 }
 
 /// Read the current IPv4 subnet from a container network.
@@ -494,6 +501,26 @@ mod tests {
             }
         });
         assert!(!exists, "should report network as not existing");
+    }
+
+    #[test]
+    fn exists_rejects_runtime_failure_instead_of_treating_it_as_missing() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "docker network inspect test-net",
+            CommandOutput {
+                status: 125,
+                stdout: String::new(),
+                stderr: "docker daemon unavailable\n".to_owned(),
+            },
+        );
+
+        let result = network_exists(&runner, "docker", "test-net");
+        assert!(result.is_err(), "runtime failure must not be treated as absence");
+        assert!(
+            !runner.was_called("network rm"),
+            "failed detection must not remove anything"
+        );
     }
 
     #[test]

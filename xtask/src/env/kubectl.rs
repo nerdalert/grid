@@ -83,17 +83,18 @@ pub(crate) fn wait_for_rollout(
 /// Returns an error if the `kubectl` process cannot be spawned or exits
 /// with a non-zero status.
 pub(crate) fn rollout_restart(context: &str, deployment: &str) -> Result<(), Box<dyn std::error::Error>> {
+    rollout_restart_ns(context, deployment, ROLLOUT_NAMESPACE)
+}
+
+/// Restart a `Deployment` rollout in an explicit namespace.
+pub(crate) fn rollout_restart_ns(
+    context: &str,
+    deployment: &str,
+    namespace: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let resource = format!("deployment/{deployment}");
     let status = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            ROLLOUT_NAMESPACE,
-            "rollout",
-            "restart",
-            &resource,
-        ])
+        .args(["--context", context, "-n", namespace, "rollout", "restart", &resource])
         .status()?;
     if !status.success() {
         return Err(format!("kubectl rollout restart {deployment} failed").into());

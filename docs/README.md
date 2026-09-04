@@ -67,6 +67,8 @@ image preparation, execution, evidence, and cleanup.
 
 ## Development
 
+- [Release Process](release.md) - versioning, validation, artifact publication,
+  and release workflow.
 - [Development](development.md) — build, test, format, lint, and coverage.
 - [Conventions](conventions.md) — coding style, testing requirements,
   documentation rules, and commit attribution.

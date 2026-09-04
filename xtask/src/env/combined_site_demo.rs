@@ -86,6 +86,9 @@ const CENTRAL_PROVIDER_BACKEND: &str = "vcr-inference-central";
 /// Primary model shared by the three site-local VCR providers.
 const PRIMARY_MODEL: &str = "Qwen/Qwen3-0.6B";
 
+/// Canonical backend identity emitted by the primary VCR provider.
+const PRIMARY_BACKEND_IDENTITY: &str = "vcr-backend";
+
 /// Combined-site overlay propagation crosses operator, SWIM, projected-volume,
 /// and gateway reload boundaries. Issue #21 tracks reducing this latency.
 const COMBINED_SITE_DATA_PLANE_WAIT: Duration = Duration::from_secs(180);
@@ -93,8 +96,29 @@ const COMBINED_SITE_DATA_PLANE_WAIT: Duration = Duration::from_secs(180);
 /// Retry interval for serving-state convergence probes.
 const COMBINED_SITE_DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Stable clients must outlive every bounded full-mode lifecycle stage.
+const STABLE_CLIENT_LIFETIME_SECS: &str = "7200";
+
 /// Makes retry probe names unique while retaining a recognizable prefix.
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Return a DNS-safe unique name for a test client pod.
+fn unique_client_name(prefix: &str) -> String {
+    let sanitized: String = prefix
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-');
+    let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let client_prefix = if sanitized.is_empty() { "client" } else { sanitized };
+    format!("{}-{}", &client_prefix[..client_prefix.len().min(40)], sequence)
+}
 
 // -----------------------------------------------------------------------------
 // Context
@@ -471,14 +495,177 @@ fn curl_pod_overrides(pod_name: &str, curl_args: &[&str]) -> String {
     .to_string()
 }
 
+/// Build a restricted, long-lived client pod used for request-sequence tests.
+fn curl_client_pod_overrides(pod_name: &str) -> String {
+    serde_json::json!({
+        "spec": {
+            "automountServiceAccountToken": false,
+            "securityContext": {
+                "runAsNonRoot": true,
+                "seccompProfile": { "type": "RuntimeDefault" }
+            },
+            "containers": [{
+                "name": pod_name,
+                "image": "curlimages/curl:8.12.1",
+                "command": ["sleep", STABLE_CLIENT_LIFETIME_SECS],
+                "securityContext": {
+                    "runAsUser": 100,
+                    "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true,
+                    "capabilities": { "drop": ["ALL"] }
+                }
+            }]
+        }
+    })
+    .to_string()
+}
+
+/// A single ready curl pod whose lifecycle is isolated from request evidence.
+struct StableCurlClient {
+    /// Kubernetes context containing the client pod.
+    context: String,
+    /// Pod name used for the complete request sequence.
+    name: String,
+}
+
+impl StableCurlClient {
+    /// Create the client pod and wait for its Ready condition.
+    fn create(context: &str, name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let name = unique_client_name(name);
+        let overrides = curl_client_pod_overrides(&name);
+        let output = Command::new("timeout")
+            .args([
+                "90s",
+                "kubectl",
+                "run",
+                &name,
+                "--image=curlimages/curl:8.12.1",
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "--restart=Never",
+                "--overrides",
+                &overrides,
+                "--command",
+                "--",
+                "sleep",
+                STABLE_CLIENT_LIFETIME_SECS,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to create stable curl client {name}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+
+        let wait = Command::new("timeout")
+            .args([
+                "90s",
+                "kubectl",
+                "wait",
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "--for=condition=Ready",
+                &format!("pod/{name}"),
+                "--timeout=75s",
+            ])
+            .output()?;
+        if !wait.status.success() {
+            drop(
+                Command::new("timeout")
+                    .args([
+                        "30s",
+                        "kubectl",
+                        "delete",
+                        "pod",
+                        &name,
+                        "--context",
+                        context,
+                        "-n",
+                        GRID_SYSTEM_NS,
+                        "--ignore-not-found",
+                    ])
+                    .output(),
+            );
+            return Err(format!(
+                "stable curl client {name} did not become ready: {}{}",
+                String::from_utf8_lossy(&wait.stdout),
+                String::from_utf8_lossy(&wait.stderr)
+            )
+            .into());
+        }
+
+        Ok(Self {
+            context: context.to_owned(),
+            name,
+        })
+    }
+
+    /// Execute one curl request without mixing in pod lifecycle output.
+    fn request(&self, curl_args: &[&str]) -> Result<std::process::Output, std::io::Error> {
+        Command::new("timeout")
+            .args([
+                "30s",
+                "kubectl",
+                "exec",
+                &self.name,
+                "--context",
+                &self.context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "--",
+                "curl",
+            ])
+            .args(curl_args)
+            .output()
+    }
+}
+
+impl Drop for StableCurlClient {
+    fn drop(&mut self) {
+        let deleted = Command::new("timeout")
+            .args([
+                "30s",
+                "kubectl",
+                "delete",
+                "pod",
+                &self.name,
+                "--context",
+                &self.context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "--ignore-not-found",
+                "--wait=true",
+            ])
+            .output();
+        if let Ok(output) = deleted
+            && !output.status.success()
+        {
+            eprintln!(
+                "[WARN] stable curl client {} deletion failed: {}",
+                self.name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+}
+
 /// Run an ephemeral curl pod with restricted PodSecurity context.
 fn run_curl_probe(context: &str, pod_name: &str, curl_args: &[&str]) -> Result<std::process::Output, std::io::Error> {
     let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let prefix = pod_name.get(..pod_name.len().min(40)).unwrap_or(pod_name);
     let unique_pod_name = format!("{prefix}-{sequence}");
     let overrides = curl_pod_overrides(&unique_pod_name, curl_args);
-    Command::new("kubectl")
+    let output = Command::new("timeout")
         .args([
+            "45s",
+            "kubectl",
             "run",
             &unique_pod_name,
             "--image=curlimages/curl:8.12.1",
@@ -486,13 +673,34 @@ fn run_curl_probe(context: &str, pod_name: &str, curl_args: &[&str]) -> Result<s
             context,
             "-n",
             GRID_SYSTEM_NS,
-            "--rm",
             "-i",
             "--restart=Never",
             "--overrides",
             &overrides,
         ])
-        .output()
+        .output();
+    let cleanup = Command::new("timeout")
+        .args([
+            "30s",
+            "kubectl",
+            "delete",
+            "pod",
+            &unique_pod_name,
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "--ignore-not-found",
+            "--wait=true",
+        ])
+        .output()?;
+    if !cleanup.status.success() {
+        return Err(std::io::Error::other(format!(
+            "failed to clean ephemeral curl pod {unique_pod_name}: {}",
+            String::from_utf8_lossy(&cleanup.stderr).trim()
+        )));
+    }
+    output
 }
 
 /// Retry a combined-site serving assertion across all overlay propagation boundaries.
@@ -501,18 +709,58 @@ fn wait_for_combined_site_data_plane<T>(
     mut check: impl FnMut() -> Result<T, Box<dyn std::error::Error>>,
 ) -> Result<T, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + COMBINED_SITE_DATA_PLANE_WAIT;
+    let mut last_observation = String::from("no observation captured");
     loop {
         match check() {
             Ok(value) => return Ok(value),
             Err(error) if Instant::now() >= deadline => {
                 return Err(format!(
-                    "{description} did not converge within {COMBINED_SITE_DATA_PLANE_WAIT:?}: {error}"
+                    "{description} did not converge within {COMBINED_SITE_DATA_PLANE_WAIT:?}; last observed failure: {last_observation}; final failure: {error}"
                 )
                 .into());
             },
-            Err(_) => std::thread::park_timeout(COMBINED_SITE_DATA_PLANE_INTERVAL),
+            Err(error) => {
+                last_observation = error.to_string();
+                std::thread::park_timeout(COMBINED_SITE_DATA_PLANE_INTERVAL);
+            },
         }
     }
+}
+
+/// Extract the most recent exact tracing field from an AI overlay log line.
+fn ai_revision_from_logs(logs: &str, field: &str) -> Option<String> {
+    logs.lines().rev().find_map(|line| {
+        let line = strip_ansi_csi(line);
+        let marker = format!("{field}=");
+        let index = line
+            .match_indices(&marker)
+            .find_map(|(index, _)| (index == 0 || line.as_bytes().get(index - 1) == Some(&b' ')).then_some(index))?;
+        let value = line.get(index + marker.len()..)?;
+        let value = value.strip_prefix('"').unwrap_or(value);
+        let value = value
+            .split(|character: char| character == '"' || character.is_whitespace())
+            .next()?;
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+/// Remove ANSI CSI styling emitted by tracing/logging sinks before parsing.
+fn strip_ansi_csi(input: &str) -> String {
+    let mut output = Vec::with_capacity(input.len());
+    let mut bytes = input.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte == 0x1B && bytes.peek() == Some(&b'[') {
+            bytes.next();
+            for control in bytes.by_ref() {
+                if (0x40..=0x7E).contains(&control) {
+                    break;
+                }
+            }
+        } else {
+            output.push(byte);
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
 }
 
 /// Run an ephemeral curl pod with additional kubectl flags (e.g. `--labels`).
@@ -522,24 +770,50 @@ fn run_curl_probe_with_flags(
     extra_kubectl_args: &[&str],
     curl_args: &[&str],
 ) -> Result<std::process::Output, std::io::Error> {
-    let overrides = curl_pod_overrides(pod_name, curl_args);
-    Command::new("kubectl")
+    let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let prefix = pod_name.get(..pod_name.len().min(40)).unwrap_or(pod_name);
+    let unique_pod_name = format!("{prefix}-{sequence}");
+    let overrides = curl_pod_overrides(&unique_pod_name, curl_args);
+    let output = Command::new("timeout")
         .args([
+            "45s",
+            "kubectl",
             "run",
-            pod_name,
+            &unique_pod_name,
             "--image=curlimages/curl:8.12.1",
             "--context",
             context,
             "-n",
             GRID_SYSTEM_NS,
-            "--rm",
             "-i",
             "--restart=Never",
             "--overrides",
             &overrides,
         ])
         .args(extra_kubectl_args)
-        .output()
+        .output();
+    let cleanup = Command::new("timeout")
+        .args([
+            "30s",
+            "kubectl",
+            "delete",
+            "pod",
+            &unique_pod_name,
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "--ignore-not-found",
+            "--wait=true",
+        ])
+        .output()?;
+    if !cleanup.status.success() {
+        return Err(std::io::Error::other(format!(
+            "failed to clean ephemeral curl pod {unique_pod_name}: {}",
+            String::from_utf8_lossy(&cleanup.stderr).trim()
+        )));
+    }
+    output
 }
 
 /// Return a response header value from curl `--include` output.
@@ -549,6 +823,25 @@ fn response_header(output: &[u8], name: &str) -> Option<String> {
         let (header, value) = line.split_once(':')?;
         header.eq_ignore_ascii_case(&expected).then(|| value.trim().to_owned())
     })
+}
+
+/// Parse the status code from the first HTTP response status line only.
+fn response_status(output: &[u8]) -> Option<u16> {
+    String::from_utf8_lossy(output).lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()?.starts_with("HTTP/")).then(|| fields.next()?.parse().ok())?
+    })
+}
+
+/// Require the complete trusted attribution set for a primary response.
+fn primary_response_is_trusted(output: &[u8]) -> bool {
+    let gateway = response_header(output, "x-grid-combined-provider-gateway");
+    let ai_gateway = response_header(output, "x-ai-demo-provider-gateway");
+    let backend = response_header(output, "x-ai-inference-provider");
+    response_status(output) == Some(200)
+        && backend.as_deref() == Some(PRIMARY_BACKEND_IDENTITY)
+        && gateway.as_deref().is_some_and(|site| CLUSTERS.contains(&site))
+        && gateway == ai_gateway
 }
 
 /// Wait for the demo environment to be ready.
@@ -1041,64 +1334,161 @@ fn assert_overlay_acceptance() -> AssertionResult {
     }
 }
 
-/// Assert local provider selection preference: west selects west, central selects central, east selects east.
-fn assert_local_provider_selection() -> AssertionResult {
+/// Return the provider sites represented by an accepted overlay.
+fn accepted_provider_sites(overlay: &OverlayData) -> BTreeSet<String> {
+    overlay
+        .candidates
+        .iter()
+        .filter(|candidate| !candidate.site.is_empty())
+        .map(|candidate| candidate.site.clone())
+        .collect()
+}
+
+/// Check that a sequence is a repeating round-robin cycle, allowing any
+/// provider order and initial picker position but requiring every value to be
+/// an accepted candidate.
+fn is_round_robin_sequence(sequence: &[String], eligible: &BTreeSet<String>) -> bool {
+    if eligible.is_empty()
+        || sequence.len() < eligible.len() * 2
+        || sequence.iter().any(|site| !eligible.contains(site))
+    {
+        return false;
+    }
+    let cycle_len = eligible.len();
+    let Some(first_cycle) = sequence.get(..cycle_len) else {
+        return false;
+    };
+    let first_cycle_set: BTreeSet<_> = first_cycle.iter().cloned().collect();
+    first_cycle_set == *eligible
+        && sequence.iter().enumerate().all(|(index, site)| {
+            first_cycle
+                .get(index % cycle_len)
+                .is_some_and(|expected| site == expected)
+        })
+}
+
+/// Assert accepted-overlay membership and round-robin selection across the
+/// eligible provider group. Locality is intentionally not assumed.
+fn assert_round_robin_provider_selection() -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
-    let mut all_local = true;
+    let overlay = read_cluster_overlay("west")?;
+    let eligible = accepted_provider_sites(&overlay);
+    let mut sequence = Vec::new();
+    let mut all_attributed = true;
+    let client = StableCurlClient::create("kind-grid-combined-west", "route-test-client")?;
 
-    for cluster in CLUSTERS {
-        let context = format!("kind-grid-combined-{cluster}");
-
-        // Send test request to consumer gateway and check response attribution
-        let test_output = run_curl_probe(
-            &context,
-            &format!("route-test-{cluster}"),
-            &[
-                "curl",
-                "-f",
-                "--include",
-                "-H",
-                "Content-Type: application/json",
-                "-H",
-                "Authorization: Bearer consumer-token",
-                "-H",
-                &format!("X-Session-Id: local-test-{cluster}"),
-                "-d",
-                r#"{"model": "Qwen/Qwen3-0.6B", "messages": [{"role":"user","content":"hello"}], "max_tokens": 16}"#,
-                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-            ],
-        )?;
-
-        let provider_site = response_header(&test_output.stdout, "x-grid-combined-provider-gateway")
-            .unwrap_or_else(|| "unknown".to_owned());
-        let selected_local = test_output.status.success() && provider_site == *cluster;
-
-        if !selected_local {
-            all_local = false;
+    let expected_revision = overlay.semantic_revision.clone();
+    wait_for_combined_site_data_plane("west consumer serving accepted overlay", || {
+        let output = client.request(&[
+            "--fail",
+            "--include",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "15",
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            "Authorization: Bearer consumer-token",
+            "-d",
+            r#"{"model": "Qwen/Qwen3-0.6B", "messages": [{"role":"user","content":"convergence"}], "max_tokens": 16}"#,
+            "http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+        ])?;
+        let status = response_status(&output.stdout);
+        let provider = response_header(&output.stdout, "x-grid-combined-provider-gateway");
+        let logs = Command::new("kubectl")
+            .args([
+                "--context",
+                "kind-grid-combined-west",
+                "-n",
+                GRID_SYSTEM_NS,
+                "logs",
+                "deployment/consumer-gateway",
+                "-c",
+                "praxis",
+                "--tail=200",
+            ])
+            .output()?;
+        let loaded_revision =
+            logs.status.success() && String::from_utf8_lossy(&logs.stdout).contains(expected_revision.as_str());
+        if output.status.success() && status == Some(200) && provider.is_some() && loaded_revision {
+            Ok(())
+        } else {
+            Err(format!(
+                "serving status={status:?}, provider={}, loaded_revision={loaded_revision}",
+                provider.as_deref().unwrap_or("missing")
+            )
+            .into())
         }
+    })?;
 
+    for request in 0..(eligible.len() * 3) {
+        let test_output = client.request(&[
+            "--fail",
+            "--include",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "15",
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            "Authorization: Bearer consumer-token",
+            "-d",
+            r#"{"model": "Qwen/Qwen3-0.6B", "messages": [{"role":"user","content":"hello"}], "max_tokens": 16}"#,
+            "http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+        ])?;
+
+        let provider_site = response_header(&test_output.stdout, "x-grid-combined-provider-gateway");
+        let response_site = response_header(&test_output.stdout, "x-ai-demo-provider-gateway");
+        let status = response_status(&test_output.stdout);
+        let attributed = test_output.status.success()
+            && status == Some(200)
+            && provider_site.as_deref().is_some_and(|site| eligible.contains(site))
+            && provider_site == response_site;
+        if !attributed {
+            all_attributed = false;
+        }
+        if let Some(site) = provider_site.clone() {
+            sequence.push(site);
+        }
         observed_facts.insert(
-            format!("{cluster}_selected_provider_site"),
-            serde_json::Value::String(provider_site),
+            format!("request_{request}_provider_site"),
+            provider_site.map_or(serde_json::Value::Null, serde_json::Value::String),
         );
         observed_facts.insert(
-            format!("{cluster}_selected_local"),
-            serde_json::Value::Bool(selected_local),
+            format!("request_{request}_attributed"),
+            serde_json::Value::Bool(attributed),
+        );
+        observed_facts.insert(
+            format!("request_{request}_status"),
+            status.map_or(serde_json::Value::Null, |code| serde_json::Value::Number(code.into())),
         );
     }
 
-    observed_facts.insert("all_sites_prefer_local".to_owned(), serde_json::Value::Bool(all_local));
+    let round_robin = all_attributed && is_round_robin_sequence(&sequence, &eligible);
+    observed_facts.insert(
+        "accepted_overlay_revision".to_owned(),
+        serde_json::Value::String(overlay.semantic_revision),
+    );
+    observed_facts.insert("eligible_provider_sites".to_owned(), serde_json::json!(eligible));
+    observed_facts.insert("provider_sequence".to_owned(), serde_json::json!(sequence));
+    observed_facts.insert(
+        "all_responses_trusted_and_eligible".to_owned(),
+        serde_json::Value::Bool(all_attributed),
+    );
+    observed_facts.insert("round_robin_cycle".to_owned(), serde_json::Value::Bool(round_robin));
 
-    if all_local {
+    if round_robin {
         Ok(proof_success(
-            "All consumer sites correctly prefer their local provider (west→west, central→central, east→east)",
+            "Accepted-overlay candidates are trusted and selected in a repeating round-robin cycle",
             observed_facts,
             start.elapsed(),
         ))
     } else {
         Ok(proof_failure(
-            "One or more consumer sites did not select their local provider",
+            "Provider selection was not a trusted round-robin cycle over accepted-overlay candidates",
             observed_facts,
             start.elapsed(),
         ))
@@ -1779,8 +2169,42 @@ fn assert_backend_access_denial() -> AssertionResult {
     }
 }
 
-/// Assert central provider-capacity drain triggers remote fallback detection.
-fn assert_central_drain_fallback() -> AssertionResult {
+/// Execute one lifecycle request through the stable central consumer client.
+fn lifecycle_request(
+    client: &StableCurlClient,
+    session_id: &str,
+    message_text: &str,
+) -> Result<(u16, String), Box<dyn std::error::Error>> {
+    let session_header = format!("X-Session-Id: {session_id}");
+    let body = format!(r#"{{"model":"{PRIMARY_MODEL}","messages":[{{"role":"user","content":"{message_text}"}}]}}"#);
+    let output = client.request(&[
+        "--include",
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "15",
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        &session_header,
+        "-d",
+        &body,
+        "http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+    ])?;
+    let status = response_status(&output.stdout).ok_or("lifecycle response had no HTTP status")?;
+    let provider = response_header(&output.stdout, "x-grid-combined-provider-gateway")
+        .ok_or("lifecycle response missing provider-gateway attribution")?;
+    let trusted_provider = response_header(&output.stdout, "x-ai-demo-provider-gateway")
+        .ok_or("lifecycle response missing trusted provider attribution")?;
+    if provider != trusted_provider {
+        return Err(format!("lifecycle provider attribution mismatch: {provider} != {trusted_provider}").into());
+    }
+    Ok((status, provider))
+}
+
+/// Assert central provider withdrawal removes it from the accepted overlay and
+/// routes subsequent requests only to remaining eligible sites.
+fn assert_central_drain_fallback(client: &StableCurlClient) -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
 
@@ -1858,41 +2282,39 @@ fn assert_central_drain_fallback() -> AssertionResult {
     }
 
     wait_for_site_model_absent_all_sites("central", PRIMARY_MODEL, Duration::from_secs(180))?;
+    let post_drain_overlay = read_cluster_overlay("central")?;
+    let eligible_after_drain = accepted_provider_sites(&post_drain_overlay);
+    let central_withdrawn = !eligible_after_drain.contains("central");
+    observed_facts.insert(
+        "post_drain_overlay_revision".to_owned(),
+        serde_json::Value::String(post_drain_overlay.semantic_revision),
+    );
+    observed_facts.insert(
+        "post_drain_eligible_provider_sites".to_owned(),
+        serde_json::json!(eligible_after_drain),
+    );
+    observed_facts.insert(
+        "withdrawn_provider_absent_after_convergence".to_owned(),
+        serde_json::Value::Bool(central_withdrawn),
+    );
+    if !central_withdrawn {
+        return Ok(proof_failure(
+            "Central provider remained in the accepted overlay after withdrawal convergence",
+            observed_facts,
+            start.elapsed(),
+        ));
+    }
 
     let last_observation = std::cell::RefCell::new("no request attempted".to_owned());
     let remote_provider_site = wait_for_combined_site_data_plane("combined-site remote fallback", || {
-        let output = run_curl_probe(
-            central_context,
-            "fallback-test-central",
-            &[
-                "curl",
-                "--fail-with-body",
-                "--silent",
-                "--show-error",
-                "--include",
-                "-H",
-                "Content-Type: application/json",
-                "-H",
-                "X-Session-Id: fallback-test-central",
-                "-d",
-                r#"{"model": "Qwen/Qwen3-0.6B", "messages": [{"role":"user","content":"hello"}], "max_tokens": 16}"#,
-                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-            ],
-        )?;
-        let provider =
-            response_header(&output.stdout, "x-grid-combined-provider-gateway").unwrap_or_else(|| "missing".to_owned());
-        let backend = response_header(&output.stdout, "x-grid-demo-backend-provider-attribution")
-            .unwrap_or_else(|| "missing".to_owned());
-        *last_observation.borrow_mut() = format!(
-            "status={}, provider_gateway={provider}, backend={backend}",
-            output.status
-        );
-        if !output.status.success() {
+        let (status, provider) = lifecycle_request(client, "fallback-test-central", "hello")?;
+        *last_observation.borrow_mut() = format!("status={status}, provider_gateway={provider}");
+        if status != 200 {
             return Err("fallback request did not return HTTP 200".into());
         }
-        if !matches!(provider.as_str(), "west" | "east") || provider != backend {
+        if !eligible_after_drain.contains(&provider) || provider == "central" {
             return Err(format!(
-                "fallback selected provider_gateway={provider}, backend={backend}; expected the same remote site"
+                "fallback selected provider_gateway={provider}; expected an eligible non-withdrawn site"
             )
             .into());
         }
@@ -1947,37 +2369,13 @@ fn deployment_scaled_to_zero(replica_state: &str) -> bool {
 /// This function assumes central provider is still up when called.
 /// The caller (run_full_scenarios) must call this BEFORE drain,
 /// then call assert_existing_session_after_drain and assert_new_session_after_drain.
-fn assert_session_establishment() -> AssertionResult {
+fn assert_session_establishment(client: &StableCurlClient) -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
 
     let session_id = "pre-drain-session";
-    let central_context = "kind-grid-combined-central";
-
-    let initial_output = run_curl_probe(
-        central_context,
-        "session-establish",
-        &[
-            "curl",
-            "-f",
-            "--include",
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            &format!("X-Session-Id: {session_id}"),
-            "-d",
-            r#"{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "pre-drain-context"}]}"#,
-            "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-        ],
-    )?;
-
-    let established = initial_output.status.success();
-    let mut provider_site = "unknown".to_owned();
-
-    if established {
-        provider_site = response_header(&initial_output.stdout, "x-grid-combined-provider-gateway")
-            .unwrap_or_else(|| "unknown".to_owned());
-    }
+    let (status, provider_site) = lifecycle_request(client, session_id, "pre-drain-context")?;
+    let established = status == 200;
 
     observed_facts.insert(
         "session_established_before_drain".to_owned(),
@@ -1990,7 +2388,7 @@ fn assert_session_establishment() -> AssertionResult {
 
     if established {
         Ok(proof_success(
-            "Session established before drain with local provider",
+            "Session established before drain with an accepted provider candidate",
             observed_facts,
             start.elapsed(),
         ))
@@ -2005,19 +2403,12 @@ fn assert_session_establishment() -> AssertionResult {
 
 /// Assert the pre-drain session survives after central provider is drained.
 /// Must be called AFTER assert_central_drain_fallback.
-fn assert_existing_session_after_drain() -> AssertionResult {
+fn assert_existing_session_after_drain(client: &StableCurlClient) -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
 
     let session_id = "pre-drain-session";
-    let central_context = "kind-grid-combined-central";
-
-    let remote_provider = wait_for_remote_session(
-        central_context,
-        "session-existing-after-drain",
-        session_id,
-        "after-drain",
-    );
+    let remote_provider = wait_for_remote_session(client, session_id, "after-drain");
     let followup_successful = remote_provider.is_ok();
     let remote_provider = remote_provider.unwrap_or_else(|_| "unknown".to_owned());
 
@@ -2047,19 +2438,12 @@ fn assert_existing_session_after_drain() -> AssertionResult {
 
 /// Assert a new session can be established after central provider is drained.
 /// Must be called AFTER assert_central_drain_fallback.
-fn assert_new_session_after_drain() -> AssertionResult {
+fn assert_new_session_after_drain(client: &StableCurlClient) -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
 
     let new_session_id = "post-drain-new-session";
-    let central_context = "kind-grid-combined-central";
-
-    let provider_site = wait_for_remote_session(
-        central_context,
-        "session-new-after-drain",
-        new_session_id,
-        "new-session-content",
-    );
+    let provider_site = wait_for_remote_session(client, new_session_id, "new-session-content");
     let new_session_works = provider_site.is_ok();
     let provider_site = provider_site.unwrap_or_else(|_| "unknown".to_owned());
 
@@ -2089,45 +2473,17 @@ fn assert_new_session_after_drain() -> AssertionResult {
 
 /// Wait until a central-consumer session is served by one identified remote provider.
 fn wait_for_remote_session(
-    context: &str,
-    pod_name: &str,
+    client: &StableCurlClient,
     session_id: &str,
     message_text: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     wait_for_combined_site_data_plane("combined-site remote session routing", || {
-        let session_header = format!("X-Session-Id: {session_id}");
-        let body =
-            format!(r#"{{"model":"{PRIMARY_MODEL}","messages":[{{"role":"user","content":"{message_text}"}}]}}"#);
-        let output = run_curl_probe(
-            context,
-            pod_name,
-            &[
-                "curl",
-                "--fail-with-body",
-                "--silent",
-                "--show-error",
-                "--include",
-                "-H",
-                "Content-Type: application/json",
-                "-H",
-                &session_header,
-                "-d",
-                &body,
-                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-            ],
-        )?;
-        if !output.status.success() {
+        let (status, provider) = lifecycle_request(client, session_id, message_text)?;
+        if status != 200 {
             return Err("session request did not return HTTP 200".into());
         }
-        let provider = response_header(&output.stdout, "x-grid-combined-provider-gateway")
-            .ok_or("session response missing provider-gateway attribution")?;
-        let backend = response_header(&output.stdout, "x-grid-demo-backend-provider-attribution")
-            .ok_or("session response missing backend attribution")?;
-        if !matches!(provider.as_str(), "west" | "east") || provider != backend {
-            return Err(format!(
-                "session selected provider_gateway={provider}, backend={backend}; expected the same remote site"
-            )
-            .into());
+        if !matches!(provider.as_str(), "west" | "east") {
+            return Err(format!("session selected provider_gateway={provider}; expected a remote site").into());
         }
         Ok(provider)
     })
@@ -2185,8 +2541,8 @@ fn ensure_central_provider_restored() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Assert provider restoration returns routing to local preference.
-fn assert_provider_restoration() -> AssertionResult {
+/// Assert provider restoration re-admits the provider to the round-robin group.
+fn assert_provider_restoration(client: &StableCurlClient) -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
 
@@ -2295,55 +2651,31 @@ fn assert_provider_restoration() -> AssertionResult {
 
     let restoration_attempt = std::cell::Cell::new(0_u64);
     let last_restoration_observation = std::cell::RefCell::new("no request attempted".to_owned());
-    let selected_provider_site = wait_for_combined_site_data_plane("combined-site local restoration", || {
+    let restored_overlay = read_cluster_overlay("central")?;
+    let eligible = accepted_provider_sites(&restored_overlay);
+    let selected_provider_site = wait_for_combined_site_data_plane("combined-site restored round-robin", || {
         let attempt = restoration_attempt.get() + 1;
         restoration_attempt.set(attempt);
-        // Every attempt represents new traffic. Reusing a session would
-        // correctly preserve its remote fallback affinity after recovery.
-        let session_header = format!("X-Session-Id: restoration-test-central-{attempt}");
-        let output = run_curl_probe(
-            central_context,
-            "restoration-test-central",
-            &[
-                "curl",
-                "--fail-with-body",
-                "--silent",
-                "--show-error",
-                "--include",
-                "-H",
-                "Content-Type: application/json",
-                "-H",
-                &session_header,
-                "-d",
-                r#"{"model": "Qwen/Qwen3-0.6B", "messages": [{"role":"user","content":"hello"}], "max_tokens": 16}"#,
-                "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-            ],
-        )?;
-        if !output.status.success() {
+        let (status, provider) = lifecycle_request(client, &format!("restoration-test-central-{attempt}"), "hello")?;
+        if status != 200 {
             return Err("restoration request did not return HTTP 200".into());
         }
-        let provider = response_header(&output.stdout, "x-grid-combined-provider-gateway")
-            .ok_or("restoration response missing provider-gateway attribution")?;
-        let backend = response_header(&output.stdout, "x-grid-demo-backend-provider-attribution")
-            .ok_or("restoration response missing backend attribution")?;
-        *last_restoration_observation.borrow_mut() = format!(
-            "attempt={attempt}, status={}, provider_gateway={provider}, backend={backend}",
-            output.status
-        );
-        if provider != "central" || backend != "central" {
+        *last_restoration_observation.borrow_mut() =
+            format!("attempt={attempt}, status={status}, provider_gateway={provider}");
+        if !eligible.contains("central") || provider != "central" {
             return Err(format!(
-                "restoration selected provider_gateway={provider}, backend={backend}; expected central"
+                "restoration selected provider_gateway={provider}; expected restored central candidate"
             )
             .into());
         }
         Ok(provider)
     });
-    let local_preference_restored = selected_provider_site.is_ok();
+    let restored_candidate_selected = selected_provider_site.is_ok();
     let selected_provider_site = selected_provider_site.unwrap_or_else(|_| "none".to_owned());
 
     observed_facts.insert(
-        "local_preference_restored".to_owned(),
-        serde_json::Value::Bool(local_preference_restored),
+        "round_robin_restored".to_owned(),
+        serde_json::Value::Bool(restored_candidate_selected),
     );
     observed_facts.insert(
         "selected_provider_site".to_owned(),
@@ -2358,15 +2690,15 @@ fn assert_provider_restoration() -> AssertionResult {
         serde_json::Value::String(last_restoration_observation.into_inner()),
     );
 
-    if provider_ready && local_preference_restored {
+    if provider_ready && restored_candidate_selected {
         Ok(proof_success(
-            "Provider restoration successfully returned routing to local preference",
+            "Provider restoration re-admitted the provider to the accepted round-robin group",
             observed_facts,
             start.elapsed(),
         ))
     } else {
         Ok(proof_failure(
-            "Provider restoration failed to restore local preference",
+            "Provider restoration did not re-admit the provider to the accepted round-robin group",
             observed_facts,
             start.elapsed(),
         ))
@@ -2385,38 +2717,57 @@ fn assert_rollout_convergence() -> AssertionResult {
         let rendered = overlay.semantic_revision != "unknown" && !overlay.semantic_revision.is_empty();
         let distributed = !overlay.candidates.is_empty();
         let expected_revision = overlay.semantic_revision.clone();
+        let client = StableCurlClient::create(&context, &format!("rollout-convergence-{cluster}"))?;
 
-        let serving_revision =
-            wait_for_combined_site_data_plane(&format!("{cluster} serving current overlay revision"), || {
-                let output = run_curl_probe(
-                    &context,
-                    &format!("serving-test-{cluster}"),
-                    &[
-                        "curl",
-                        "--fail-with-body",
-                        "--silent",
-                        "--show-error",
-                        "--include",
-                        "-H",
-                        "Content-Type: application/json",
-                        "-d",
-                        r#"{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"hello"}],"max_tokens":16}"#,
-                        "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-                    ],
-                )?;
+        let serving_revision = wait_for_combined_site_data_plane(
+            &format!("{cluster} serving current overlay revision"),
+            || {
+                let output = client.request(&[
+                    "--fail-with-body",
+                    "--silent",
+                    "--show-error",
+                    "--include",
+                    "--max-time",
+                    "10",
+                    "-H",
+                    "Content-Type: application/json",
+                    "-H",
+                    "Authorization: Bearer consumer-token",
+                    "-d",
+                    r#"{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"hello"}],"max_tokens":16}"#,
+                    "http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+                ])?;
                 if !output.status.success() {
                     return Err("serving request did not return HTTP 200".into());
                 }
-                let revision = response_header(&output.stdout, "x-grid-demo-backend-overlay-revision")
-                    .ok_or("serving response missing overlay revision attribution")?;
-                if revision != expected_revision {
+                let logs = Command::new("timeout")
+                    .args([
+                        "20s",
+                        "kubectl",
+                        "--context",
+                        &context,
+                        "-n",
+                        GRID_SYSTEM_NS,
+                        "logs",
+                        "deployment/consumer-gateway",
+                        "-c",
+                        "praxis",
+                        "--tail=200",
+                    ])
+                    .output()?;
+                let logs_text = String::from_utf8_lossy(&logs.stdout);
+                let accepted_revision = ai_revision_from_logs(&logs_text, "accepted_revision");
+                let revision = ai_revision_from_logs(&logs_text, "serving_revision")
+                    .ok_or("AI logs missing serving_revision evidence")?;
+                if accepted_revision.as_deref() != Some(expected_revision.as_str()) || revision != expected_revision {
                     return Err(format!(
-                        "serving revision {revision} does not match distributed revision {expected_revision}"
+                        "AI revisions accepted={accepted_revision:?}, serving={revision} do not match distributed revision {expected_revision}"
                     )
                     .into());
                 }
                 Ok(revision)
-            });
+            },
+        );
         let serving = serving_revision.is_ok();
         let accepted = serving;
         let serving_revision = serving_revision.unwrap_or_else(|_| "none".to_owned());
@@ -3419,10 +3770,10 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
         return Ok(());
     }
 
-    let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE")
-        .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3".to_owned());
+    let gateway =
+        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "ghcr.io/praxis-proxy/ai:0.3.0".to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
-        .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.3".to_owned());
+        .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
     let vcr = crate::env::image_overrides::vcr_image();
 
     for image in [&gateway, &operator, &vcr] {
@@ -3555,7 +3906,7 @@ fn apply_credential_secret(context: &str, secret_name: &str, token: &str) -> Res
 /// semantic revision from the `grid.praxis-proxy.io/overlay-revision`
 /// annotation (content-addressed, safe to compare across clusters).
 fn read_cluster_overlay(cluster: &str) -> Result<OverlayData, Box<dyn std::error::Error>> {
-    let context = format!("kind-grid-combined-{cluster}");
+    let context = combined_kubectl_context(cluster);
 
     let output = Command::new("kubectl")
         .args([
@@ -4324,10 +4675,10 @@ fn materialize_external_provider_stack(
     reason = "Image override application with structured YAML manipulation; nested ifs follow YAML structure hierarchy"
 )]
 fn apply_image_overrides(config: &mut serde_yaml::Value) {
-    let gateway_image = std::env::var("GRID_XTASK_GATEWAY_IMAGE")
-        .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3".to_owned());
+    let gateway_image =
+        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "ghcr.io/praxis-proxy/ai:0.3.0".to_owned());
     let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
-        .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.3".to_owned());
+        .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
     let vcr_image = crate::env::image_overrides::vcr_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
 
@@ -4770,11 +5121,14 @@ fn run_quick_scenarios(
     run_and_insert(&mut results, "overlay_acceptance", assert_overlay_acceptance);
 
     eprintln!();
-    eprintln!("[SCENARIO {}] Verify local provider selection", scenario());
+    eprintln!(
+        "[SCENARIO {}] Verify cross-site round-robin provider selection",
+        scenario()
+    );
     run_and_insert(
         &mut results,
-        "local_provider_selection",
-        assert_local_provider_selection,
+        "round_robin_provider_selection",
+        assert_round_robin_provider_selection,
     );
 
     eprintln!();
@@ -4841,13 +5195,31 @@ fn run_full_scenarios(
         n
     };
 
+    let lifecycle_client = StableCurlClient::create("kind-grid-combined-central", "session-lifecycle-client");
+
     // Step 1: Establish session BEFORE drain
     eprintln!();
     eprintln!("[SCENARIO {}] Establish session before drain", scenario());
-    run_and_insert(&mut results, "session_establishment", assert_session_establishment);
+    match lifecycle_client {
+        Ok(client) => {
+            run_and_insert_with(&mut results, "session_establishment", || {
+                assert_session_establishment(&client)
+            });
 
-    // Steps 2-5 are wrapped so restoration is guaranteed even if intermediate steps fail.
-    run_drain_session_restore_sequence(&mut results, &mut scenario);
+            // Steps 2-5 are wrapped so restoration is guaranteed even if intermediate steps fail.
+            run_drain_session_restore_sequence(&mut results, &mut scenario, &client);
+        },
+        Err(error) => {
+            results.insert(
+                "session_establishment".to_owned(),
+                proof_failure(
+                    &format!("failed to create stable lifecycle client: {error}"),
+                    BTreeMap::new(),
+                    Duration::ZERO,
+                ),
+            );
+        },
+    }
 
     // Provider lifecycle: add/remove/re-add a secondary mock provider
     run_provider_lifecycle_sequence(
@@ -4901,34 +5273,56 @@ fn run_and_insert(results: &mut BTreeMap<String, ProofResult>, name: &str, asser
     }
 }
 
+/// Run a closure-backed assertion and insert its result.
+fn run_and_insert_with<F>(results: &mut BTreeMap<String, ProofResult>, name: &str, assertion_fn: F)
+where
+    F: FnOnce() -> AssertionResult,
+{
+    match run_assertion(name, assertion_fn) {
+        Ok(proof) => {
+            results.insert(name.to_owned(), proof);
+        },
+        Err(e) => {
+            eprintln!("  [X] {name} failed: {e}");
+            results.insert(
+                name.to_owned(),
+                proof_failure(&format!("{name} failed: {e}"), BTreeMap::new(), Duration::ZERO),
+            );
+        },
+    }
+}
+
 /// Execute the drain -> session tests -> restore sequence with guaranteed restoration.
 fn run_drain_session_restore_sequence(
     results: &mut BTreeMap<String, ProofResult>,
     scenario: &mut dyn FnMut() -> usize,
+    client: &StableCurlClient,
 ) {
     // Step 2: Drain
     eprintln!();
     eprintln!("[SCENARIO {}] Central drain and remote fallback", scenario());
-    run_and_insert(results, "central_drain_fallback", assert_central_drain_fallback);
+    run_and_insert_with(results, "central_drain_fallback", || {
+        assert_central_drain_fallback(client)
+    });
 
     // Step 3: Existing session after drain
     eprintln!();
     eprintln!("[SCENARIO {}] Existing session survives drain", scenario());
-    run_and_insert(
-        results,
-        "existing_session_after_drain",
-        assert_existing_session_after_drain,
-    );
+    run_and_insert_with(results, "existing_session_after_drain", || {
+        assert_existing_session_after_drain(client)
+    });
 
     // Step 4: New session after drain
     eprintln!();
     eprintln!("[SCENARIO {}] New session after drain", scenario());
-    run_and_insert(results, "new_session_after_drain", assert_new_session_after_drain);
+    run_and_insert_with(results, "new_session_after_drain", || {
+        assert_new_session_after_drain(client)
+    });
 
     // Step 5: Restore (guaranteed)
     eprintln!();
     eprintln!("[SCENARIO {}] Provider restoration", scenario());
-    run_and_insert(results, "provider_restoration", assert_provider_restoration);
+    run_and_insert_with(results, "provider_restoration", || assert_provider_restoration(client));
 
     if let Err(error) = ensure_central_provider_restored() {
         results.insert(
@@ -5359,7 +5753,10 @@ spec:
          \x20   app.kubernetes.io/instance: {site}-secondary\n"
     );
 
-    let routing_cluster = format!("vcr-{site}-provider");
+    // Keep the lifecycle candidate's routing identity distinct from the
+    // primary provider. Stable IDs include routing identity, so reusing the
+    // primary cluster would make the two same-model candidates collide.
+    let routing_cluster = format!("vcr-{site}-provider-secondary");
     let label = GRIDSITE_PROVIDER_LABEL;
     let inference_provider = format!(
         r#"apiVersion: grid.praxis-proxy.io/v1alpha1
@@ -5501,12 +5898,193 @@ fn append_secondary_mock_config(
     Ok(result)
 }
 
+/// Add the dynamically-created secondary provider gateway to a consumer's
+/// static hop and load-balancer configuration.
+///
+/// The routing overlay can advertise a new candidate, but Praxis still needs
+/// a corresponding named load-balancer cluster in its consumer config. Clone
+/// the existing west gateway entry so its Forge-captured endpoint and TLS
+/// settings remain authoritative; do not introduce a transient IP here.
+fn append_secondary_consumer_config(config: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut document: serde_yaml::Value = serde_yaml::from_str(config)?;
+    let chains = document
+        .get_mut("filter_chains")
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or("consumer config has no filter_chains sequence")?;
+    let main = chains
+        .iter_mut()
+        .find(|chain| chain.get("name").and_then(serde_yaml::Value::as_str) == Some("main"))
+        .ok_or("consumer config has no main filter chain")?;
+    let filters = main
+        .get_mut("filters")
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or("consumer main chain has no filters sequence")?;
+
+    let mut added_hop = false;
+    let mut added_cluster = false;
+    for filter in filters {
+        let Some(filter_name) = filter.get("filter").and_then(serde_yaml::Value::as_str) else {
+            continue;
+        };
+        if filter_name == "intelligent_route" {
+            let hops = filter
+                .get_mut("provider_hop_clusters")
+                .and_then(serde_yaml::Value::as_sequence_mut)
+                .ok_or("intelligent_route has no provider_hop_clusters sequence")?;
+            if !hops
+                .iter()
+                .any(|hop| hop.as_str() == Some("vcr-west-provider-secondary"))
+            {
+                hops.push(serde_yaml::Value::String("vcr-west-provider-secondary".to_owned()));
+            }
+            added_hop = true;
+        } else if filter_name == "load_balancer" {
+            let clusters = filter
+                .get_mut("clusters")
+                .and_then(serde_yaml::Value::as_sequence_mut)
+                .ok_or("load_balancer has no clusters sequence")?;
+            if clusters.iter().any(|cluster| {
+                cluster.get("name").and_then(serde_yaml::Value::as_str) == Some("vcr-west-provider-secondary")
+            }) {
+                added_cluster = true;
+                continue;
+            }
+            let west = clusters
+                .iter()
+                .find(|cluster| cluster.get("name").and_then(serde_yaml::Value::as_str) == Some("vcr-west-provider"))
+                .cloned()
+                .ok_or("load_balancer has no vcr-west-provider cluster to clone")?;
+            let mut secondary = west;
+            secondary
+                .as_mapping_mut()
+                .ok_or("vcr-west-provider cluster is not a YAML mapping")?
+                .insert(
+                    serde_yaml::Value::String("name".to_owned()),
+                    serde_yaml::Value::String("vcr-west-provider-secondary".to_owned()),
+                );
+            clusters.push(secondary);
+            added_cluster = true;
+        }
+    }
+
+    if !added_hop || !added_cluster {
+        return Err("consumer config missing intelligent_route or load_balancer secondary insertion point".into());
+    }
+    Ok(serde_yaml::to_string(&document)?)
+}
+
+/// Rematerialize all consumer configs after a provider is added and wait for
+/// each consumer rollout before issuing requests against the new candidate.
+fn rematerialize_consumers_for_secondary() -> Result<(), Box<dyn std::error::Error>> {
+    for site in CLUSTERS {
+        let context = format!("kind-grid-combined-{site}");
+        let current = kubectl::get_configmap_yaml(&context, GRID_SYSTEM_NS, "consumer-gateway-config")?;
+        let document: serde_yaml::Value = serde_yaml::from_str(&current)?;
+        let config = document
+            .get("data")
+            .and_then(|data| data.get("praxis.yaml"))
+            .and_then(serde_yaml::Value::as_str)
+            .ok_or_else(|| format!("{site}: consumer-gateway-config has no data.praxis.yaml"))?;
+        let rendered = append_secondary_consumer_config(config)?;
+        let create = Command::new("kubectl")
+            .args([
+                "--context",
+                &context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "create",
+                "configmap",
+                "consumer-gateway-config",
+                "--from-literal",
+                &format!("praxis.yaml={rendered}"),
+                "--dry-run=client",
+                "-o",
+                "yaml",
+            ])
+            .output()?;
+        if !create.status.success() {
+            return Err(format!(
+                "{site}: failed to render secondary consumer config: {}",
+                String::from_utf8_lossy(&create.stderr)
+            )
+            .into());
+        }
+        kubectl::apply_manifest(&context, &String::from_utf8(create.stdout)?)?;
+        kubectl::rollout_restart_ns(&context, "consumer-gateway", GRID_SYSTEM_NS)?;
+        kubectl::wait_for_rollout_ns(&context, "consumer-gateway", GRID_SYSTEM_NS, site)?;
+        eprintln!("  [OK] {site}: consumer config rematerialized with secondary gateway cluster");
+    }
+    Ok(())
+}
+
+/// Capture the exact consumer configuration before lifecycle mutation.
+fn capture_consumer_configs() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    CLUSTERS
+        .iter()
+        .map(|site| {
+            let context = format!("kind-grid-combined-{site}");
+            let current = kubectl::get_configmap_yaml(&context, GRID_SYSTEM_NS, "consumer-gateway-config")?;
+            let document: serde_yaml::Value = serde_yaml::from_str(&current)?;
+            let config = document
+                .get("data")
+                .and_then(|data| data.get("praxis.yaml"))
+                .and_then(serde_yaml::Value::as_str)
+                .ok_or_else(|| format!("{site}: consumer-gateway-config has no data.praxis.yaml"))?;
+            Ok(((*site).to_owned(), config.to_owned()))
+        })
+        .collect()
+}
+
+/// Restore captured consumer configurations exactly and only restart changed consumers.
+fn restore_consumer_configs(snapshots: &BTreeMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
+    for site in CLUSTERS {
+        let Some(original) = snapshots.get(*site) else { continue };
+        let context = format!("kind-grid-combined-{site}");
+        let current = kubectl::get_configmap_yaml(&context, GRID_SYSTEM_NS, "consumer-gateway-config")?;
+        let document: serde_yaml::Value = serde_yaml::from_str(&current)?;
+        let current_config = document
+            .get("data")
+            .and_then(|data| data.get("praxis.yaml"))
+            .and_then(serde_yaml::Value::as_str)
+            .ok_or_else(|| format!("{site}: consumer-gateway-config has no data.praxis.yaml"))?;
+        if current_config == original {
+            continue;
+        }
+        let create = Command::new("kubectl")
+            .args([
+                "--context",
+                &context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "create",
+                "configmap",
+                "consumer-gateway-config",
+                "--from-literal",
+                &format!("praxis.yaml={original}"),
+                "--dry-run=client",
+                "-o",
+                "yaml",
+            ])
+            .output()?;
+        if !create.status.success() {
+            return Err(format!(
+                "{site}: failed to render original consumer config: {}",
+                String::from_utf8_lossy(&create.stderr)
+            )
+            .into());
+        }
+        kubectl::apply_manifest(&context, &String::from_utf8(create.stdout)?)?;
+        kubectl::rollout_restart_ns(&context, "consumer-gateway", GRID_SYSTEM_NS)?;
+        kubectl::wait_for_rollout_ns(&context, "consumer-gateway", GRID_SYSTEM_NS, site)?;
+        eprintln!("  [OK] {site}: original consumer configuration restored");
+    }
+    Ok(())
+}
+
 /// Re-render and apply the provider gateway config for a single site.
 ///
-/// The secondary provider shares the primary's routing cluster
-/// (`routingClusterRef: vcr-{site}-provider`), so its stable_id is
-/// looked up by model name in the candidates list rather than by cluster
-/// key in `stable_ids`.
+/// The secondary provider has its own routing cluster so its stable ID remains
+/// distinct from the primary same-model candidate.
 fn rematerialize_site_provider_config(
     site: &str,
     external_provider: Option<&ExternalProviderDescriptor>,
@@ -5542,11 +6120,7 @@ fn rematerialize_site_provider_config(
     }
 
     if include_secondary {
-        let secondary_id = overlay
-            .candidates
-            .iter()
-            .find(|c| c.name == SECONDARY_MODEL)
-            .map(|c| c.stable_id.clone())
+        let secondary_id = additional_candidate_stable_id(&overlay, site, SECONDARY_MODEL, &primary_id)
             .ok_or_else(|| format!("{site}: secondary candidate {SECONDARY_MODEL} not in overlay candidates"))?;
         rendered = append_secondary_mock_config(&rendered, site, &secondary_id)?;
     }
@@ -5589,24 +6163,41 @@ fn rematerialize_site_provider_config(
     clippy::disallowed_methods,
     reason = "Sleep is required for polling with timeout functionality"
 )]
-fn wait_for_candidate_model_on_all_sites(model: &str, timeout: Duration) -> Result<String, Box<dyn std::error::Error>> {
+fn wait_for_additional_candidate_on_all_sites(
+    site: &str,
+    model: &str,
+    primary_stable_id: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
     let interval = Duration::from_secs(5);
     let start = Instant::now();
+    let mut last_observation = String::from("no overlay observations");
 
     while start.elapsed() < timeout {
         let mut ids: Vec<String> = Vec::new();
         let mut all_present = true;
+        let mut states = Vec::new();
         for cluster in CLUSTERS {
             if let Ok(data) = read_cluster_overlay(cluster) {
-                if let Some(c) = data.candidates.iter().find(|c| c.name == model) {
-                    ids.push(c.stable_id.clone());
+                states.push(format!(
+                    "{cluster}:{}",
+                    data.candidates
+                        .iter()
+                        .map(|candidate| format!("{}@{}", candidate.name, candidate.stable_id))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+                if let Some(stable_id) = additional_candidate_stable_id(&data, site, model, primary_stable_id) {
+                    ids.push(stable_id);
                 } else {
                     all_present = false;
                 }
             } else {
+                states.push(format!("{cluster}:unreadable"));
                 all_present = false;
             }
         }
+        last_observation = format!("elapsed={:?}; {}", start.elapsed(), states.join("; "));
         if all_present
             && ids.len() == CLUSTERS.len()
             && let Some(reference) = ids.first()
@@ -5616,35 +6207,113 @@ fn wait_for_candidate_model_on_all_sites(model: &str, timeout: Duration) -> Resu
         }
         std::thread::sleep(interval);
     }
-    Err(format!("candidate model '{model}' not converged on all sites after {timeout:?}").into())
+    Err(format!(
+        "additional candidate model '{model}' not converged on all sites after {timeout:?}; \
+         primary_stable_id={primary_stable_id}; last observed state: {last_observation}"
+    )
+    .into())
 }
 
-/// Wait for a candidate (identified by model name) to be absent from all
-/// sites' overlays.
+/// Return the stable ID of a lifecycle candidate, excluding the site's
+/// already-present primary candidate. The same model name may legitimately be
+/// advertised by multiple providers.
+fn additional_candidate_stable_id(
+    overlay: &OverlayData,
+    site: &str,
+    model: &str,
+    primary_stable_id: &str,
+) -> Option<String> {
+    overlay
+        .candidates
+        .iter()
+        .find(|candidate| candidate.site == site && candidate.name == model && candidate.stable_id != primary_stable_id)
+        .map(|candidate| candidate.stable_id.clone())
+}
+
+/// Wait for a specific provider candidate to be absent from all sites' overlays.
 #[expect(
     clippy::disallowed_methods,
     reason = "Sleep is required for polling with timeout functionality"
 )]
-fn wait_for_candidate_model_absent_all_sites(model: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+fn wait_for_candidate_stable_id_absent_all_sites(
+    stable_id: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
     let interval = Duration::from_secs(5);
     let start = Instant::now();
+    let mut last_observation = String::from("no overlay observations");
 
     while start.elapsed() < timeout {
         let mut all_absent = true;
+        let mut states = Vec::new();
         for cluster in CLUSTERS {
-            if let Ok(data) = read_cluster_overlay(cluster)
-                && data.candidates.iter().any(|c| c.name == model)
-            {
-                all_absent = false;
+            match read_cluster_overlay(cluster) {
+                Ok(data) => {
+                    let matching = data.candidates.iter().filter(|c| c.stable_id == stable_id).count();
+                    states.push(format!("{cluster}:stable_id_matches={matching}"));
+                    if matching > 0 {
+                        all_absent = false;
+                    }
+                },
+                Err(error) => {
+                    states.push(format!("{cluster}:unreadable={error}"));
+                    all_absent = false;
+                },
+            }
+            if !all_absent {
                 break;
             }
         }
+        last_observation = format!("elapsed={:?}; {}", start.elapsed(), states.join("; "));
         if all_absent {
             return Ok(());
         }
         std::thread::sleep(interval);
     }
-    Err(format!("candidate model '{model}' still present after {timeout:?}").into())
+    Err(format!(
+        "candidate stable_id '{stable_id}' still present after {timeout:?}; last observed state: {last_observation}"
+    )
+    .into())
+}
+
+/// Wait for every candidate using a routing-cluster identity to disappear.
+fn wait_for_routing_cluster_absent_all_sites(
+    routing_cluster: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let interval = Duration::from_secs(5);
+    let start = Instant::now();
+    let mut last_observation = String::from("no overlay observations");
+    while start.elapsed() < timeout {
+        let mut absent = true;
+        let mut states = Vec::new();
+        for cluster in CLUSTERS {
+            match read_cluster_overlay(cluster) {
+                Ok(data) => {
+                    let matches = data
+                        .candidates
+                        .iter()
+                        .filter(|candidate| candidate.cluster == routing_cluster)
+                        .count();
+                    states.push(format!("{cluster}:routing_cluster_matches={matches}"));
+                    absent &= matches == 0;
+                },
+                Err(error) => {
+                    absent = false;
+                    states.push(format!("{cluster}:unreadable={error}"));
+                },
+            }
+        }
+        last_observation = format!("elapsed={:?}; {}", start.elapsed(), states.join("; "));
+        if absent {
+            return Ok(());
+        }
+        std::thread::sleep(interval);
+    }
+    Err(format!(
+        "routing cluster '{routing_cluster}' still present after {timeout:?}; last observed state: {last_observation}"
+    )
+    .into())
 }
 
 /// Return whether an overlay contains the provider candidate for one site and model.
@@ -5816,6 +6485,7 @@ fn provider_gateway_restart_args(context: &str) -> Vec<&str> {
 fn probe_secondary_model_with_retry(
     from_cluster: &str,
     expected_provider_site: &str,
+    expected_backend_cluster: &str,
     timeout: Duration,
 ) -> Result<BTreeMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
     let context = format!("kind-grid-combined-{from_cluster}");
@@ -5844,23 +6514,45 @@ fn probe_secondary_model_with_retry(
             ],
         ) {
             let provider_gw = response_header(&output.stdout, "x-grid-combined-provider-gateway");
+            let backend_cluster = response_header(&output.stdout, "x-ai-inference-provider");
+            let status = response_status(&output.stdout);
             let status_line = String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .find(|line| line.starts_with("HTTP/"))
                 .unwrap_or("missing HTTP status")
                 .to_owned();
+            let ai_gateway = response_header(&output.stdout, "x-ai-demo-provider-gateway");
+            let gateway_matches = provider_gw.as_deref() == Some(expected_provider_site) && ai_gateway == provider_gw;
+            let backend_matches = backend_cluster.as_deref() == Some(expected_backend_cluster);
             last_observation = format!(
-                "exit_success={}, status={status_line}, provider_gateway={}",
+                "exit_success={}, status={status_line}, provider_gateway={}, ai_gateway={}, backend_cluster={}",
                 output.status.success(),
                 provider_gw.as_deref().unwrap_or("missing"),
+                ai_gateway.as_deref().unwrap_or("missing"),
+                backend_cluster.as_deref().unwrap_or("missing"),
             );
-            if output.status.success()
-                && status_line.contains(" 200 ")
-                && provider_gw.as_deref() == Some(expected_provider_site)
-            {
+            if output.status.success() && status == Some(200) && gateway_matches && backend_matches {
                 let mut facts = BTreeMap::new();
                 facts.insert("from_cluster".to_owned(), serde_json::json!(from_cluster));
+                facts.insert("status".to_owned(), serde_json::json!(status));
                 facts.insert("provider_gateway".to_owned(), serde_json::json!(provider_gw));
+                facts.insert("ai_provider_gateway".to_owned(), serde_json::json!(ai_gateway));
+                facts.insert(
+                    "expected_provider_site".to_owned(),
+                    serde_json::json!(expected_provider_site),
+                );
+                facts.insert(
+                    "expected_backend_cluster".to_owned(),
+                    serde_json::json!(expected_backend_cluster),
+                );
+                facts.insert(
+                    "gateway_attribution_matches".to_owned(),
+                    serde_json::json!(gateway_matches),
+                );
+                facts.insert(
+                    "backend_attribution_matches".to_owned(),
+                    serde_json::json!(backend_matches),
+                );
                 return Ok(facts);
             }
         }
@@ -5893,15 +6585,29 @@ fn lifecycle_add_provider(
     let start = Instant::now();
     let mut facts = BTreeMap::new();
 
+    let primary_stable_id = read_cluster_overlay(site)?
+        .candidates
+        .iter()
+        .find(|candidate| candidate.site == site && candidate.name == PRIMARY_MODEL)
+        .map(|candidate| candidate.stable_id.clone())
+        .ok_or_else(|| format!("{site}: primary candidate not present before secondary addition"))?;
+
     deploy_secondary_mock_provider(site)?;
 
-    let stable_id = wait_for_candidate_model_on_all_sites(SECONDARY_MODEL, Duration::from_secs(120))?;
+    let stable_id = wait_for_additional_candidate_on_all_sites(
+        site,
+        SECONDARY_MODEL,
+        &primary_stable_id,
+        Duration::from_secs(120),
+    )?;
     facts.insert("secondary_stable_id".to_owned(), serde_json::json!(stable_id));
 
     rematerialize_site_provider_config(site, external_provider, external_site, true, demo_root)?;
+    rematerialize_consumers_for_secondary()?;
     apply_provider_gateway_stack(forge_bin, resolved_config, site, external_site)?;
 
-    let probe_facts = probe_secondary_model_with_retry(site, site, COMBINED_SITE_DATA_PLANE_WAIT)?;
+    let probe_facts =
+        probe_secondary_model_with_retry(site, site, "vcr-backend-secondary", COMBINED_SITE_DATA_PLANE_WAIT)?;
     facts.extend(probe_facts);
 
     let primary_ctx = format!("kind-grid-combined-{site}");
@@ -5942,11 +6648,23 @@ fn lifecycle_assert_global_convergence(site: &str) -> AssertionResult {
     let start = Instant::now();
     let mut facts = BTreeMap::new();
 
-    let stable_id = wait_for_candidate_model_on_all_sites(SECONDARY_MODEL, Duration::from_secs(180))?;
+    let primary_stable_id = read_cluster_overlay(site)?
+        .candidates
+        .iter()
+        .find(|candidate| candidate.site == site && candidate.name == PRIMARY_MODEL)
+        .map(|candidate| candidate.stable_id.clone())
+        .ok_or_else(|| format!("{site}: primary candidate not present during lifecycle convergence"))?;
+    let stable_id = wait_for_additional_candidate_on_all_sites(
+        site,
+        SECONDARY_MODEL,
+        &primary_stable_id,
+        Duration::from_secs(180),
+    )?;
     facts.insert("global_stable_id".to_owned(), serde_json::json!(stable_id));
 
     for cluster in CLUSTERS {
-        let probe_facts = probe_secondary_model_with_retry(cluster, site, COMBINED_SITE_DATA_PLANE_WAIT)?;
+        let probe_facts =
+            probe_secondary_model_with_retry(cluster, site, "vcr-backend-secondary", COMBINED_SITE_DATA_PLANE_WAIT)?;
         facts.insert(format!("{cluster}_probe"), serde_json::json!(probe_facts));
     }
 
@@ -5965,6 +6683,7 @@ fn lifecycle_assert_global_convergence(site: &str) -> AssertionResult {
 )]
 fn lifecycle_remove_provider(
     site: &str,
+    secondary_stable_id: &str,
     external_provider: Option<&ExternalProviderDescriptor>,
     external_site: Option<&str>,
     forge_bin: &Path,
@@ -5976,7 +6695,7 @@ fn lifecycle_remove_provider(
 
     remove_secondary_mock_provider(site)?;
 
-    wait_for_candidate_model_absent_all_sites(SECONDARY_MODEL, Duration::from_secs(180))?;
+    wait_for_candidate_stable_id_absent_all_sites(secondary_stable_id, Duration::from_secs(180))?;
     facts.insert("candidate_drained".to_owned(), serde_json::json!(true));
 
     rematerialize_site_provider_config(site, external_provider, external_site, false, demo_root)?;
@@ -6017,8 +6736,12 @@ fn lifecycle_remove_provider(
     ))
 }
 
-/// Verify the secondary model is no longer routable from any consumer.
-fn lifecycle_assert_unroutable() -> AssertionResult {
+/// Verify new traffic never selects the withdrawn candidate.
+///
+/// The secondary intentionally shares the primary model, so a successful
+/// response is expected after removal. The assertion must inspect trusted
+/// backend attribution rather than treating the shared model as unroutable.
+fn lifecycle_assert_removed_candidate_not_selected() -> AssertionResult {
     let start = Instant::now();
     let mut facts = BTreeMap::new();
 
@@ -6043,13 +6766,24 @@ fn lifecycle_assert_unroutable() -> AssertionResult {
             ],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let status_line = stdout.lines().next().unwrap_or("").to_owned();
-        let got_200 = status_line.contains("200");
+        let status = response_status(&output.stdout);
+        let status_line = stdout
+            .lines()
+            .find(|line| line.starts_with("HTTP/"))
+            .unwrap_or("")
+            .to_owned();
+        let gateway = response_header(&output.stdout, "x-grid-combined-provider-gateway");
+        let ai_gateway = response_header(&output.stdout, "x-ai-demo-provider-gateway");
+        let backend = response_header(&output.stdout, "x-ai-inference-provider");
+        let trusted_primary = primary_response_is_trusted(&output.stdout);
         facts.insert(format!("{cluster}_status"), serde_json::json!(status_line));
-        facts.insert(format!("{cluster}_got_200"), serde_json::json!(got_200));
-        if got_200 {
+        facts.insert(format!("{cluster}_status_code"), serde_json::json!(status));
+        facts.insert(format!("{cluster}_provider_gateway"), serde_json::json!(gateway));
+        facts.insert(format!("{cluster}_ai_provider_gateway"), serde_json::json!(ai_gateway));
+        facts.insert(format!("{cluster}_backend"), serde_json::json!(backend));
+        if !trusted_primary || backend.as_deref() == Some("vcr-backend-secondary") {
             return Ok(proof_failure(
-                &format!("removed secondary model still routable from {cluster}"),
+                &format!("withdrawn secondary response lacked trusted primary attribution from {cluster}"),
                 facts,
                 start.elapsed(),
             ));
@@ -6057,7 +6791,7 @@ fn lifecycle_assert_unroutable() -> AssertionResult {
     }
 
     Ok(proof_success(
-        "secondary model correctly unroutable from all consumers after removal",
+        "withdrawn secondary candidate was absent from new traffic; shared model remained routable",
         facts,
         start.elapsed(),
     ))
@@ -6072,6 +6806,8 @@ fn lifecycle_assert_unroutable() -> AssertionResult {
 fn lifecycle_cleanup(
     results: &mut BTreeMap<String, ProofResult>,
     site: &str,
+    secondary_stable_id: Option<&str>,
+    consumer_snapshots: &BTreeMap<String, String>,
     external_provider: Option<&ExternalProviderDescriptor>,
     external_site: Option<&str>,
     forge_bin: &Path,
@@ -6084,9 +6820,13 @@ fn lifecycle_cleanup(
 
     let cleanup_result = (|| -> Result<(), Box<dyn std::error::Error>> {
         remove_secondary_mock_provider(site)?;
-        wait_for_candidate_model_absent_all_sites(SECONDARY_MODEL, Duration::from_secs(180))?;
+        if let Some(stable_id) = secondary_stable_id {
+            wait_for_candidate_stable_id_absent_all_sites(stable_id, Duration::from_secs(180))?;
+        }
+        wait_for_routing_cluster_absent_all_sites("vcr-west-provider-secondary", Duration::from_secs(180))?;
         rematerialize_site_provider_config(site, external_provider, external_site, false, demo_root)?;
         apply_provider_gateway_stack(forge_bin, resolved_config, site, external_site)?;
+        restore_consumer_configs(consumer_snapshots)?;
 
         let ctx = format!("kind-grid-combined-{site}");
         let output = run_curl_probe(
@@ -6153,6 +6893,21 @@ fn run_provider_lifecycle_sequence(
     eprintln!("=== PROVIDER LIFECYCLE (add/remove/re-add on {site}) ===");
     eprintln!();
 
+    let consumer_snapshots = match capture_consumer_configs() {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            results.insert(
+                "provider_addition".to_owned(),
+                proof_failure(
+                    &format!("could not snapshot consumer configurations: {error}"),
+                    BTreeMap::new(),
+                    Duration::ZERO,
+                ),
+            );
+            return;
+        },
+    };
+
     let baseline_deployments = record_gateway_deployment_state();
 
     let skip = |proof_results: &mut BTreeMap<String, ProofResult>, name: &str, blocker: &str| {
@@ -6199,7 +6954,7 @@ fn run_provider_lifecycle_sequence(
         for name in [
             "provider_global_convergence",
             "provider_removal",
-            "removed_provider_unroutable",
+            "removed_provider_not_selected",
             "provider_readdition",
             "stable_id_determinism",
             "gateway_restart_boundary",
@@ -6210,6 +6965,8 @@ fn run_provider_lifecycle_sequence(
         lifecycle_cleanup(
             results,
             site,
+            None,
+            &consumer_snapshots,
             external_provider,
             external_site,
             forge_bin,
@@ -6240,8 +6997,12 @@ fn run_provider_lifecycle_sequence(
     eprintln!();
     eprintln!("[SCENARIO {}] Provider removal", scenario());
     let removal_ok = match run_assertion("provider_removal", || {
+        let Some(secondary_stable_id) = add_stable_id.as_deref() else {
+            return Err("provider addition did not produce a secondary stable ID".into());
+        };
         lifecycle_remove_provider(
             site,
+            secondary_stable_id,
             external_provider,
             external_site,
             forge_bin,
@@ -6265,7 +7026,7 @@ fn run_provider_lifecycle_sequence(
 
     if !removal_ok {
         for name in [
-            "removed_provider_unroutable",
+            "removed_provider_not_selected",
             "provider_readdition",
             "stable_id_determinism",
             "gateway_restart_boundary",
@@ -6276,6 +7037,8 @@ fn run_provider_lifecycle_sequence(
         lifecycle_cleanup(
             results,
             site,
+            add_stable_id.as_deref(),
+            &consumer_snapshots,
             external_provider,
             external_site,
             forge_bin,
@@ -6288,7 +7051,11 @@ fn run_provider_lifecycle_sequence(
     // --- Step 4: Removed provider unroutable ---
     eprintln!();
     eprintln!("[SCENARIO {}] Removed provider unroutable", scenario());
-    run_and_insert(results, "removed_provider_unroutable", lifecycle_assert_unroutable);
+    run_and_insert(
+        results,
+        "removed_provider_not_selected",
+        lifecycle_assert_removed_candidate_not_selected,
+    );
 
     // --- Step 5: Provider re-addition ---
     eprintln!();
@@ -6351,19 +7118,19 @@ fn run_provider_lifecycle_sequence(
 
         for cluster in CLUSTERS {
             let cg_key = format!("{cluster}/consumer-gateway");
-            let cg_same = matches!(
+            let cg_changed = matches!(
                 (baseline_deployments.get(&cg_key), post_deployments.get(&cg_key)),
-                (Some((b, _)), Some((p, _))) if b == p
+                (Some((b, _)), Some((p, _))) if b != p
             );
             facts.insert(
                 format!("{cluster}_consumer_gw"),
-                serde_json::json!(if cg_same {
-                    "unchanged (overlay hot-reload)"
+                serde_json::json!(if cg_changed {
+                    "rolled (static secondary gateway cluster added)"
                 } else {
-                    "RESTARTED (unexpected)"
+                    "unchanged (unexpected: secondary gateway cluster not loaded)"
                 }),
             );
-            if !cg_same {
+            if !cg_changed {
                 boundary_ok = false;
             }
 
@@ -6413,7 +7180,7 @@ fn run_provider_lifecycle_sequence(
             "gateway_restart_boundary".to_owned(),
             if boundary_ok {
                 proof_success(
-                    "consumer gateways hot-reloaded overlay without restart; \
+                    "consumer gateways rolled to load the lifecycle gateway cluster; \
                  non-lifecycle provider gateways and all operators unchanged; \
                  lifecycle-site provider gateway rolled for static config change",
                     facts,
@@ -6442,6 +7209,8 @@ fn run_provider_lifecycle_sequence(
     lifecycle_cleanup(
         results,
         site,
+        readd_stable_id.as_deref(),
+        &consumer_snapshots,
         external_provider,
         external_site,
         forge_bin,
@@ -6455,6 +7224,33 @@ fn teardown_environment(context: &CombinedSiteContext) -> Result<(), Box<dyn std
     eprintln!();
     eprintln!("=== TEARDOWN ===");
 
+    // The combined-site runner creates its three Kind clusters through Forge,
+    // but older Forge state may not retain those cluster records. Remove the
+    // exact run-owned cluster names first so their Docker endpoints cannot
+    // prevent Forge from removing the run network. Missing clusters are safe.
+    for site in CLUSTERS {
+        let kind_name = combined_kind_cluster_name(site);
+        let removed = Command::new("timeout")
+            .args(["120s", "kind", "delete", "cluster", "--name", &kind_name])
+            .output()?;
+        if !removed.status.success() {
+            let still_present = kind_cluster_exists(&kind_name)?;
+            if still_present {
+                return Err(format!(
+                    "failed to remove run-owned Kind cluster {kind_name}: {}{}",
+                    String::from_utf8_lossy(&removed.stdout),
+                    String::from_utf8_lossy(&removed.stderr)
+                )
+                .into());
+            }
+            continue;
+        }
+        if kind_cluster_exists(&kind_name)? {
+            return Err(format!("run-owned Kind cluster {kind_name} remains after deletion").into());
+        }
+        eprintln!("  [OK] removed Kind cluster {kind_name}");
+    }
+
     let status = Command::new(&context.forge_bin)
         .args(["down", "--config"])
         .arg(&context.resolved_config)
@@ -6466,6 +7262,29 @@ fn teardown_environment(context: &CombinedSiteContext) -> Result<(), Box<dyn std
 
     eprintln!("  [OK] Environment torn down successfully");
     Ok(())
+}
+
+/// Return the Kind cluster name corresponding to a Forge site.
+fn combined_kind_cluster_name(site: &str) -> String {
+    format!("grid-combined-{site}")
+}
+
+/// Return the kubectl context corresponding to a Forge site.
+fn combined_kubectl_context(site: &str) -> String {
+    format!("kind-{}", combined_kind_cluster_name(site))
+}
+
+/// Check whether a named Kind cluster exists, using a bounded command.
+fn kind_cluster_exists(cluster_name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let listed = Command::new("timeout")
+        .args(["30s", "kind", "get", "clusters"])
+        .output()?;
+    if !listed.status.success() {
+        return Err(format!("kind get clusters failed: {}", String::from_utf8_lossy(&listed.stderr)).into());
+    }
+    Ok(String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .any(|line| line.trim() == cluster_name))
 }
 
 // -----------------------------------------------------------------------------
@@ -6763,6 +7582,47 @@ mod tests {
     }
 
     #[test]
+    fn additional_candidate_ignores_primary_and_other_sites() {
+        let overlay = OverlayData {
+            resource_version: "1".to_owned(),
+            semantic_revision: "revision".to_owned(),
+            stable_ids: BTreeMap::new(),
+            candidates: vec![
+                OverlayCandidate {
+                    kind: "inference_model".to_owned(),
+                    name: PRIMARY_MODEL.to_owned(),
+                    site: "west".to_owned(),
+                    cluster: "vcr-west-provider".to_owned(),
+                    stable_id: "primary-west".to_owned(),
+                },
+                OverlayCandidate {
+                    kind: "inference_model".to_owned(),
+                    name: PRIMARY_MODEL.to_owned(),
+                    site: "central".to_owned(),
+                    cluster: "vcr-central-provider".to_owned(),
+                    stable_id: "primary-central".to_owned(),
+                },
+                OverlayCandidate {
+                    kind: "inference_model".to_owned(),
+                    name: PRIMARY_MODEL.to_owned(),
+                    site: "west".to_owned(),
+                    cluster: "vcr-west-provider".to_owned(),
+                    stable_id: "secondary-west".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            additional_candidate_stable_id(&overlay, "west", PRIMARY_MODEL, "primary-west").as_deref(),
+            Some("secondary-west")
+        );
+        assert_eq!(
+            additional_candidate_stable_id(&overlay, "central", PRIMARY_MODEL, "primary-central"),
+            None
+        );
+    }
+
+    #[test]
     fn proof_success_creation() {
         let mut facts = BTreeMap::new();
         facts.insert("cluster_count".to_owned(), serde_json::Value::Number(3.into()));
@@ -6863,7 +7723,7 @@ mod tests {
             "swim_convergence",
             "external_provider_absence",
             "overlay_acceptance",
-            "local_provider_selection",
+            "round_robin_provider_selection",
             "response_attribution",
             "tls_certificate_validation",
             "authorization_replacement",
@@ -6880,6 +7740,59 @@ mod tests {
     fn cluster_constants() {
         assert_eq!(CLUSTERS.len(), 3);
         assert_eq!(CLUSTERS, &["west", "central", "east"]);
+    }
+
+    fn test_overlay(sites: &[&str]) -> OverlayData {
+        OverlayData {
+            resource_version: "1".to_owned(),
+            semantic_revision: "test-revision".to_owned(),
+            stable_ids: BTreeMap::new(),
+            candidates: sites
+                .iter()
+                .enumerate()
+                .map(|(index, site)| OverlayCandidate {
+                    kind: "inference_model".to_owned(),
+                    name: format!("provider-{site}"),
+                    site: (*site).to_owned(),
+                    cluster: format!("cluster-{index}"),
+                    stable_id: format!("stable-{index}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn accepted_provider_sites_come_from_overlay_candidates() {
+        let overlay = test_overlay(&["west", "central", "east", "west"]);
+        assert_eq!(
+            accepted_provider_sites(&overlay),
+            BTreeSet::from(["central".to_owned(), "east".to_owned(), "west".to_owned()])
+        );
+    }
+
+    #[test]
+    fn round_robin_sequence_accepts_any_repeating_cycle() {
+        let eligible = BTreeSet::from(["central".to_owned(), "east".to_owned(), "west".to_owned()]);
+        let valid = ["east", "west", "central", "east", "west", "central"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let invalid = ["east", "west", "east", "west", "east", "west"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(is_round_robin_sequence(&valid, &eligible));
+        assert!(!is_round_robin_sequence(&invalid, &eligible));
+    }
+
+    #[test]
+    fn round_robin_sequence_rejects_unknown_provider() {
+        let eligible = BTreeSet::from(["west".to_owned(), "east".to_owned()]);
+        let sequence = ["west", "east", "unknown", "west"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(!is_round_robin_sequence(&sequence, &eligible));
     }
 
     #[test]
@@ -6914,6 +7827,99 @@ mod tests {
                     }]
                 }
             })
+        );
+    }
+
+    #[test]
+    fn curl_client_overrides_are_restricted_and_long_lived() {
+        let actual: serde_json::Value =
+            serde_json::from_str(&curl_client_pod_overrides("stable-client")).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            actual
+                .pointer("/spec/securityContext/runAsNonRoot")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            actual
+                .pointer("/spec/securityContext/seccompProfile/type")
+                .and_then(serde_json::Value::as_str),
+            Some("RuntimeDefault")
+        );
+        assert_eq!(
+            actual
+                .pointer("/spec/containers/0/command")
+                .and_then(serde_json::Value::as_array),
+            serde_json::json!(["sleep", STABLE_CLIENT_LIFETIME_SECS]).as_array()
+        );
+        assert_eq!(
+            actual
+                .pointer("/spec/containers/0/securityContext/runAsUser")
+                .and_then(serde_json::Value::as_u64),
+            Some(100)
+        );
+        assert_eq!(
+            actual
+                .pointer("/spec/containers/0/securityContext/allowPrivilegeEscalation")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn client_names_are_unique_and_dns_safe() {
+        let first = unique_client_name("Rollout Client/West");
+        let second = unique_client_name("Rollout Client/West");
+        assert_ne!(first, second);
+        assert!(first.len() <= 42);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+    }
+
+    #[test]
+    fn kind_cluster_and_context_names_are_distinct() {
+        assert_eq!(combined_kind_cluster_name("west"), "grid-combined-west");
+        assert_eq!(combined_kubectl_context("west"), "kind-grid-combined-west");
+        assert_ne!(combined_kind_cluster_name("west"), combined_kubectl_context("west"));
+    }
+
+    #[test]
+    fn response_status_ignores_kubectl_lifecycle_text() {
+        let output = b"pod/probe created\nHTTP/1.1 401 Unauthorized\ncontent-type: text/plain\npod \"probe\" deleted\n";
+        assert_eq!(response_status(output), Some(401));
+    }
+
+    #[test]
+    fn primary_attribution_requires_all_trusted_headers() {
+        let valid = b"HTTP/1.1 200 OK\r\nx-grid-combined-provider-gateway: west\r\nx-ai-demo-provider-gateway: west\r\nx-ai-inference-provider: vcr-backend\r\n";
+        let missing =
+            b"HTTP/1.1 200 OK\r\nx-grid-combined-provider-gateway: west\r\nx-ai-inference-provider: vcr-backend\r\n";
+        assert!(primary_response_is_trusted(valid));
+        assert!(!primary_response_is_trusted(missing));
+    }
+
+    #[test]
+    fn response_status_reads_only_http_status_lines() {
+        let output = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\nHTTP/1.1 503 body text";
+        assert_eq!(response_status(output), Some(200));
+        assert_eq!(response_status(b"curl: (28) timeout"), None);
+    }
+
+    #[test]
+    fn provider_attribution_requires_two_matching_trusted_headers() {
+        let output =
+            b"HTTP/1.1 200 OK\r\nx-grid-combined-provider-gateway: central\r\nx-ai-demo-provider-gateway: central\r\n";
+        assert_eq!(response_status(output), Some(200));
+        assert_eq!(
+            response_header(output, "x-grid-combined-provider-gateway").as_deref(),
+            Some("central")
+        );
+        assert_eq!(
+            response_header(output, "x-ai-demo-provider-gateway").as_deref(),
+            Some("central")
         );
     }
 
@@ -7245,6 +8251,51 @@ spec:
         assert!(with_both.contains("Qwen/Qwen3-0.6B"), "secondary route must be present",);
         assert!(with_both.contains("gpt-4o-mini"), "external route must be preserved",);
         assert!(with_both.contains("Qwen/Qwen3-0.6B"), "primary route must be preserved",);
+    }
+
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "test assertions on the fixed-shape YAML fixture")]
+    fn append_secondary_consumer_config_clones_forge_gateway_settings() {
+        let config = r#"
+filter_chains:
+  - name: main
+    filters:
+      - filter: intelligent_route
+        provider_hop_clusters: [vcr-west-provider]
+      - filter: load_balancer
+        clusters:
+          - name: vcr-west-provider
+            endpoints: ["captured-ip:8443"]
+            tls:
+              sni: west.grid.internal
+admin:
+  address: 127.0.0.1:9901
+"#;
+        let rendered = append_secondary_consumer_config(config).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+        let filters = &value["filter_chains"][0]["filters"];
+        assert_eq!(filters[0]["provider_hop_clusters"].as_sequence().unwrap().len(), 2);
+        let clusters = filters[1]["clusters"].as_sequence().unwrap();
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[1]["name"].as_str(), Some("vcr-west-provider-secondary"));
+        assert_eq!(clusters[1]["endpoints"][0].as_str(), Some("captured-ip:8443"));
+        assert_eq!(clusters[1]["tls"]["sni"].as_str(), Some("west.grid.internal"));
+    }
+
+    #[test]
+    fn ai_revision_from_logs_reads_latest_exact_field() {
+        let logs = r#"
+overlay reloaded accepted_revision=old serving_revision=old
+overlay reloaded accepted_revision="new" serving_revision="new" previous_serving_revision="old"
+"#;
+        assert_eq!(ai_revision_from_logs(logs, "accepted_revision"), Some("new".to_owned()));
+        assert_eq!(ai_revision_from_logs(logs, "serving_revision"), Some("new".to_owned()));
+    }
+
+    #[test]
+    fn ai_revision_from_logs_does_not_match_previous_serving_revision() {
+        let logs = "overlay reloaded previous_serving_revision=old";
+        assert_eq!(ai_revision_from_logs(logs, "serving_revision"), None);
     }
 
     #[test]

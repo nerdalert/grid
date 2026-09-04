@@ -11,7 +11,7 @@ cargo xtask env run-grid-glb-demo \
 ```
 
 The default configuration pulls
-`ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3`, which contains the
+`ghcr.io/praxis-proxy/ai:0.3.0`, which contains the
 `intelligent_route`, `provider_route`, and `credential_inject` filters used by
 this topology. A local AI build must be selected explicitly:
 

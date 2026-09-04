@@ -6,8 +6,8 @@ FAIL=0
 KIND_CLUSTER=""
 
 OPERATOR_IMAGE="ghcr.io/praxis-proxy/grid-operator"
-OPERATOR_TAG="${GRID_OPERATOR_CI_TAG:-v0.1.3}"
-DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
+OPERATOR_TAG="${GRID_OPERATOR_CI_TAG:-v0.1.4}"
+DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.3.0"
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -192,7 +192,7 @@ echo "  Praxis Gateway Chart ($GW_DIR)"
 echo "======================================================================"
 
 # Common required argument for the gateway chart. The image intentionally uses
-# the chart default so this path validates the released Grid rollup contract.
+# the chart default so this path validates the official Praxis AI contract.
 GW_REQ=(--set config.existingConfigMap=test-config)
 
 # ── Helm lint ────────────────────────────────────────────────────────

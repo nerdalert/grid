@@ -4,9 +4,9 @@ replicaCount: 1
 # -- Gateway container image settings.
 image:
   # -- Image repository.
-  repository: ghcr.io/praxis-proxy/grid-ai-rollup
+  repository: ghcr.io/praxis-proxy/ai
   # -- Image tag. Used when digest is empty.
-  tag: "v0.1.3"
+  tag: "0.3.0"
   # -- Immutable image digest (sha256:<64 hex>). When set, tag is ignored.
   digest: ""
   # -- Image pull policy.
