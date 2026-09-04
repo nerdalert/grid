@@ -64,7 +64,7 @@ AI image; these values may advance independently.
 | `commonLabels` | object | `{}` | Labels added to all resources. |
 | `podLabels` | object | `{}` | Additional pod labels. Selector labels cannot be overridden. |
 | `podAnnotations` | object | `{}` | Pod annotations. |
-| `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
+| `podSecurityContext` | object | `{runAsUser: 100, runAsGroup: 101}` | Pod-level securityContext matching the official Praxis AI 0.3.0 image; override the IDs for a compatible image or an OpenShift-assigned UID range. |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
 | `config.existingConfigMap` | string | **required** | Name of an existing ConfigMap with the Praxis config. |
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
@@ -103,14 +103,33 @@ AI image; these values may advance independently.
 
 ## Security
 
-The chart enforces Kubernetes restricted security defaults:
+The chart enforces Kubernetes restricted security defaults and defaults to the
+numeric identity used by the official Praxis AI 0.3.0 image (`praxis:praxis`,
+UID 100, GID 101). Numeric IDs are required because Kubernetes cannot verify
+that a named image user is non-root when `runAsNonRoot: true` is set.
 
-- `runAsNonRoot: true` (no fixed UID)
+- `runAsNonRoot: true`
+- `runAsUser: 100`, `runAsGroup: 101` (official AI 0.3.0 defaults)
 - `readOnlyRootFilesystem: true`
 - `allowPrivilegeEscalation: false`
 - All Linux capabilities dropped
 - `seccompProfile.type: RuntimeDefault`
 - `automountServiceAccountToken: false`
+
+For a compatible image with a different non-root identity, override
+`podSecurityContext.runAsUser` and `podSecurityContext.runAsGroup`. On OpenShift,
+allow the restricted SCC to assign IDs from the namespace range by clearing the
+fixed defaults:
+
+```yaml
+podSecurityContext:
+  runAsUser: null
+  runAsGroup: null
+```
+
+The chart then omits those fields while retaining `runAsNonRoot` and the other
+restricted controls. Do not disable `runAsNonRoot`, add capabilities, or enable
+privilege escalation.
 
 When overlay-sync is enabled, the pod uses a dedicated ServiceAccount, but
 automatic token mounting remains disabled. A short-lived projected token is

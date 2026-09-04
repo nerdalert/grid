@@ -214,6 +214,29 @@ if grep -Fq "image: ${DEFAULT_GATEWAY_IMAGE}" /tmp/helm-rendered-gateway.yaml; t
 else
   fail "gateway default image is not ${DEFAULT_GATEWAY_IMAGE}"
 fi
+DEFAULT_SECURITY=$(helm template verify-gw-security "$GW_DIR" "${GW_REQ[@]}" \
+  --namespace grid-system --show-only templates/deployment.yaml 2>/dev/null)
+if echo "$DEFAULT_SECURITY" | grep -q '^        runAsUser: 100$' && \
+   echo "$DEFAULT_SECURITY" | grep -q '^        runAsGroup: 101$' && \
+   echo "$DEFAULT_SECURITY" | grep -q '^            runAsNonRoot: true$' && \
+   echo "$DEFAULT_SECURITY" | grep -q '^            allowPrivilegeEscalation: false$' && \
+   echo "$DEFAULT_SECURITY" | grep -q '^                - ALL$'; then
+  pass "gateway default identity matches official AI 0.3.0 (100:101) with restricted controls"
+else
+  fail "gateway default identity/security context does not match official AI 0.3.0"
+fi
+OPENSHIFT_SECURITY=$(helm template verify-gw-openshift "$GW_DIR" "${GW_REQ[@]}" \
+  --namespace grid-system \
+  --set podSecurityContext.runAsUser=null \
+  --set podSecurityContext.runAsGroup=null \
+  --show-only templates/deployment.yaml 2>/dev/null)
+if ! echo "$OPENSHIFT_SECURITY" | grep -q '^        runAsUser:' && \
+   ! echo "$OPENSHIFT_SECURITY" | grep -q '^        runAsGroup:' && \
+   echo "$OPENSHIFT_SECURITY" | grep -q '^        runAsNonRoot: true$'; then
+  pass "gateway fixed identity can be cleared for OpenShift-assigned IDs"
+else
+  fail "gateway OpenShift identity override did not preserve the expected security context"
+fi
 
 # ── Variant renderings ──────────────────────────────────────────────
 try_template "$GW_DIR" "edge gateway" "${GW_REQ[@]}" \

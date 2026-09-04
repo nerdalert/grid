@@ -27,11 +27,14 @@ podLabels: {}
 # -- Annotations on the gateway pod template.
 podAnnotations: {}
 
-# -- Extra pod-level securityContext fields (e.g. runAsUser, runAsGroup).
-# runAsNonRoot and seccompProfile are always set by the chart.
-podSecurityContext: {}
-# runAsUser: 100
-# runAsGroup: 101
+# -- Pod-level securityContext fields. Defaults match the official Praxis AI
+# 0.3.0 image (`praxis:praxis`, UID 100, GID 101) so Kubernetes can verify
+# runAsNonRoot before creating the container. Override these IDs for a
+# compatible image or a platform such as OpenShift that assigns a namespace
+# UID range. runAsNonRoot and seccompProfile remain chart-owned.
+podSecurityContext:
+  runAsUser: 100
+  runAsGroup: 101
 
 # -- Container arguments. Defaults to the config file path.
 args:
