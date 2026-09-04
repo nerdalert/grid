@@ -127,7 +127,7 @@ pub(crate) struct HttpResult {
 }
 
 /// One overlay routing candidate as published by the operator.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct OverlayCandidate {
     /// Provider site of the candidate.
     pub(crate) site: String,
@@ -138,7 +138,7 @@ pub(crate) struct OverlayCandidate {
 }
 
 /// A parsed, validated routing overlay for one consumer gateway.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct OverlayView {
     /// Content-addressed overlay revision.
     pub(crate) revision: String,
@@ -899,20 +899,199 @@ fn validate_overlay(view: &OverlayView) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// Wait until both consumer overlays converge on three valid candidates.
-fn await_overlay_convergence() -> Result<Overlays, Box<dyn std::error::Error>> {
-    poll_until(Duration::from_secs(240), Duration::from_secs(5), || {
-        let mut views: Overlays = BTreeMap::new();
-        for gateway in CONSUMERS {
-            match read_overlay(gateway).and_then(|view| validate_overlay(&view).map(|()| view)) {
-                Ok(view) => {
-                    views.insert(gateway.to_owned(), view);
-                },
-                Err(_) => return Ok(None),
+/// A single consumer gateway's convergence observation.
+struct ConsumerObservation {
+    /// Consumer gateway release name.
+    gateway: String,
+    /// Parsed accepted overlay from the Grid `ConfigMap`, when readable.
+    overlay: Option<OverlayView>,
+    /// Praxis-reported accepted revision from the gateway log, if present.
+    praxis_accepted: Option<String>,
+    /// Praxis-reported serving revision from the gateway log, if present.
+    praxis_serving: Option<String>,
+}
+
+/// Strip ANSI SGR (CSI) sequences emitted by the gateway tracing subscriber.
+fn strip_csi_sgr(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' {
+            if chars.next() == Some('[') {
+                for final_byte in chars.by_ref() {
+                    if final_byte.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
             }
+        } else {
+            output.push(character);
         }
-        Ok(Some(views))
-    })
+    }
+    output
+}
+
+/// Return the latest exact `field=value` from logs.
+///
+/// The `field=` prefix must sit at a whitespace boundary, so `serving_revision`
+/// never matches inside `previous_serving_revision` or `retained_serving_revision`.
+/// Both quoted (`field="v"`) and unquoted (`field=v`) values are supported.
+fn latest_log_field(logs: &str, field: &str) -> Option<String> {
+    let prefix = format!("{field}=");
+    logs.lines()
+        .rev()
+        .find_map(|line| {
+            line.match_indices(&prefix).find_map(|(index, _)| {
+                let at_boundary = index == 0
+                    || line
+                        .get(..index)
+                        .and_then(|value| value.chars().next_back())
+                        .is_some_and(char::is_whitespace);
+                if !at_boundary {
+                    return None;
+                }
+                let value = line.get(index + prefix.len()..)?;
+                let parsed = value.strip_prefix('"').map_or_else(
+                    || value.split_whitespace().next().unwrap_or(""),
+                    |quoted| quoted.split('"').next().unwrap_or(""),
+                );
+                Some(parsed.to_owned())
+            })
+        })
+        .filter(|value| !value.is_empty())
+}
+
+/// Read a consumer gateway's Praxis-reported `(accepted, serving)` revisions.
+fn consumer_praxis_revisions(gateway: &str) -> (Option<String>, Option<String>) {
+    let context = context_for("west");
+    let deployment = format!("deployment/{gateway}");
+    let args = [
+        "--context",
+        &context,
+        "-n",
+        NAMESPACE,
+        "logs",
+        &deployment,
+        "-c",
+        "praxis",
+        "--tail=400",
+    ];
+    let logs = match spawn_timed("kubectl", &args, 30) {
+        Ok(output) if output.status.success() => strip_csi_sgr(&String::from_utf8_lossy(&output.stdout)),
+        _ => return (None, None),
+    };
+    (
+        latest_log_field(&logs, "accepted_revision"),
+        latest_log_field(&logs, "serving_revision"),
+    )
+}
+
+/// Observe one consumer: its accepted overlay plus Praxis accepted/serving revisions.
+fn observe_consumer(gateway: &str) -> ConsumerObservation {
+    let (praxis_accepted, praxis_serving) = consumer_praxis_revisions(gateway);
+    ConsumerObservation {
+        gateway: gateway.to_owned(),
+        overlay: read_overlay(gateway).ok(),
+        praxis_accepted,
+        praxis_serving,
+    }
+}
+
+/// Observe every consumer gateway once.
+fn observe_consumers() -> Vec<ConsumerObservation> {
+    CONSUMERS.iter().map(|gateway| observe_consumer(gateway)).collect()
+}
+
+/// First 12 characters of a revision, for compact diagnostics.
+fn short_rev(value: &str) -> &str {
+    value.get(..value.len().min(12)).unwrap_or(value)
+}
+
+/// Decide whether every consumer is serving the exact accepted Grid revision.
+///
+/// Returns the validated overlays and the shared revision only when, for both
+/// consumers: the overlay is valid, the Grid revision is nonempty, and Praxis's
+/// accepted and serving revisions both equal it — and both consumers share one
+/// current revision.
+fn convergence_ready(observations: &[ConsumerObservation]) -> Option<(Overlays, String)> {
+    if observations.len() != CONSUMERS.len() {
+        return None;
+    }
+    let mut overlays: Overlays = BTreeMap::new();
+    let mut revisions: Vec<String> = Vec::new();
+    for observation in observations {
+        let overlay = observation.overlay.as_ref()?;
+        validate_overlay(overlay).ok()?;
+        let grid = overlay.revision.as_str();
+        if grid.is_empty()
+            || observation.praxis_accepted.as_deref() != Some(grid)
+            || observation.praxis_serving.as_deref() != Some(grid)
+        {
+            return None;
+        }
+        overlays.insert(observation.gateway.clone(), overlay.clone());
+        revisions.push(grid.to_owned());
+    }
+    let first = revisions.first()?;
+    revisions
+        .iter()
+        .all(|revision| revision == first)
+        .then(|| (overlays, first.clone()))
+}
+
+/// Compact per-consumer last-observed revisions for timeout diagnostics.
+fn convergence_diagnostics(observations: &[ConsumerObservation]) -> String {
+    observations
+        .iter()
+        .map(|observation| {
+            let grid = observation
+                .overlay
+                .as_ref()
+                .map_or("none", |overlay| overlay.revision.as_str());
+            let accepted = observation.praxis_accepted.as_deref().unwrap_or("none");
+            let serving = observation.praxis_serving.as_deref().unwrap_or("none");
+            format!(
+                "{}[grid={} praxis_accepted={} praxis_serving={}]",
+                observation.gateway,
+                short_rev(grid),
+                short_rev(accepted),
+                short_rev(serving)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Gate traffic until both consumer gateways are serving the exact overlay
+/// revision Grid accepted.
+///
+/// State-based polling (no fixed success sleep): requires, for both consumers,
+/// a valid three-candidate overlay whose Grid revision equals Praxis's accepted
+/// and serving revisions, with both consumers on one shared revision, held
+/// stable across one poll before returning. On timeout it reports each
+/// consumer's last observed Grid/accepted/serving revisions.
+fn await_overlay_convergence() -> Result<Overlays, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let mut pending: Option<String> = None;
+    loop {
+        let observations = observe_consumers();
+        if let Some((overlays, revision)) = convergence_ready(&observations) {
+            if pending.as_deref() == Some(revision.as_str()) {
+                return Ok(overlays);
+            }
+            pending = Some(revision);
+        } else {
+            pending = None;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "consumers did not reach a stable serving revision matching Grid within 240s: {}",
+                convergence_diagnostics(&observations)
+            )
+            .into());
+        }
+        std::thread::park_timeout(Duration::from_secs(5));
+    }
 }
 
 /// Build a passed/failed scenario result.
@@ -1836,6 +2015,101 @@ mod tests {
             candidates: Vec::new(),
         };
         validate_overlay(&view).unwrap_err();
+    }
+
+    fn gate_overlay(revision: &str) -> OverlayView {
+        OverlayView {
+            revision: revision.into(),
+            selection_policy: "roundRobin".into(),
+            candidates: CLUSTERS
+                .iter()
+                .map(|site| OverlayCandidate {
+                    site: (*site).into(),
+                    stable_id: format!("id-{site}"),
+                    selection_group: 0,
+                })
+                .collect(),
+        }
+    }
+
+    fn gate_observation(gateway: &str, grid: &str, accepted: &str, serving: &str) -> ConsumerObservation {
+        ConsumerObservation {
+            gateway: gateway.into(),
+            overlay: Some(gate_overlay(grid)),
+            praxis_accepted: Some(accepted.into()),
+            praxis_serving: Some(serving.into()),
+        }
+    }
+
+    #[test]
+    fn serving_gate_ready_on_exact_accepted_serving_match() {
+        let observations = vec![
+            gate_observation(CONSUMER_A, "revA", "revA", "revA"),
+            gate_observation(CONSUMER_B, "revA", "revA", "revA"),
+        ];
+        let (overlays, revision) = convergence_ready(&observations).unwrap();
+        assert_eq!(revision, "revA");
+        assert_eq!(overlays.len(), 2);
+    }
+
+    #[test]
+    fn serving_gate_not_ready_when_one_consumer_serves_older_revision() {
+        let observations = vec![
+            gate_observation(CONSUMER_A, "revA", "revA", "revA"),
+            gate_observation(CONSUMER_B, "revA", "revA", "revOLD"),
+        ];
+        assert!(convergence_ready(&observations).is_none());
+    }
+
+    #[test]
+    fn serving_gate_not_ready_when_consumers_serve_different_revisions() {
+        let observations = vec![
+            gate_observation(CONSUMER_A, "rev1", "rev1", "rev1"),
+            gate_observation(CONSUMER_B, "rev2", "rev2", "rev2"),
+        ];
+        assert!(convergence_ready(&observations).is_none());
+    }
+
+    #[test]
+    fn latest_log_field_handles_ansi_colored_output() {
+        let raw = "\x1b[32mserving_revision=abc123\x1b[0m";
+        let logs = strip_csi_sgr(raw);
+        assert_eq!(latest_log_field(&logs, "serving_revision").as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn latest_log_field_handles_quoted_and_unquoted_values() {
+        assert_eq!(
+            latest_log_field("accepted_revision=plain rest", "accepted_revision").as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            latest_log_field("accepted_revision=\"quoted value\"", "accepted_revision").as_deref(),
+            Some("quoted value")
+        );
+    }
+
+    #[test]
+    fn latest_log_field_rejects_previous_serving_revision_false_match() {
+        let line = "previous_serving_revision=OLD serving_revision=NEW retained_serving_revision=KEEP";
+        assert_eq!(latest_log_field(line, "serving_revision").as_deref(), Some("NEW"));
+        assert_eq!(
+            latest_log_field(line, "previous_serving_revision").as_deref(),
+            Some("OLD")
+        );
+    }
+
+    #[test]
+    fn timeout_diagnostics_include_both_consumer_revisions() {
+        let observations = vec![
+            gate_observation(CONSUMER_A, "revAaaaa", "revAaaaa", "revAaaaa"),
+            gate_observation(CONSUMER_B, "revBbbbb", "revBbbbb", "revBstale"),
+        ];
+        let diagnostics = convergence_diagnostics(&observations);
+        assert!(diagnostics.contains(CONSUMER_A));
+        assert!(diagnostics.contains(CONSUMER_B));
+        assert!(diagnostics.contains("revAaaaa"));
+        assert!(diagnostics.contains("revBstale"));
     }
 
     #[test]
