@@ -14,7 +14,7 @@ use serde::Serialize;
 use super::{
     DemoMode, GlbDemoModeOptions, GlbDemoOptions, IngressMode, certs,
     external_provider::{self, ExternalProviderDescriptor},
-    glb, gtm_emulator, image_overrides, kubectl, operator, workload,
+    glb, gtm_emulator, image_overrides, kubectl, operator, safe_truncate_str, workload,
 };
 
 #[cfg(test)]
@@ -1361,27 +1361,6 @@ fn read_overlay_candidates(edge: &str) -> Result<Vec<serde_json::Value>, Box<dyn
     Ok(candidates)
 }
 
-/// Poll until no candidates from `site` appear in the edge overlay.
-fn wait_for_overlay_candidate_absent(edge: &str, site: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + OVERLAY_CONVERGENCE_TIMEOUT;
-    loop {
-        let candidates = read_overlay_candidates(edge)?;
-        let has_site = candidates
-            .iter()
-            .any(|c| c.get("site").and_then(serde_json::Value::as_str) == Some(site));
-        if !has_site {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timeout: {edge} overlay still lists {site} candidates after {OVERLAY_CONVERGENCE_TIMEOUT:?}"
-            )
-            .into());
-        }
-        std::thread::park_timeout(OVERLAY_POLL_INTERVAL);
-    }
-}
-
 /// Poll until at least one candidate from `site` appears in the edge overlay.
 fn wait_for_overlay_candidate_present(edge: &str, site: &str) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + OVERLAY_CONVERGENCE_TIMEOUT;
@@ -1427,23 +1406,40 @@ fn wait_for_rollout(context: &str, name: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-/// Confirm overlay convergence, hot-reload, and remote fallback to a
-/// provider outside the drained site. Returns the fallback provider name.
+/// Confirm overlay convergence, hot-reload, and routing away from the exact
+/// withdrawn backend candidate. A sibling candidate in the same provider
+/// site remains valid; the assertion therefore uses backend attribution, not
+/// only the coarser provider-gateway site name.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fallback proof keeps the serving barrier and bounded request assertion together"
+)]
 fn verify_drain_fallback(
     consumer_edge: &str,
     reload_before: usize,
     narrator: &mut Narrator,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    wait_for_overlay_candidate_absent(consumer_edge, "east-provider")?;
+    let withdrawal_revisions =
+        glb::wait_for_all_edges_withdrawal_serving_revisions(&["east-edge", "west-edge"], "east-provider")?;
+    let withdrawal_revision = withdrawal_revisions
+        .get(consumer_edge)
+        .ok_or_else(|| format!("missing withdrawal revision for {consumer_edge}"))?;
     narrator.narrate(&format!(
-        "  [OK] {consumer_edge} overlay no longer lists east-provider candidates"
+        "  [OK] {consumer_edge} serves withdrawal revision {} with no east-provider candidates",
+        safe_truncate_str(withdrawal_revision, 16)
     ));
 
     glb::check_hot_reload_observed(consumer_edge, reload_before)?;
     narrator.narrate(&format!("  [OK] {consumer_edge} gateway reloaded overlay after drain"));
 
-    let resp = glb::wait_for_data_plane_convergence("remote fallback routing", || {
-        let resp = workload::send_workload_request(consumer_edge, WORKLOAD_REQUEST_BODY, None)?;
+    let resp = glb::wait_for_data_plane_convergence("post-withdrawal routing", || {
+        let session = format!(
+            "withdrawal-proof-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        );
+        let resp = workload::send_workload_request(consumer_edge, WORKLOAD_REQUEST_BODY, Some(&session))?;
         if resp.status != 200 {
             return Err(format!(
                 "remote fallback: {consumer_edge} returned status {} after drain",
@@ -1454,9 +1450,9 @@ fn verify_drain_fallback(
         if resp.provider.is_empty() {
             return Err(format!("remote fallback: {consumer_edge} response missing provider header").into());
         }
-        if !resp.provider.starts_with("west") {
+        if resp.provider == "east-provider" {
             return Err(format!(
-                "remote fallback: {consumer_edge} routed to {}, expected a west-provider identity",
+                "post-withdrawal routing: {consumer_edge} routed to withdrawn backend {}",
                 resp.provider
             )
             .into());
@@ -1725,7 +1721,7 @@ fn restart_grid_operator(cluster: &str) -> Result<(), Box<dyn std::error::Error>
     if !output.status.success() {
         return Err(format!(
             "failed to restart {cluster} Grid operator: {}",
-            super::safe_truncate_str(&String::from_utf8_lossy(&output.stderr), 160)
+            safe_truncate_str(&String::from_utf8_lossy(&output.stderr), 160)
         )
         .into());
     }

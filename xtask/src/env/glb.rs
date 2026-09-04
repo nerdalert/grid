@@ -1566,6 +1566,12 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, res
         return;
     }
 
+    // Workload mode has no global ingress or GTM path. Its direct withdrawal
+    // and fallback proof runs in glb_demo with workload-specific attribution.
+    if ingress_mode == IngressMode::Workload {
+        return;
+    }
+
     // Session affinity initial bind.
     proof_banner("checking session affinity bind");
     let provider_a = match check_session_bind(EDGE_PORT) {
@@ -1830,6 +1836,7 @@ fn check_backend_network_policy(mode: IngressMode) -> Result<String, Box<dyn std
     let mut evidence = Vec::new();
     for provider in PROVIDER_CLUSTERS {
         let context = kubectl_context(provider);
+        load_network_probe_image(provider)?;
         let backends: &[(&str, &str)] = if *provider == "east-provider" {
             &[
                 ("primary", "vcr-inference.grid-system.svc.cluster.local:8000"),
@@ -1849,6 +1856,30 @@ fn check_backend_network_policy(mode: IngressMode) -> Result<String, Box<dyn std
         }
     }
     Ok(evidence.join("; "))
+}
+
+/// Load the restricted probe image before using `imagePullPolicy: Never`.
+fn load_network_probe_image(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cluster = format!("{CLUSTER_PREFIX}-{provider}");
+    let output = Command::new("timeout")
+        .args([
+            "120s",
+            "kind",
+            "load",
+            "docker-image",
+            "curlimages/curl:8.10.1",
+            "--name",
+            &cluster,
+        ])
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "failed to load network-policy probe image into {cluster}: {}",
+        safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240)
+    )
+    .into())
 }
 
 /// Prove network and credential rejection behavior for one private backend.
@@ -3322,6 +3353,81 @@ fn verify_edge_accepted_revision(edge: &str, revision: &str) -> Result<(), Box<d
     )
 }
 
+/// Maximum time to wait for an edge to serve a withdrawal revision.
+const EDGE_SERVING_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Poll until the edge accepts and serves `revision` in two consecutive
+/// observations without a pod replacement or container restart.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded serving barrier keeps polling, identity, and diagnostic state together"
+)]
+pub(crate) fn verify_edge_serving_revision(edge: &str, revision: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + EDGE_SERVING_TIMEOUT;
+    let initial = edge_pod_identity(edge)?;
+    let mut stable_observations = 0_u8;
+    loop {
+        let observation = edge_serving_observation(edge)?;
+        let current = observation.identity;
+        let logs = observation.logs;
+        let last = observation.last;
+        if current.uid != initial.uid || current.restart_count != initial.restart_count {
+            return Err(format!(
+                "{edge} edge pod changed while waiting for serving revision {}; initial uid/restarts={}/{}, observed={}/{}, {}",
+                safe_truncate_str(revision, 16),
+                safe_truncate_str(&initial.uid, 12),
+                initial.restart_count,
+                safe_truncate_str(&current.uid, 12),
+                current.restart_count,
+                last,
+            )
+            .into());
+        }
+        if logs_prove_serving(&logs, revision) {
+            stable_observations = stable_observations.saturating_add(1);
+            if stable_observations >= 2 {
+                return Ok(());
+            }
+        } else {
+            stable_observations = 0;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{edge} did not serve revision {} within {EDGE_SERVING_TIMEOUT:?}; last observed {}",
+                safe_truncate_str(revision, 16),
+                last
+            )
+            .into());
+        }
+        thread::park_timeout(EDGE_ACCEPTANCE_POLL);
+    }
+}
+
+/// A single atomic observation of edge identity and revision log state.
+struct EdgeServingObservation {
+    /// Pod identity and restart state observed alongside the logs.
+    identity: EdgePodIdentity,
+    /// Gateway logs used to prove accepted and serving revisions.
+    logs: String,
+    /// Sanitized revision summary retained for timeout diagnostics.
+    last: String,
+}
+
+/// Read one complete edge observation for the serving-revision barrier.
+fn edge_serving_observation(edge: &str) -> Result<EdgeServingObservation, Box<dyn std::error::Error>> {
+    let logs = edge_gateway_logs(edge)?;
+    let last = format!(
+        "accepted_revision={} serving_revision={}",
+        extract_last_accepted_revision(&logs).unwrap_or_else(|| "none".to_owned()),
+        extract_last_serving_revision(&logs).unwrap_or_else(|| "none".to_owned())
+    );
+    Ok(EdgeServingObservation {
+        identity: edge_pod_identity(edge)?,
+        logs,
+        last,
+    })
+}
+
 /// Testable core of the edge acceptance barrier.
 ///
 /// `log_source` is injected so unit tests can supply synthetic logs without
@@ -3361,9 +3467,18 @@ fn wait_for_edge_revision_acceptance(
 /// must appear as an exact quoted value, not as a substring of a longer field
 /// or an unrelated context.
 fn logs_prove_acceptance(logs: &str, revision: &str) -> bool {
-    logs.lines().any(|line| {
+    strip_csi_sgr(logs).lines().any(|line| {
         (line.contains("overlay snapshot initialized") || line.contains("overlay reloaded"))
             && accepted_revision_from_line(line) == Some(revision)
+    })
+}
+
+/// Check whether one log line proves the exact accepted and serving revision.
+fn logs_prove_serving(logs: &str, revision: &str) -> bool {
+    strip_csi_sgr(logs).lines().any(|line| {
+        (line.contains("overlay snapshot initialized") || line.contains("overlay reloaded"))
+            && accepted_revision_from_line(line) == Some(revision)
+            && serving_revision_from_line(line) == Some(revision)
     })
 }
 
@@ -3423,6 +3538,14 @@ fn extract_last_accepted_revision(logs: &str) -> Option<String> {
     logs.lines()
         .rev()
         .find_map(accepted_revision_from_line)
+        .map(str::to_owned)
+}
+
+/// Extract the most recent exact `serving_revision` value from logs.
+fn extract_last_serving_revision(logs: &str) -> Option<String> {
+    logs.lines()
+        .rev()
+        .find_map(serving_revision_from_line)
         .map(str::to_owned)
 }
 
@@ -4049,20 +4172,38 @@ fn wait_for_candidate_admission(
     Err(format!("timeout waiting for {provider} admission_state={expected} on {edge}; observed={observed:?}").into())
 }
 
-/// Wait until an unavailable provider is absent from the edge overlay.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "synchronous polling in xtask; no async runtime is active"
-)]
-fn wait_for_candidate_absent(edge: &str, provider: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + PROVIDER_STATE_WAIT;
-    while Instant::now() < deadline {
-        if overlay_candidate(edge, provider)?.is_none() {
-            return Ok(format!("provider={provider} absent from operator-rendered overlay"));
-        }
-        thread::sleep(Duration::from_secs(1));
+/// Wait until the withdrawn provider is absent and the edge serves that exact
+/// projected overlay revision.
+pub(crate) fn wait_for_withdrawal_serving_revision(
+    edge: &str,
+    provider: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    wait_for_check(
+        "withdrawal overlay candidate removal",
+        EDGE_SERVING_TIMEOUT,
+        EDGE_ACCEPTANCE_POLL,
+        || {
+            if overlay_candidate(edge, provider)?.is_some() {
+                return Err(format!("{edge} still contains withdrawn provider {provider}").into());
+            }
+            let revision = overlay_revision(edge)?;
+            verify_edge_serving_revision(edge, &revision)?;
+            Ok(revision)
+        },
+    )
+}
+
+/// Require every edge in the request path to serve its own withdrawn overlay.
+pub(crate) fn wait_for_all_edges_withdrawal_serving_revisions(
+    edges: &[&str],
+    provider: &str,
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let mut revisions = BTreeMap::new();
+    for edge in edges {
+        let revision = wait_for_withdrawal_serving_revision(edge, provider)?;
+        revisions.insert((*edge).to_owned(), revision);
     }
-    Err(format!("timeout waiting for {provider} removal from {edge} overlay").into())
+    Ok(revisions)
 }
 
 /// Return the `InferenceProvider` resource for one demo provider identity.
@@ -4343,8 +4484,8 @@ fn withdraw_provider(edge: &str, provider: &str) -> Result<(String, ProviderWith
         scale_provider_backend(provider, 0)?;
         refresh_provider(provider)?;
         let phase = wait_for_provider_phase(provider, "Unavailable")?;
-        let overlay = wait_for_candidate_absent(edge, provider)?;
-        Ok(format!("{phase}; {overlay}"))
+        let overlays = wait_for_all_edges_withdrawal_serving_revisions(EDGE_CLUSTERS, provider)?;
+        Ok(format!("{phase}; serving revisions={overlays:?}"))
     })();
     match result {
         Ok(evidence) => Ok((evidence, state)),
@@ -4484,12 +4625,17 @@ fn parse_header_dump(text: &str) -> BTreeMap<String, String> {
     map
 }
 
-/// Extract the `X-AI-Demo-Provider-Gateway` header from a response.
+/// Extract the most specific trusted provider identity from a response.
 fn extract_provider(resp: &verify::HttpResponse) -> Result<String, Box<dyn std::error::Error>> {
+    // Prefer the backend candidate identity when the provider gateway
+    // forwards it.  The gateway-site header is intentionally coarser: one
+    // site can host multiple candidates, so using it for withdrawal checks
+    // would confuse a withdrawn backend with a still-eligible sibling.
     resp.headers
-        .get("x-ai-demo-provider-gateway")
+        .get("x-grid-demo-provider")
+        .or_else(|| resp.headers.get("x-ai-demo-provider-gateway"))
         .cloned()
-        .ok_or_else(|| "missing x-ai-demo-provider-gateway header".into())
+        .ok_or_else(|| "missing provider attribution headers".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -5315,6 +5461,19 @@ clusters:
     }
 
     #[test]
+    fn extract_provider_prefers_backend_candidate_identity() {
+        let resp = verify::HttpResponse {
+            status: 200,
+            body: String::new(),
+            headers: BTreeMap::from([
+                ("x-ai-demo-provider-gateway".to_owned(), "east-provider".to_owned()),
+                ("x-grid-demo-provider".to_owned(), "east-provider-secondary".to_owned()),
+            ]),
+        };
+        assert_eq!(extract_provider(&resp).ok().as_deref(), Some("east-provider-secondary"));
+    }
+
+    #[test]
     fn extract_provider_missing() {
         let resp = verify::HttpResponse {
             status: 200,
@@ -5569,6 +5728,27 @@ clusters:
         let raw = "\x1b[2m2026-07-29T07:07:11Z\x1b[0m \x1b[32m INFO\x1b[0m intelligent_route: overlay reloaded \x1b[3maccepted_revision\x1b[0m\x1b[2m=\x1b[0m\"rev_abc\"";
         let cleaned = strip_csi_sgr(raw);
         assert!(logs_prove_acceptance(&cleaned, "rev_abc"));
+    }
+
+    #[test]
+    fn serving_proof_requires_exact_accepted_and_serving_revision() {
+        let revision = "rev_abc";
+        let matching = format!("overlay reloaded accepted_revision=\"{revision}\" serving_revision=\"{revision}\"");
+        assert!(logs_prove_serving(&matching, revision));
+        assert!(!logs_prove_serving(
+            "overlay reloaded accepted_revision=\"rev_abc\" serving_revision=\"old\"",
+            revision
+        ));
+        assert!(!logs_prove_serving(
+            "overlay reloaded previous_serving_revision=\"rev_abc\"",
+            revision
+        ));
+    }
+
+    #[test]
+    fn serving_proof_accepts_ansi_and_unquoted_fields() {
+        let raw = "\x1b[32moverlay reloaded\x1b[0m \x1b[3maccepted_revision\x1b[0m=rev_abc serving_revision=rev_abc";
+        assert!(logs_prove_serving(raw, "rev_abc"));
     }
 
     #[test]
