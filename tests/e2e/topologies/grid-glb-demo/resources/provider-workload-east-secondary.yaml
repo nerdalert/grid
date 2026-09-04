@@ -31,6 +31,8 @@ spec:
           image: "{{ cluster.properties.vcrImage }}"
           imagePullPolicy: "{{ cluster.properties.imagePullPolicy }}"
           env:
+            - name: MOCK_PROVIDER_SITE
+              value: "east-provider-secondary"
             - name: MODEL
               value: "Qwen/Qwen3-0.6B"
             - name: MOCK_PD_ROLE
@@ -52,6 +54,11 @@ spec:
           ports:
             - name: http
               containerPort: 8000
+          args:
+            - --provider
+            - openai
+            - --port
+            - "8000"
           readinessProbe:
             httpGet:
               path: /health
@@ -60,7 +67,7 @@ spec:
             periodSeconds: 5
           startupProbe:
             httpGet:
-              path: /v1/models
+              path: /health
               port: 8000
             periodSeconds: 10
             failureThreshold: 60
