@@ -19,6 +19,7 @@ pub(crate) mod operator;
 pub(crate) mod operator_overlay;
 pub(crate) mod provider_traffic_qualification;
 pub(crate) mod providers;
+pub(crate) mod single_cluster_multi_gateway_qualification;
 pub(crate) mod token_rate_limit_qualification;
 pub(crate) mod trust;
 pub(crate) mod verify;
@@ -1022,6 +1023,22 @@ pub(crate) enum Action {
         options: GlbDemoOptions,
     },
 
+    /// Qualify multiple consumer and provider gateways in one Kind cluster.
+    RunGridSingleClusterMultiGatewayQualification {
+        /// Path to the single-cluster Forge topology.
+        #[arg(
+            long,
+            default_value = "tests/e2e/topologies/grid-single-cluster-multi-gateway/forge.yaml"
+        )]
+        forge_config: PathBuf,
+        /// Keep the cluster after the qualification.
+        #[arg(long)]
+        keep: bool,
+        /// Evidence output directory.
+        #[arg(long)]
+        evidence_dir: Option<PathBuf>,
+    },
+
     /// Run the distributed token-rate-limit topology with structured evidence.
     RunGridTokenRateLimitQualification {
         /// Path to the Forge environment config file.
@@ -1170,6 +1187,18 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::RunGridProviderTrafficQualification { forge_config, options } => {
             provider_traffic_qualification::run(forge_config, options)
         },
+        Action::RunGridSingleClusterMultiGatewayQualification {
+            forge_config,
+            keep,
+            evidence_dir,
+        } => single_cluster_multi_gateway_qualification::run(
+            forge_config,
+            &single_cluster_multi_gateway_qualification::Options {
+                forge_config: forge_config.clone(),
+                keep: *keep,
+                evidence_dir: evidence_dir.clone(),
+            },
+        ),
         Action::RunGridTokenRateLimitQualification {
             forge_config,
             evidence_dir,

@@ -52,6 +52,9 @@
   proves shared identity-scoped quota enforcement across gateway replicas,
   regional provider selection, expiry, restart persistence, fail-closed state
   storage, and storage-network isolation.
+- [Single-cluster Multi-gateway Qualification](../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md) -
+  proves shared overlay delivery and independent consumer/provider gateway
+  behavior within one Kind cluster and one GridSite.
 
 These integration tests create their environments through Forge and execute
 through first-class Rust `xtask` commands. Their topology READMEs document

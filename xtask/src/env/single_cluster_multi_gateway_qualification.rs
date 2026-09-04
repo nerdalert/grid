@@ -1,0 +1,1200 @@
+//! Single-cluster, multi-gateway integration qualification.
+//!
+//! This qualification deliberately keeps all provider and consumer processes
+//! in one Kind cluster. It proves the shared Kubernetes/overlay boundary while
+//! recording that round-robin cursors remain local to each consumer process.
+
+#![allow(
+    clippy::missing_docs_in_private_items,
+    reason = "internal evidence model is documented by its serialized schema"
+)]
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use serde::Serialize;
+
+const TOPOLOGY: &str = "tests/e2e/topologies/grid-single-cluster-multi-gateway/forge.yaml";
+const CLUSTER: &str = "single";
+const CLUSTER_PREFIX: &str = "grid-single-cluster-multi-gateway";
+const NAMESPACE: &str = "grid-system";
+const QUALIFICATION_TIMEOUT: Duration = Duration::from_secs(180);
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Names used by the Forge, Kind, Kubernetes, and Docker layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClusterIdentity {
+    forge_cluster: &'static str,
+    kind_cluster: String,
+    kubectl_context: String,
+    node_container: String,
+}
+
+fn cluster_identity() -> ClusterIdentity {
+    let kind_cluster = format!("{CLUSTER_PREFIX}-{CLUSTER}");
+    ClusterIdentity {
+        forge_cluster: CLUSTER,
+        kubectl_context: format!("kind-{kind_cluster}"),
+        node_container: format!("{kind_cluster}-control-plane"),
+        kind_cluster,
+    }
+}
+
+/// CLI options for the single-cluster qualification.
+#[derive(Debug, clap::Args)]
+pub(crate) struct Options {
+    /// Forge topology to deploy.
+    #[arg(long, default_value = TOPOLOGY)]
+    pub(crate) forge_config: PathBuf,
+    /// Keep the cluster after the run for debugging.
+    #[arg(long)]
+    pub(crate) keep: bool,
+    /// Evidence directory. Defaults to a timestamped ignored directory.
+    #[arg(long)]
+    pub(crate) evidence_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct Scenario {
+    name: String,
+    result: String,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct Evidence {
+    schema_version: u8,
+    result: String,
+    topology: String,
+    cluster: String,
+    source_revision: String,
+    scenarios: Vec<Scenario>,
+    observations: BTreeMap<String, serde_json::Value>,
+    cleanup: String,
+}
+
+struct Cleanup {
+    forge: PathBuf,
+    config: PathBuf,
+    enabled: bool,
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        if self.enabled {
+            drop(
+                Command::new(&self.forge)
+                    .args(["down", "--config"])
+                    .arg(&self.config)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status(),
+            );
+        }
+    }
+}
+
+fn timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or_else(|_| "unknown".to_owned(), |d| d.as_secs().to_string())
+}
+
+fn evidence_path(config: &Path, requested: Option<&Path>, run: &str) -> PathBuf {
+    requested.map_or_else(
+        || {
+            config
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("evidence")
+                .join(format!("single-cluster-multi-gateway-{run}"))
+        },
+        Path::to_path_buf,
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded process setup, polling, collection, and timeout handling stay together"
+)]
+fn command_output(command: &mut Command, timeout: Duration) -> Result<Output, String> {
+    let description = format!("{command:?}");
+    let stdout_file = tempfile::NamedTempFile::new().map_err(|error| format!("stdout temp file: {error}"))?;
+    let stderr_file = tempfile::NamedTempFile::new().map_err(|error| format!("stderr temp file: {error}"))?;
+    let stdout_path = stdout_file.path().to_owned();
+    let stderr_path = stderr_file.path().to_owned();
+    command.stdout(
+        stdout_file
+            .as_file()
+            .try_clone()
+            .map_err(|error| format!("clone stdout handle: {error}"))?,
+    );
+    command.stderr(
+        stderr_file
+            .as_file()
+            .try_clone()
+            .map_err(|error| format!("clone stderr handle: {error}"))?,
+    );
+    let mut child: Child = command
+        .spawn()
+        .map_err(|error| format!("spawn {description}: {error}"))?;
+    let started = Instant::now();
+    loop {
+        match child
+            .try_wait()
+            .map_err(|error| format!("wait {description}: {error}"))?
+        {
+            Some(_) => {
+                let status = child
+                    .wait()
+                    .map_err(|error| format!("collect {description}: {error}"))?;
+                return Ok(Output {
+                    status,
+                    stdout: fs::read(stdout_path).map_err(|error| format!("read stdout {description}: {error}"))?,
+                    stderr: fs::read(stderr_path).map_err(|error| format!("read stderr {description}: {error}"))?,
+                });
+            },
+            None if started.elapsed() >= timeout => {
+                drop(child.kill());
+                drop(child.wait());
+                return Err(format!("timeout after {timeout:?}: {description}"));
+            },
+            None => thread::park_timeout(Duration::from_millis(100)),
+        }
+    }
+}
+
+fn kubectl(args: &[&str]) -> Result<Output, String> {
+    let mut command = Command::new("kubectl");
+    let identity = cluster_identity();
+    command.args(["--context", identity.kubectl_context.as_str()]);
+    command.args(args);
+    command_output(&mut command, QUALIFICATION_TIMEOUT)
+}
+
+/// Run kubectl with owned arguments for operations containing dynamic values.
+fn kubectl_owned(args: &[String]) -> Result<Output, String> {
+    let mut command = Command::new("kubectl");
+    let identity = cluster_identity();
+    command.args(["--context", identity.kubectl_context.as_str()]);
+    command.args(args);
+    command_output(&mut command, QUALIFICATION_TIMEOUT)
+}
+
+/// Scale a deployment and wait for its observed state to settle.
+fn scale_deployment(name: &str, replicas: u32) -> Result<(), String> {
+    let args = vec![
+        "-n".to_owned(),
+        NAMESPACE.to_owned(),
+        "scale".to_owned(),
+        format!("deployment/{name}"),
+        format!("--replicas={replicas}"),
+    ];
+    let output = kubectl_owned(&args)?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let started = Instant::now();
+    loop {
+        let value = json_kubectl(&["-n", NAMESPACE, "get", "deployment", name, "-o", "json"])?;
+        let current = value
+            .get("status")
+            .and_then(|item| item.get("readyReplicas"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if current == u64::from(replicas) {
+            return Ok(());
+        }
+        if started.elapsed() >= QUALIFICATION_TIMEOUT {
+            return Err(format!(
+                "deployment/{name} did not reach readyReplicas={replicas}; last={current}"
+            ));
+        }
+        thread::park_timeout(POLL_INTERVAL);
+    }
+}
+
+/// Capture the operator's current Grid and overlay resources.
+fn capture_grid_state() -> Result<serde_json::Value, String> {
+    let networks = json_kubectl(&["-n", NAMESPACE, "get", "gridnetworks", "-o", "json"])?;
+    let sites = json_kubectl(&["-n", NAMESPACE, "get", "gridsites", "-o", "json"])?;
+    let providers = json_kubectl(&["-n", NAMESPACE, "get", "inferenceproviders", "-o", "json"])?;
+    let overlays = json_kubectl(&["-n", NAMESPACE, "get", "configmaps", "-o", "json"])?;
+    Ok(serde_json::json!({
+        "gridNetworks": networks.get("items").cloned().unwrap_or(serde_json::Value::Null),
+        "gridSites": sites.get("items").cloned().unwrap_or(serde_json::Value::Null),
+        "inferenceProviders": providers.get("items").cloned().unwrap_or(serde_json::Value::Null),
+        "configMaps": overlays.get("items").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+/// Images required by the topology's `Never` pull policy.
+const QUALIFICATION_IMAGES: [&str; 4] = [
+    "grid-operator:single-cluster-qualification",
+    "grid-overlay-sync:single-cluster-qualification",
+    "praxis-ai:single-cluster-qualification",
+    "ghcr.io/neuralmagic/vllm-vcr:vllm0.23",
+];
+
+/// Match a Docker reference against the repository and tag columns from `crictl`.
+fn node_has_image(listing: &str, image: &str) -> bool {
+    let (repository, tag) = image.rsplit_once(':').unwrap_or((image, "latest"));
+    listing.lines().any(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        fields.first().is_some_and(|repository_field| {
+            (*repository_field == repository || *repository_field == format!("docker.io/library/{repository}"))
+                && fields.get(1).is_some_and(|tag_field| *tag_field == tag)
+        })
+    })
+}
+
+/// Discover the Docker node name for a Kind cluster.
+fn discover_node(kind_cluster: &str) -> Result<String, String> {
+    let output = Command::new("kind")
+        .args(["get", "nodes", "--name", kind_cluster])
+        .output()
+        .map_err(|error| format!("discover Kind nodes: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "kind get nodes failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("Kind cluster {kind_cluster} has no discovered nodes"))
+}
+
+/// Load and verify every local image before any Forge stack is applied.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each image is inspected, loaded, and verified before deployment"
+)]
+fn load_and_verify_images() -> Result<(), String> {
+    let identity = cluster_identity();
+    let node = discover_node(&identity.kind_cluster)?;
+    for image in QUALIFICATION_IMAGES {
+        let mut inspect = Command::new("docker");
+        inspect.args(["image", "inspect", image]);
+        let output = command_output(&mut inspect, Duration::from_secs(30))?;
+        if !output.status.success() {
+            return Err(format!("required local image is missing: {image}"));
+        }
+        let mut load = Command::new("kind");
+        load.args(["load", "docker-image", image, "--name", &identity.kind_cluster]);
+        let load_output = command_output(&mut load, QUALIFICATION_TIMEOUT)?;
+        if !load_output.status.success() {
+            return Err(format!(
+                "failed loading {image}: {}",
+                String::from_utf8_lossy(&load_output.stderr).trim()
+            ));
+        }
+        let mut verify = Command::new("docker");
+        verify.args(["exec", &node, "crictl", "images"]);
+        let verify_output = verify
+            .output()
+            .map_err(|error| format!("verify image {image}: {error}"))?;
+        let listing = String::from_utf8_lossy(&verify_output.stdout);
+        if !verify_output.status.success() || !node_has_image(&listing, image) {
+            return Err(format!(
+                "Kind node does not contain exact image reference {image}; status={}, stdout={listing}, stderr={}",
+                verify_output.status,
+                String::from_utf8_lossy(&verify_output.stderr)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Apply one Forge stack and preserve its complete bounded result.
+fn apply_stack(forge: &str, config: &Path, stack: &str, evidence_dir: &Path) -> Result<(), String> {
+    let started = timestamp();
+    let mut command = Command::new(forge);
+    command.args([
+        "--config",
+        config.to_str().unwrap_or_default(),
+        "--non-interactive",
+        "stack",
+        "apply",
+        CLUSTER,
+        stack,
+    ]);
+    let output = command_output(&mut command, QUALIFICATION_TIMEOUT)?;
+    let finished = timestamp();
+    let status = if output.status.success() { "PASS" } else { "FAIL" };
+    let record = format!(
+        "stack: {stack}\nstart: {started}\nend: {finished}\nstatus: {status}\n\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    fs::write(evidence_dir.join(format!("stack-{stack}.txt")), record).map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("stack {stack} failed"))
+    }
+}
+
+/// Run `forge up` with bounded process-tree termination and live pipe draining.
+fn forge_up(forge: &str, config: &Path, evidence_dir: &Path) -> Result<(), String> {
+    let config_arg = config.to_string_lossy().into_owned();
+    let mut command = Command::new("timeout");
+    command.args([
+        "--signal=TERM",
+        "--kill-after=10s",
+        &format!("{}s", QUALIFICATION_TIMEOUT.as_secs()),
+        forge,
+        "--config",
+        &config_arg,
+        "--non-interactive",
+        "up",
+    ]);
+    let output = command
+        .output()
+        .map_err(|error| format!("spawn bounded forge up: {error}"))?;
+    let record = format!(
+        "forge up\nstatus: {}\n\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    fs::write(evidence_dir.join("forge-up.txt"), record).map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("bounded forge up failed or timed out: {}", output.status))
+    }
+}
+
+/// Capture setup-boundary diagnostics without exposing kubeconfig or secrets.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the setup failure record intentionally captures each boundary in one place"
+)]
+fn capture_setup_diagnostics(evidence_dir: &Path) {
+    let identity = cluster_identity();
+    let commands = [
+        ("kind-clusters.txt", "kind", vec!["get", "clusters"]),
+        (
+            "kind-nodes.txt",
+            "kind",
+            vec!["get", "nodes", "--name", identity.kind_cluster.as_str()],
+        ),
+        (
+            "node-state.json",
+            "kubectl",
+            vec![
+                "--context",
+                identity.kubectl_context.as_str(),
+                "get",
+                "nodes",
+                "-o",
+                "json",
+            ],
+        ),
+        (
+            "docker-network.json",
+            "docker",
+            vec!["network", "inspect", "grid-single-cluster-multi-gateway-net"],
+        ),
+        ("process-tree.txt", "ps", vec!["-eo", "pid,ppid,stat,etime,cmd"]),
+        (
+            "docker-node-inspect.json",
+            "docker",
+            vec!["inspect", identity.node_container.as_str()],
+        ),
+    ];
+    for (name, program, args) in commands {
+        let mut command = Command::new(program);
+        command.args(args);
+        let output = command_output(&mut command, Duration::from_secs(15));
+        let text = output.map_or_else(
+            |error| format!("command failed: {error}"),
+            |item| {
+                format!(
+                    "status: {}\n{}{}",
+                    item.status,
+                    String::from_utf8_lossy(&item.stdout),
+                    String::from_utf8_lossy(&item.stderr)
+                )
+            },
+        );
+        drop(fs::write(evidence_dir.join(name), text));
+    }
+}
+
+/// Run a command in the long-lived restricted qualification client.
+fn client_command(args: &[&str]) -> Result<Output, String> {
+    let mut command = Command::new("kubectl");
+    let identity = cluster_identity();
+    command.args(["--context", identity.kubectl_context.as_str()]);
+    command.args(["-n", NAMESPACE, "exec", "qualification-client", "--"]);
+    command.args(args);
+    command_output(&mut command, QUALIFICATION_TIMEOUT)
+}
+
+/// Issue one attributed request through a consumer gateway.
+fn attributed_request(consumer: &str, request_id: u32) -> Result<String, String> {
+    // Consumer services expose the client-facing HTTP listener on 8080. The
+    // 8443 listener is used by provider gateways for their mTLS hop.
+    let service = format!("http://{consumer}.grid-system.svc.cluster.local:8080/v1/chat/completions");
+    let body = format!(
+        r#"{{"model":"Qwen/Qwen3-0.6B","messages":[{{"role":"user","content":"qualification-{request_id}"}}],"max_tokens":4}}"#
+    );
+    let args = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "10",
+        "--dump-header",
+        "/dev/stderr",
+        "--header",
+        "Content-Type: application/json",
+        "--header",
+        "Authorization: Bearer qualification-token",
+        "--data",
+        body.as_str(),
+        service.as_str(),
+    ];
+    let output = client_command(&args)?;
+    if !output.status.success() {
+        return Err(format!(
+            "{consumer} request failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// Extract the selected provider from the trusted response header.
+fn selected_provider(headers: &str) -> Result<String, String> {
+    headers
+        .lines()
+        .find_map(|line| line.strip_prefix("x-ai-demo-provider-gateway: "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("response did not contain trusted provider attribution: {headers}"))
+}
+
+/// Parse the routing overlay for one consumer from captured `ConfigMaps`.
+fn consumer_overlay(state: &serde_json::Value, consumer: &str) -> Result<serde_json::Value, String> {
+    state
+        .get("configMaps")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("metadata")
+                    .and_then(|metadata| metadata.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name.contains(consumer))
+                    && item
+                        .get("data")
+                        .and_then(|data| data.get("routing-overlay.json"))
+                        .is_some()
+            })
+        })
+        .and_then(|item| item.get("data"))
+        .and_then(|data| data.get("routing-overlay.json"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("routing overlay ConfigMap for {consumer} was not found"))
+        .and_then(|raw| {
+            serde_json::from_str(raw).map_err(|error| format!("invalid {consumer} routing overlay: {error}"))
+        })
+}
+
+/// Read the latest accepted and serving revisions reported by a consumer.
+fn consumer_revisions(consumer: &str) -> Result<(String, String), String> {
+    let args = vec![
+        "-n".to_owned(),
+        NAMESPACE.to_owned(),
+        "logs".to_owned(),
+        format!("deployment/{consumer}"),
+        "--all-containers=true".to_owned(),
+    ];
+    let output = kubectl_owned(&args)?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read {consumer} logs: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let raw_logs = String::from_utf8_lossy(&output.stdout);
+    let logs = strip_ansi(&raw_logs);
+    let field = |name: &str| {
+        logs.lines().rev().find_map(|line| {
+            line.split_whitespace()
+                .find_map(|part| part.strip_prefix(&format!("{name}=")))
+                .map(|value| value.trim_matches('"').to_owned())
+        })
+    };
+    let accepted = field("accepted_revision").ok_or_else(|| format!("{consumer} has no accepted_revision log"))?;
+    let serving = field("serving_revision").ok_or_else(|| format!("{consumer} has no serving_revision log"))?;
+    Ok((accepted, serving))
+}
+
+/// Remove terminal CSI sequences emitted by the structured log formatter.
+fn strip_ansi(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut sequence = false;
+    for character in input.chars() {
+        if sequence {
+            if character.is_ascii_alphabetic() {
+                sequence = false;
+            }
+        } else if character == '\x1b' {
+            sequence = true;
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+/// Assert that both consumers serve the same accepted candidate snapshot.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the overlay contract is validated as one atomic evidence boundary"
+)]
+fn assert_overlay_contract(state: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let overlays = ["consumer-gateway-a", "consumer-gateway-b"]
+        .into_iter()
+        .map(|consumer| consumer_overlay(state, consumer).map(|overlay| (consumer, overlay)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let revisions = overlays
+        .iter()
+        .map(|(consumer, overlay)| {
+            overlay
+                .get("revision")
+                .and_then(|revision| revision.get("value"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{consumer} overlay has no content revision"))
+        })
+        .map(|revision| revision.map(str::to_owned))
+        .collect::<Result<Vec<_>, _>>()?;
+    let [first_revision, second_revision] = revisions.as_slice() else {
+        return Err(format!("expected two consumer revisions, got {revisions:?}"));
+    };
+    if first_revision != second_revision {
+        return Err(format!("consumer overlays disagree: {revisions:?}"));
+    }
+    let mut candidate_sets = Vec::new();
+    for (consumer, overlay) in overlays {
+        let candidates = overlay
+            .get("overlay")
+            .and_then(|item| item.get("candidates"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("{consumer} overlay has no candidates"))?;
+        let ids = candidates
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .get("cluster")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| format!("{consumer} candidate has no cluster identity"))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if ids
+            != BTreeSet::from([
+                "vcr-provider-a-provider",
+                "vcr-provider-b-provider",
+                "vcr-provider-c-provider",
+            ])
+        {
+            return Err(format!("{consumer} candidates are {ids:?}"));
+        }
+        candidate_sets.push(serde_json::json!({"consumer": consumer, "revision": first_revision, "candidates": ids}));
+    }
+    Ok(serde_json::Value::Array(candidate_sets))
+}
+
+/// Require both consumers to report the exact revision accepted by Grid.
+fn assert_serving_revisions(state: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut evidence = Vec::new();
+    for consumer in ["consumer-gateway-a", "consumer-gateway-b"] {
+        let overlay = consumer_overlay(state, consumer)?;
+        let expected = overlay
+            .get("revision")
+            .and_then(|revision| revision.get("value"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("{consumer} overlay has no revision"))?;
+        let (accepted, serving) = consumer_revisions(consumer)?;
+        if accepted != expected || serving != expected {
+            return Err(format!(
+                "{consumer} revision mismatch: expected={expected}, accepted={accepted}, serving={serving}"
+            ));
+        }
+        evidence.push(serde_json::json!({
+            "consumer": consumer,
+            "expected": expected,
+            "accepted": accepted,
+            "serving": serving,
+        }));
+    }
+    Ok(serde_json::Value::Array(evidence))
+}
+
+/// Wait until both consumer overlays contain exactly the requested provider set.
+#[expect(
+    clippy::too_many_lines,
+    reason = "polling keeps candidate state and last error together"
+)]
+fn wait_for_candidate_set(expected: &BTreeSet<&str>) -> Result<serde_json::Value, String> {
+    let started = Instant::now();
+    let mut last_error = "no overlay observed".to_owned();
+    loop {
+        if let Ok(state) = capture_grid_state() {
+            let mut ready = true;
+            for consumer in ["consumer-gateway-a", "consumer-gateway-b"] {
+                match consumer_overlay(&state, consumer).and_then(|overlay| {
+                    let candidates = overlay
+                        .get("overlay")
+                        .and_then(|item| item.get("candidates"))
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| format!("{consumer} has no candidates"))?;
+                    let ids = candidates
+                        .iter()
+                        .filter_map(|candidate| candidate.get("cluster").and_then(serde_json::Value::as_str))
+                        .collect::<BTreeSet<_>>();
+                    if &ids == expected {
+                        Ok(())
+                    } else {
+                        Err(format!("{consumer} candidates: {ids:?}"))
+                    }
+                }) {
+                    Ok(()) => {},
+                    Err(error) => {
+                        ready = false;
+                        last_error = error;
+                    },
+                }
+            }
+            if ready {
+                return Ok(state);
+            }
+        }
+        if started.elapsed() >= QUALIFICATION_TIMEOUT {
+            return Err(format!("overlay candidate set did not converge; last={last_error}"));
+        }
+        thread::park_timeout(POLL_INTERVAL);
+    }
+}
+
+/// Verify that the restricted client cannot bypass the provider gateway.
+fn direct_backend_probe() -> Result<bool, String> {
+    let output = client_command(&[
+        "curl",
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--max-time",
+        "5",
+        "http://vcr-inference-provider-a.grid-system.svc.cluster.local:8000/health",
+    ])?;
+    Ok(!output.status.success())
+}
+
+fn json_kubectl(args: &[&str]) -> Result<serde_json::Value, String> {
+    let output = kubectl(args)?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| format!("invalid kubectl JSON: {error}"))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "readiness polling keeps the last observed resource contract together"
+)]
+fn wait_deployment(name: &str) -> Result<(), String> {
+    let started = Instant::now();
+    let args = ["-n", NAMESPACE, "get", "deployment", name, "-o", "json"];
+    loop {
+        if started.elapsed() >= QUALIFICATION_TIMEOUT {
+            return Err(format!(
+                "deployment/{name} did not become ready; last state unavailable"
+            ));
+        }
+        if let Ok(value) = json_kubectl(&args) {
+            let desired = value
+                .get("spec")
+                .and_then(|item| item.get("replicas"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let ready = value
+                .get("status")
+                .and_then(|item| item.get("readyReplicas"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let observed = value
+                .get("status")
+                .and_then(|item| item.get("observedGeneration"))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1);
+            let generation = value
+                .get("metadata")
+                .and_then(|item| item.get("generation"))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-2);
+            if desired > 0 && ready >= desired && observed >= generation {
+                return Ok(());
+            }
+        }
+        thread::park_timeout(POLL_INTERVAL);
+    }
+}
+
+fn scenario(name: &str, result: &str, detail: impl Into<String>) -> Scenario {
+    Scenario {
+        name: name.to_owned(),
+        result: result.to_owned(),
+        detail: detail.into(),
+    }
+}
+
+/// Run the qualification.
+#[expect(
+    clippy::too_many_lines,
+    reason = "qualification phases are intentionally visible in execution order"
+)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "the runner's ordered phase control flow is the qualification contract"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the qualification keeps bounded scenario and observation state together for final evidence"
+)]
+pub(crate) fn run(forge_config: &Path, options: &Options) -> Result<(), Box<dyn std::error::Error>> {
+    let run = timestamp();
+    let evidence_dir = evidence_path(forge_config, options.evidence_dir.as_deref(), &run);
+    fs::create_dir_all(&evidence_dir)?;
+    let forge = super::glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?;
+    let source_revision = Command::new("git").args(["rev-parse", "HEAD"]).output().map_or_else(
+        |_| "unknown".to_owned(),
+        |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+    );
+    let mut cleanup = Cleanup {
+        forge: forge.clone().into(),
+        config: forge_config.to_path_buf(),
+        enabled: !options.keep,
+    };
+    let mut scenarios = Vec::new();
+    let mut observations = BTreeMap::new();
+    let identity = cluster_identity();
+    observations.insert(
+        "cluster_identity".to_owned(),
+        serde_json::json!({
+            "forgeCluster": identity.forge_cluster,
+            "kindCluster": identity.kind_cluster,
+            "kubectlContext": identity.kubectl_context,
+            "nodeContainer": identity.node_container,
+        }),
+    );
+
+    let up_result = forge_up(&forge, forge_config, &evidence_dir);
+    if let Err(error) = &up_result {
+        capture_setup_diagnostics(&evidence_dir);
+        scenarios.push(scenario("forge-up", "BLOCKED", error.clone()));
+    }
+    if up_result.is_ok() {
+        let images_ready = match load_and_verify_images() {
+            Ok(()) => {
+                scenarios.push(scenario(
+                    "image-loading",
+                    "PASS",
+                    "all required local image references were loaded and verified in the Kind node",
+                ));
+                true
+            },
+            Err(error) => {
+                capture_setup_diagnostics(&evidence_dir);
+                scenarios.push(scenario("image-loading", "FAIL", error));
+                false
+            },
+        };
+        let mut stacks_ready = images_ready;
+        for stack in images_ready
+            .then_some([
+                "metallb",
+                "tls-bootstrap",
+                "provider-a-operator-base",
+                "vcr-backend",
+                "provider-a-site",
+                "provider-gateway-a",
+                "provider-gateway-b",
+                "provider-gateway-c",
+                "consumer-gateway-a",
+                "consumer-gateway-b",
+            ])
+            .into_iter()
+            .flatten()
+        {
+            match apply_stack(&forge, forge_config, stack, &evidence_dir) {
+                Ok(()) => scenarios.push(scenario(format!("stack/{stack}").as_str(), "PASS", "stack completed")),
+                Err(error) => {
+                    stacks_ready = false;
+                    let last_state = capture_grid_state().unwrap_or(serde_json::Value::Null);
+                    observations.insert(format!("timeout_state_{stack}"), last_state);
+                    scenarios.push(scenario(format!("stack/{stack}").as_str(), "FAIL", error));
+                    break;
+                },
+            }
+        }
+        for deployment in stacks_ready
+            .then_some([
+                "grid-operator",
+                "vcr-inference-provider-a",
+                "vcr-inference-provider-b",
+                "vcr-inference-provider-c",
+                "provider-gateway-a",
+                "provider-gateway-b",
+                "provider-gateway-c",
+                "consumer-gateway-a",
+                "consumer-gateway-b",
+            ])
+            .into_iter()
+            .flatten()
+        {
+            match wait_deployment(deployment) {
+                Ok(()) => scenarios.push(scenario(
+                    format!("ready/{deployment}").as_str(),
+                    "PASS",
+                    "observed generation is ready",
+                )),
+                Err(error) => scenarios.push(scenario(format!("ready/{deployment}").as_str(), "FAIL", error)),
+            }
+        }
+        if stacks_ready {
+            match kubectl(&[
+                "wait",
+                "--for=jsonpath={.status.phase}=Running",
+                "pod/qualification-client",
+                "-n",
+                NAMESPACE,
+                "--timeout=120s",
+            ]) {
+                Ok(output) if output.status.success() => scenarios.push(scenario(
+                    "ready/qualification-client",
+                    "PASS",
+                    "restricted long-lived probe pod is Running",
+                )),
+                Ok(output) => scenarios.push(scenario(
+                    "ready/qualification-client",
+                    "FAIL",
+                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                )),
+                Err(error) => scenarios.push(scenario("ready/qualification-client", "FAIL", error)),
+            }
+            if let Ok(value) = json_kubectl(&["-n", NAMESPACE, "get", "deploy", "-o", "json"]) {
+                observations.insert(
+                    "deployments".to_owned(),
+                    value.get("items").cloned().unwrap_or(serde_json::Value::Null),
+                );
+            }
+            if let Ok(value) = json_kubectl(&["-n", NAMESPACE, "get", "endpointslices", "-o", "json"]) {
+                observations.insert(
+                    "endpointslices".to_owned(),
+                    value.get("items").cloned().unwrap_or(serde_json::Value::Null),
+                );
+            }
+            let all_candidates = BTreeSet::from([
+                "vcr-provider-a-provider",
+                "vcr-provider-b-provider",
+                "vcr-provider-c-provider",
+            ]);
+            match wait_for_candidate_set(&all_candidates).and_then(|state| {
+                let contract = assert_overlay_contract(&state)?;
+                observations.insert("overlay_contract".to_owned(), contract);
+                Ok(state)
+            }) {
+                Ok(state) => {
+                    observations.insert("grid_state_bootstrap".to_owned(), state);
+                    scenarios.push(scenario(
+                        "overlay-and-serving-revision",
+                        "PASS",
+                        "GridNetwork, GridSite, providers, and generated overlay resources captured after readiness",
+                    ));
+                },
+                Err(error) => scenarios.push(scenario("overlay-and-serving-revision", "FAIL", error)),
+            }
+            match capture_grid_state().and_then(|state| assert_serving_revisions(&state)) {
+                Ok(revisions) => {
+                    observations.insert("serving_revisions".to_owned(), revisions);
+                    scenarios.push(scenario(
+                        "serving-revision-barrier",
+                        "PASS",
+                        "both consumers report the exact Grid overlay revision as accepted and serving",
+                    ));
+                },
+                Err(error) => scenarios.push(scenario("serving-revision-barrier", "FAIL", error)),
+            }
+            let mut request_evidence = BTreeMap::<String, Vec<String>>::new();
+            for consumer in ["consumer-gateway-a", "consumer-gateway-b"] {
+                let mut responses = Vec::new();
+                for request_id in 0..6 {
+                    match attributed_request(consumer, request_id) {
+                        Ok(headers) => responses.push(headers),
+                        Err(error) => responses.push(format!("ERROR: {error}")),
+                    }
+                }
+                request_evidence.insert(consumer.to_owned(), responses);
+            }
+            observations.insert(
+                "attributed_requests".to_owned(),
+                serde_json::to_value(&request_evidence).unwrap_or(serde_json::Value::Null),
+            );
+            let request_failures = request_evidence
+                .values()
+                .flatten()
+                .filter(|item| item.starts_with("ERROR:"))
+                .count();
+            let provider_sequences = request_evidence
+                .iter()
+                .map(|(consumer, responses)| {
+                    responses
+                        .iter()
+                        .map(|headers| selected_provider(headers))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|sequence| (consumer.clone(), sequence))
+                })
+                .collect::<Result<Vec<_>, _>>();
+            observations.insert(
+                "provider_sequences".to_owned(),
+                serde_json::to_value(&provider_sequences).unwrap_or(serde_json::Value::Null),
+            );
+            let sequence_valid = provider_sequences.as_ref().is_ok_and(|sequences| {
+                let expected_rotation = ["provider-a", "provider-b", "provider-c"];
+                sequences.iter().all(|(_, sequence)| {
+                    sequence.len() == 6
+                        && sequence.iter().enumerate().all(|(index, provider)| {
+                            expected_rotation.get(index % expected_rotation.len()) == Some(&provider.as_str())
+                        })
+                })
+            });
+            scenarios.push(if request_failures == 0 && sequence_valid {
+                scenario(
+                    "provider-load-sharing",
+                    "PASS",
+                    "six bounded requests through each consumer followed the independent A/B/C rotation with trusted attribution",
+                )
+            } else {
+                scenario(
+                    "provider-load-sharing",
+                    "FAIL",
+                    format!("{request_failures} requests failed or provider rotation/attribution was invalid"),
+                )
+            });
+            let withdrawal_result = scale_deployment("vcr-inference-provider-b", 0)
+                .and_then(|()| {
+                    let expected = BTreeSet::from(["vcr-provider-a-provider", "vcr-provider-c-provider"]);
+                    wait_for_candidate_set(&expected)
+                })
+                .and_then(|state| {
+                    observations.insert("withdrawal_state".to_owned(), state);
+                    let requests = ["consumer-gateway-a", "consumer-gateway-b"]
+                        .into_iter()
+                        .map(|consumer| {
+                            attributed_request(consumer, 100).and_then(|headers| {
+                                let provider = selected_provider(&headers)?;
+                                if provider == "provider-b" {
+                                    Err("withdrawn provider-b received traffic".to_owned())
+                                } else {
+                                    Ok(headers)
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    observations.insert(
+                        "withdrawal_requests".to_owned(),
+                        serde_json::to_value(requests).unwrap_or(serde_json::Value::Null),
+                    );
+                    scale_deployment("vcr-inference-provider-b", 1)
+                })
+                .and_then(|()| {
+                    let expected = BTreeSet::from([
+                        "vcr-provider-a-provider",
+                        "vcr-provider-b-provider",
+                        "vcr-provider-c-provider",
+                    ]);
+                    wait_for_candidate_set(&expected)
+                })
+                .map(|state| {
+                    observations.insert("restoration_state".to_owned(), state);
+                });
+            scenarios.push(match withdrawal_result {
+                Ok(()) => scenario(
+                    "withdrawal-restoration",
+                    "PASS",
+                    "provider gateway B was withdrawn, traffic continued through both consumers, and B was restored",
+                ),
+                Err(error) => scenario("withdrawal-restoration", "FAIL", error),
+            });
+            let consumer_result = scale_deployment("consumer-gateway-a", 0)
+                .and_then(|()| attributed_request("consumer-gateway-b", 200).map(|_| ()))
+                .and_then(|()| scale_deployment("consumer-gateway-a", 1))
+                .and_then(|()| attributed_request("consumer-gateway-a", 201).map(|_| ()));
+            scenarios.push(match consumer_result {
+                Ok(()) => scenario(
+                    "consumer-failure",
+                    "PASS",
+                    "consumer A was removed and restored while consumer B continued serving",
+                ),
+                Err(error) => scenario("consumer-failure", "FAIL", error),
+            });
+            let concurrent_results = ["consumer-gateway-a", "consumer-gateway-b"]
+                .into_iter()
+                .map(|consumer| {
+                    thread::spawn(move || {
+                        (0..4)
+                            .map(|request_id| {
+                                attributed_request(consumer, 300 + request_id).and_then(|headers| {
+                                    selected_provider(&headers).map(|provider| (request_id, provider))
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .map(|handle| handle.join().unwrap_or_default())
+                .collect::<Vec<_>>();
+            let concurrent_failures = concurrent_results
+                .iter()
+                .flatten()
+                .filter(|result| result.is_err())
+                .count();
+            let concurrent_providers = concurrent_results
+                .iter()
+                .flatten()
+                .filter_map(|result| result.as_ref().ok())
+                .map(|(_, provider)| provider.as_str())
+                .collect::<BTreeSet<_>>();
+            observations.insert(
+                "concurrent_requests".to_owned(),
+                serde_json::to_value(
+                    concurrent_results
+                        .iter()
+                        .map(|results| {
+                            results
+                                .iter()
+                                .map(|result| match result {
+                                    Ok((request_id, provider)) => {
+                                        serde_json::json!({"requestId": request_id, "provider": provider})
+                                    },
+                                    Err(error) => serde_json::json!({"error": error}),
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or(serde_json::Value::Null),
+            );
+            scenarios.push(if concurrent_failures == 0 && concurrent_providers.len() == 3 {
+                scenario(
+                    "concurrent-traffic",
+                    "PASS",
+                    "eight concurrent requests completed through both consumers with trusted attribution to all providers",
+                )
+            } else {
+                scenario(
+                    "concurrent-traffic",
+                    "FAIL",
+                    format!("{concurrent_failures} concurrent requests failed"),
+                )
+            });
+            match direct_backend_probe() {
+                Ok(true) => scenarios.push(scenario(
+                    "security",
+                    "PASS",
+                    "restricted client reached the consumer path while direct provider-backend access was denied",
+                )),
+                Ok(false) => scenarios.push(scenario(
+                    "security",
+                    "FAIL",
+                    "restricted client unexpectedly reached provider backend directly",
+                )),
+                Err(error) => scenarios.push(scenario("security", "FAIL", error)),
+            }
+        }
+    }
+
+    let result = if scenarios.iter().any(|item| item.result == "FAIL") {
+        "FAIL"
+    } else if scenarios.iter().any(|item| item.result == "BLOCKED") {
+        "BLOCKED"
+    } else {
+        "PASS"
+    };
+    let cleanup_result = if options.keep {
+        "kept by request"
+    } else {
+        "scheduled by cleanup guard"
+    };
+    let evidence = Evidence {
+        schema_version: 1,
+        result: result.to_owned(),
+        topology: forge_config.display().to_string(),
+        cluster: cluster_identity().kind_cluster,
+        source_revision,
+        scenarios,
+        observations,
+        cleanup: cleanup_result.to_owned(),
+    };
+    fs::write(evidence_dir.join("results.json"), serde_json::to_vec_pretty(&evidence)?)?;
+    fs::write(
+        evidence_dir.join("SUMMARY.md"),
+        format!("# Single-cluster multi-gateway qualification\n\nResult: **{result}**\n\nEvidence: `results.json`\n"),
+    )?;
+    if !options.keep {
+        let mut down = Command::new(&forge);
+        down.args(["down", "--config"]).arg(forge_config);
+        let output =
+            command_output(&mut down, QUALIFICATION_TIMEOUT).map_err(|error| format!("cleanup failed: {error}"))?;
+        if !output.status.success() {
+            return Err(format!("cleanup failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+        }
+        cleanup.enabled = false;
+    }
+    if result == "PASS" {
+        Ok(())
+    } else {
+        Err(format!("qualification result: {result}; see {}", evidence_dir.display()).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_layers_use_distinct_names() {
+        let identity = cluster_identity();
+        assert_eq!(identity.forge_cluster, "single");
+        assert_eq!(identity.kind_cluster, "grid-single-cluster-multi-gateway-single");
+        assert_eq!(
+            identity.kubectl_context,
+            "kind-grid-single-cluster-multi-gateway-single"
+        );
+        assert_eq!(
+            identity.node_container,
+            "grid-single-cluster-multi-gateway-single-control-plane"
+        );
+        assert!(!identity.node_container.starts_with("kind-"));
+    }
+
+    #[test]
+    fn node_image_matching_accepts_crictl_repository_and_tag_columns() {
+        let listing = "IMAGE TAG IMAGE ID SIZE\ndocker.io/library/grid-operator single-cluster-qualification abc 1MB\n";
+        assert!(node_has_image(listing, "grid-operator:single-cluster-qualification"));
+        assert!(!node_has_image(listing, "grid-operator:other"));
+    }
+}
