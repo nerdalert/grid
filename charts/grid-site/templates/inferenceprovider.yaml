@@ -42,4 +42,11 @@ spec:
   metricsConfig:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with .gatewayRef }}
+  gatewayRef: {{ . | quote }}
+  {{- end }}
+  {{- with .trafficPolicy }}
+  trafficPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 {{- end }}

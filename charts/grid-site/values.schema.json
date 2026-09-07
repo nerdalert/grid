@@ -163,7 +163,13 @@
           "providerKind": { "type": "string", "minLength": 1 },
           "backendKind": { "type": "string", "minLength": 1 },
           "endpoint": { "type": "string", "minLength": 1 },
-          "routingClusterRef": { "type": "string" }
+          "routingClusterRef": { "type": "string" },
+          "gatewayRef": { "type": "string", "minLength": 1 },
+          "trafficPolicy": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "drain": { "type": "boolean", "default": false } }
+          }
         }
       }
     },

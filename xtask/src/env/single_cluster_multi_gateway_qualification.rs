@@ -575,13 +575,38 @@ fn client_command(args: &[&str]) -> Result<Output, String> {
 
 /// Issue one attributed request through a consumer gateway.
 fn attributed_request(consumer: &str, request_id: u32) -> Result<String, String> {
+    attributed_request_once(consumer, request_id, None)
+}
+
+/// Issue one attributed request with an explicit session-affinity key.
+fn attributed_request_with_session(consumer: &str, request_id: u32, session: &str) -> Result<String, String> {
+    attributed_request_once(consumer, request_id, Some(session))
+}
+
+fn attributed_request_once(consumer: &str, request_id: u32, session: Option<&str>) -> Result<String, String> {
+    let args = build_request_args(consumer, request_id, session)?;
+    let references: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = client_command(&references)?;
+    if !output.status.success() {
+        return Err(format!(
+            "{consumer} request failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+fn build_request_args(consumer: &str, request_id: u32, session: Option<&str>) -> Result<Vec<String>, String> {
+    if session.is_some_and(|value| value.chars().any(char::is_control)) {
+        return Err("session ID contains a control character".to_owned());
+    }
     // Consumer services expose the client-facing HTTP listener on 8080. The
     // 8443 listener is used by provider gateways for their mTLS hop.
     let service = format!("http://{consumer}.grid-system.svc.cluster.local:8080/v1/chat/completions");
     let body = format!(
         r#"{{"model":"Qwen/Qwen3-0.6B","messages":[{{"role":"user","content":"qualification-{request_id}"}}],"max_tokens":4}}"#
     );
-    let args = [
+    let mut args = vec![
         "curl",
         "--silent",
         "--show-error",
@@ -593,18 +618,208 @@ fn attributed_request(consumer: &str, request_id: u32) -> Result<String, String>
         "Content-Type: application/json",
         "--header",
         "Authorization: Bearer qualification-token",
-        "--data",
-        body.as_str(),
-        service.as_str(),
-    ];
-    let output = client_command(&args)?;
-    if !output.status.success() {
-        return Err(format!(
-            "{consumer} request failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    if let Some(session) = session {
+        args.extend(["--header".to_owned(), format!("X-Session-Id: {session}")]);
     }
-    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+    args.extend(["--data".to_owned(), body, service]);
+    Ok(args)
+}
+
+#[derive(Debug)]
+struct RetriedProbe {
+    headers: String,
+    attempts: Vec<serde_json::Value>,
+}
+
+/// Retry only transport failures; a received HTTP response is final.
+#[expect(clippy::too_many_lines, reason = "the bounded retry records every probe attempt")]
+fn attributed_request_with_transport_retry(
+    consumer: &str,
+    request_id: u32,
+    session: Option<&str>,
+) -> Result<RetriedProbe, String> {
+    let mut attempts = Vec::new();
+    for attempt in 1..=3 {
+        let result = match session {
+            Some(value) => attributed_request_with_session(consumer, request_id, value),
+            None => attributed_request(consumer, request_id),
+        };
+        match result {
+            Ok(headers) => {
+                attempts.push(retry_evidence(
+                    "provider-attributed-request",
+                    attempt,
+                    true,
+                    http_status(&headers),
+                    None,
+                ));
+                return Ok(RetriedProbe { headers, attempts });
+            },
+            Err(error) => {
+                let status = http_status(&error);
+                let retry = retry_decision(false, status, attempt);
+                attempts.push(retry_evidence(
+                    "provider-attributed-request",
+                    attempt,
+                    false,
+                    status,
+                    None,
+                ));
+                if !retry {
+                    return Err(format!("{error}; attempts={attempts:?}"));
+                }
+            },
+        }
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+fn http_status(output: &str) -> Option<u16> {
+    output.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        matches!(
+            fields.next(),
+            Some("HTTP/1.0" | "HTTP/1.1" | "HTTP/2" | "HTTP/2.0" | "HTTP/3")
+        )
+        .then(|| fields.next()?.parse().ok())?
+    })
+}
+
+fn retry_decision(process_succeeded: bool, status: Option<u16>, attempt: u8) -> bool {
+    !process_succeeded && status.is_none() && attempt < 3
+}
+
+fn retry_reason(process_succeeded: bool, status: Option<u16>, attempt: u8) -> &'static str {
+    if process_succeeded || status.is_some() {
+        "http_response_received"
+    } else if attempt >= 3 {
+        "transport_retry_limit_reached"
+    } else {
+        "transport_without_http_response"
+    }
+}
+
+fn session_id(prefix: &str, consumer: &str, attempt: u32) -> String {
+    format!("{prefix}-{consumer}-{attempt}")
+}
+
+fn restoration_undrain(original_drain: bool) -> bool {
+    !original_drain
+}
+
+fn retry_evidence(
+    scenario: &str,
+    attempt: u8,
+    process_succeeded: bool,
+    status: Option<u16>,
+    provider: Option<&str>,
+) -> serde_json::Value {
+    let retry = retry_decision(process_succeeded, status, attempt);
+    serde_json::json!({
+        "scenario": scenario,
+        "attempt": attempt,
+        "transport": if process_succeeded { "ok" } else { "error" },
+        "http_status": status,
+        "provider": provider,
+        "retry": retry,
+        "retry_reason": retry_reason(process_succeeded, status, attempt),
+        "final": !retry,
+    })
+}
+
+/// Restore providers if a qualification phase fails after mutation.
+struct RestorationGuard {
+    context: String,
+    providers: Vec<(String, bool)>,
+    snapshot_error: Option<String>,
+    active: bool,
+}
+
+impl RestorationGuard {
+    fn new(context: &str, providers: &[&str]) -> Self {
+        let mut snapshot_error = None;
+        let providers = providers
+            .iter()
+            .filter_map(
+                |provider| match super::provider_drain::read_drain_state(context, provider) {
+                    Ok(original) => Some(((*provider).to_owned(), original)),
+                    Err(error) => {
+                        snapshot_error = Some(format!("failed to snapshot {provider} drain state: {error}"));
+                        None
+                    },
+                },
+            )
+            .collect();
+        Self {
+            context: context.to_owned(),
+            providers,
+            snapshot_error,
+            active: true,
+        }
+    }
+
+    fn ensure_snapshot(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.snapshot_error
+            .as_ref()
+            .map_or(Ok(()), |error| Err(error.clone().into()))
+    }
+
+    fn restore(&mut self, network: &str, consumers: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+        for (provider, original) in &self.providers {
+            super::provider_drain::run(
+                &self.context,
+                None,
+                Some(provider),
+                false,
+                restoration_undrain(*original),
+                Duration::from_secs(120),
+                Some(network),
+                consumers,
+            )?;
+        }
+        self.active = false;
+        Ok(())
+    }
+
+    fn finish<T>(
+        &mut self,
+        result: Result<T, Box<dyn std::error::Error>>,
+        network: &str,
+        consumers: &[String],
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let restoration = self.restore(network, consumers);
+        match (result, restoration) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(format!("scenario passed but restoration failed: {error}").into()),
+            (Err(error), Err(restore_error)) => {
+                Err(format!("{error}; restoration also failed: {restore_error}").into())
+            },
+        }
+    }
+}
+
+impl Drop for RestorationGuard {
+    fn drop(&mut self) {
+        if self.active {
+            for (provider, original) in &self.providers {
+                drop(super::provider_drain::run(
+                    &self.context,
+                    None,
+                    Some(provider),
+                    false,
+                    restoration_undrain(*original),
+                    Duration::from_secs(120),
+                    None,
+                    &[],
+                ));
+            }
+        }
+    }
 }
 
 /// Extract the selected provider from the trusted response header.
@@ -616,6 +831,43 @@ fn selected_provider(headers: &str) -> Result<String, String> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| format!("response did not contain trusted provider attribution: {headers}"))
+}
+
+/// Find a stable session currently attributed to the requested provider.
+fn session_for_provider(consumer: &str, provider: &str, prefix: &str) -> Result<String, String> {
+    for attempt in 0..12 {
+        let session = session_id(prefix, consumer, attempt);
+        let headers = attributed_request_with_session(consumer, 450 + attempt, &session)?;
+        if selected_provider(&headers)? == provider {
+            return Ok(session);
+        }
+    }
+    Err(format!(
+        "could not establish affinity session for {consumer} -> {provider}"
+    ))
+}
+
+/// Return the admission state for a candidate in both consumer overlays.
+fn candidate_admission_states(state: &serde_json::Value, candidate: &str) -> Result<Vec<String>, String> {
+    ["consumer-gateway-a", "consumer-gateway-b"]
+        .into_iter()
+        .map(|consumer| {
+            let overlay = consumer_overlay(state, consumer)?;
+            overlay
+                .get("overlay")
+                .and_then(|value| value.get("candidates"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .find(|item| item.get("cluster").and_then(serde_json::Value::as_str) == Some(candidate))
+                })
+                .and_then(|item| item.get("admission_state"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{consumer} overlay has no candidate {candidate}"))
+        })
+        .collect()
 }
 
 /// Parse the routing overlay for one consumer from captured `ConfigMaps`.
@@ -885,6 +1137,18 @@ fn wait_deployment(name: &str) -> Result<(), String> {
     }
 }
 
+/// Restart the operator while a drain is active; the CR remains the source of truth.
+fn restart_operator() -> Result<(), String> {
+    let output = kubectl(&["-n", NAMESPACE, "rollout", "restart", "deployment/grid-operator"])?;
+    if !output.status.success() {
+        return Err(format!(
+            "operator restart failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    wait_deployment("grid-operator")
+}
+
 fn scenario(name: &str, result: &str, detail: impl Into<String>) -> Scenario {
     Scenario {
         name: name.to_owned(),
@@ -1138,6 +1402,212 @@ pub(crate) fn run(forge_config: &Path, options: &Options) -> Result<(), Box<dyn 
                     format!("{request_failures} requests failed or provider rotation/attribution was invalid"),
                 )
             });
+            let drain_context = cluster_identity().kubectl_context;
+            let drain_consumers = ["consumer-gateway-a".to_owned(), "consumer-gateway-b".to_owned()];
+            let individual_drain = {
+                let mut restore = RestorationGuard::new(&drain_context, &["vcr-provider-a-provider"]);
+                let mut existing_session = String::new();
+                let result = restore
+                    .ensure_snapshot()
+                    .and_then(|()| {
+                        session_for_provider("consumer-gateway-a", "provider-a", "existing-individual")
+                            .map_err(Into::into)
+                    })
+                    .map(|session| existing_session = session)
+                    .and_then(|_| {
+                        super::provider_drain::run(
+                            &drain_context,
+                            None,
+                            Some("vcr-provider-a-provider"),
+                            false,
+                            false,
+                            Duration::from_secs(120),
+                            Some("grid-single-cluster-multi-gateway"),
+                            &drain_consumers,
+                        )
+                    })
+                    .and_then(|()| Ok(wait_for_candidate_set(&all_candidates)?))
+                    .and_then(|state| {
+                        let states = candidate_admission_states(&state, "vcr-provider-a-provider")?;
+                        observations.insert("individual_drain_overlay".to_owned(), state);
+                        if states.iter().all(|value| value == "existing_only") {
+                            Ok(())
+                        } else {
+                            Err(format!("individual drain did not produce existing_only: {states:?}").into())
+                        }
+                    })
+                    .and_then(|()| {
+                        let mut new_session_results = Vec::new();
+                        for request_id in 0..4 {
+                            for consumer in ["consumer-gateway-a", "consumer-gateway-b"] {
+                            let session = format!("new-drain-{consumer}-{request_id}");
+                            let RetriedProbe { headers, attempts } =
+                                attributed_request_with_transport_retry(consumer, 500 + request_id, Some(&session))?;
+                                let provider = selected_provider(&headers)?;
+                                if provider == "provider-a" {
+                                    return Err("new session selected individually drained provider-a".into());
+                                }
+                                new_session_results.push(serde_json::json!({
+                                    "consumer": consumer,
+                                "session": format!("new-drain-{consumer}-{request_id}"),
+                                "provider": provider,
+                                "attempts": attempts,
+                                }));
+                            }
+                        }
+                        observations.insert(
+                            "individual_drain_new_sessions".to_owned(),
+                            serde_json::Value::Array(new_session_results),
+                        );
+                        Ok(())
+                    })
+                    .and_then(|()| {
+                    let RetriedProbe { headers, attempts } = attributed_request_with_transport_retry(
+                        "consumer-gateway-a",
+                        550,
+                        Some(&existing_session),
+                    )?;
+                        let provider = selected_provider(&headers)?;
+                        observations.insert(
+                            "individual_drain_existing_session".to_owned(),
+                        serde_json::json!({"session": existing_session, "provider": provider, "headers": headers, "attempts": attempts}),
+                        );
+                        if provider == "provider-a" {
+                            Ok(())
+                        } else {
+                            Err("existing affinity session did not remain on provider-a".into())
+                        }
+                    });
+                restore.finish(result, "grid-single-cluster-multi-gateway", &drain_consumers)
+            };
+            scenarios.push(match individual_drain {
+                Ok(()) => scenario(
+                    "individual-provider-drain",
+                    "PASS",
+                    "one provider was capped at existing_only in both consumer overlays and restored",
+                ),
+                Err(error) => scenario("individual-provider-drain", "FAIL", error.to_string()),
+            });
+            let gateway_drain = {
+                let mut restore =
+                    RestorationGuard::new(&drain_context, &["vcr-provider-a-provider", "vcr-provider-b-provider"]);
+                let mut existing_a = String::new();
+                let mut existing_b = String::new();
+                let result = restore
+                    .ensure_snapshot()
+                    .and_then(|()| {
+                        session_for_provider("consumer-gateway-a", "provider-a", "existing-gateway-a")
+                            .map_err(Into::into)
+                    })
+                    .map(|session| existing_a = session)
+                    .and_then(|_| {
+                        session_for_provider("consumer-gateway-a", "provider-b", "existing-gateway-b")
+                            .map(|session| existing_b = session)
+                            .map_err(Into::into)
+                    })
+                    .and_then(|_| {
+                        super::provider_drain::run(
+                            &drain_context,
+                            Some("provider-gateway-a"),
+                            None,
+                            false,
+                            false,
+                            Duration::from_secs(120),
+                            Some("grid-single-cluster-multi-gateway"),
+                            &drain_consumers,
+                        )
+                    })
+                    .and_then(|()| Ok(wait_for_candidate_set(&all_candidates)?))
+                    .and_then(|state| {
+                        let a = candidate_admission_states(&state, "vcr-provider-a-provider")?;
+                        let b = candidate_admission_states(&state, "vcr-provider-b-provider")?;
+                        observations.insert("gateway_drain_overlay".to_owned(), state);
+                        if a.iter().all(|value| value == "existing_only")
+                            && b.iter().all(|value| value == "existing_only")
+                        {
+                            Ok(())
+                        } else {
+                            Err(format!("gateway drain states were not existing_only: a={a:?}, b={b:?}").into())
+                        }
+                    })
+                    .and_then(|()| restart_operator().map_err(Into::into))
+                    .and_then(|()| {
+                        let state = wait_for_candidate_set(&all_candidates)?;
+                        let a = candidate_admission_states(&state, "vcr-provider-a-provider")?;
+                        let b = candidate_admission_states(&state, "vcr-provider-b-provider")?;
+                        if a.iter().all(|value| value == "existing_only")
+                            && b.iter().all(|value| value == "existing_only")
+                        {
+                            observations.insert("gateway_drain_after_operator_restart".to_owned(), state);
+                            Ok(())
+                        } else {
+                            Err(format!("drain was not preserved across operator restart: a={a:?}, b={b:?}").into())
+                        }
+                    })
+                    .and_then(|()| {
+                        for (session, expected) in [(&existing_a, "provider-a"), (&existing_b, "provider-b")] {
+                            let RetriedProbe { headers, attempts } =
+                                attributed_request_with_transport_retry("consumer-gateway-a", 650, Some(session))?;
+                            observations.insert(
+                                format!("gateway_drain_existing_{expected}"),
+                                serde_json::json!({"session": session, "provider": expected, "attempts": attempts, "headers": headers}),
+                            );
+                            let actual = selected_provider(&headers)?;
+                            if actual != expected {
+                                return Err(
+                                    format!("existing affinity session moved from {expected} to {actual}").into()
+                                );
+                            }
+                        }
+                        for request_id in 0..4 {
+                            for consumer in ["consumer-gateway-a", "consumer-gateway-b"] {
+                            let session = format!("new-gateway-drain-{consumer}-{request_id}");
+                            let RetriedProbe { headers, attempts } =
+                                attributed_request_with_transport_retry(consumer, 600 + request_id, Some(&session))?;
+                                let provider = selected_provider(&headers)?;
+                            if provider == "provider-a" || provider == "provider-b" {
+                                return Err("new session selected a provider from drained gateway".into());
+                            }
+                            observations.insert(
+                                format!("gateway_drain_new_{consumer}_{request_id}"),
+                                serde_json::json!({"session": session, "provider": provider, "attempts": attempts, "headers": headers}),
+                            );
+                            }
+                        }
+                        Ok(())
+                    });
+                restore.finish(result, "grid-single-cluster-multi-gateway", &drain_consumers)
+            };
+            scenarios.push(match gateway_drain {
+                Ok(()) => scenario(
+                    "provider-gateway-drain",
+                    "PASS",
+                    "all explicitly assigned providers were drained together and restored",
+                ),
+                Err(error) => scenario("provider-gateway-drain", "FAIL", error.to_string()),
+            });
+            let invalid_selector = super::provider_drain::run(
+                &drain_context,
+                Some("gateway-that-does-not-exist"),
+                None,
+                false,
+                false,
+                Duration::from_secs(30),
+                None,
+                &[],
+            );
+            scenarios.push(match invalid_selector {
+                Ok(()) => scenario(
+                    "invalid-drain-selector",
+                    "FAIL",
+                    "unmatched gateway selector unexpectedly succeeded",
+                ),
+                Err(error) => scenario(
+                    "invalid-drain-selector",
+                    "PASS",
+                    format!("rejected without mutation: {error}"),
+                ),
+            });
             let withdrawal_result = scale_deployment("vcr-inference-provider-b", 0)
                 .and_then(|()| {
                     let expected = BTreeSet::from(["vcr-provider-a-provider", "vcr-provider-c-provider"]);
@@ -1182,6 +1652,54 @@ pub(crate) fn run(forge_config: &Path, options: &Options) -> Result<(), Box<dyn 
                     "provider gateway B was withdrawn, traffic continued through both consumers, and B was restored",
                 ),
                 Err(error) => scenario("withdrawal-restoration", "FAIL", error),
+            });
+            let unhealthy_drain_result = scale_deployment("vcr-inference-provider-c", 0)
+                .and_then(|()| {
+                    let expected = BTreeSet::from(["vcr-provider-a-provider", "vcr-provider-b-provider"]);
+                    wait_for_candidate_set(&expected).map(|_| ())
+                })
+                .and_then(|()| {
+                    super::provider_drain::run(
+                        &drain_context,
+                        None,
+                        Some("vcr-provider-c-provider"),
+                        false,
+                        false,
+                        Duration::from_secs(30),
+                        None,
+                        &[],
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .and_then(|()| {
+                    super::provider_drain::run(
+                        &drain_context,
+                        None,
+                        Some("vcr-provider-c-provider"),
+                        false,
+                        true,
+                        Duration::from_secs(30),
+                        None,
+                        &[],
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .and_then(|()| {
+                    let expected = BTreeSet::from(["vcr-provider-a-provider", "vcr-provider-b-provider"]);
+                    wait_for_candidate_set(&expected).map(|_| ())
+                })
+                .and_then(|()| scale_deployment("vcr-inference-provider-c", 1))
+                .and_then(|()| wait_for_candidate_set(&all_candidates).map(|_| ()))
+                .inspect_err(|_| {
+                    drop(scale_deployment("vcr-inference-provider-c", 1));
+                });
+            scenarios.push(match unhealthy_drain_result {
+                Ok(()) => scenario(
+                    "unhealthy-provider-precedence",
+                    "PASS",
+                    "drain and undrain did not promote an unhealthy provider; recovery restored it",
+                ),
+                Err(error) => scenario("unhealthy-provider-precedence", "FAIL", error),
             });
             let consumer_result = scale_deployment("consumer-gateway-a", 0)
                 .and_then(|()| attributed_request("consumer-gateway-b", 200).map(|_| ()))
@@ -1318,6 +1836,162 @@ pub(crate) fn run(forge_config: &Path, options: &Options) -> Result<(), Box<dyn 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessionless_and_affinity_request_arguments_are_unambiguous() {
+        let plain = build_request_args("consumer-a", 1, None).unwrap_or_else(|_| std::process::abort());
+        assert!(!plain.iter().any(|arg| arg.contains("Session-Id")));
+        assert!(!plain.iter().any(|arg| arg == "X-Session-Id"));
+        assert_eq!(plain.iter().filter(|arg| *arg == "--header").count(), 2);
+
+        let affinity =
+            build_request_args("consumer-a", 2, Some("existing-2")).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            affinity.iter().filter(|arg| arg.starts_with("X-Session-Id: ")).count(),
+            1
+        );
+        let header_index = affinity
+            .iter()
+            .position(|arg| arg == "X-Session-Id: existing-2")
+            .unwrap_or(usize::MAX);
+        assert!(header_index > 0 && affinity.get(header_index - 1).is_some_and(|value| value == "--header"));
+        assert_eq!(affinity.iter().filter(|arg| *arg == "--data").count(), 1);
+        assert!(
+            affinity
+                .iter()
+                .any(|arg| arg == "Authorization: Bearer qualification-token")
+        );
+        let invalid_session = build_request_args("consumer-a", 3, Some("bad\nvalue"));
+        assert!(invalid_session.is_err(), "control characters must be rejected");
+    }
+
+    #[test]
+    fn request_arguments_are_stable_except_for_request_identity() {
+        let first = build_request_args("consumer-a", 4, None).unwrap_or_else(|_| std::process::abort());
+        let second = build_request_args("consumer-a", 4, None).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(first, second);
+        assert!(first.windows(2).any(|pair| pair == ["--max-time", "10"]));
+        assert!(first.last().is_some_and(|value| value.contains("/v1/chat/completions")));
+    }
+
+    #[test]
+    fn retry_decision_matrix_never_retries_http_responses_or_exceeds_three_attempts() {
+        for attempt in 1..=2 {
+            assert!(retry_decision(false, None, attempt));
+        }
+        assert!(!retry_decision(false, None, 3));
+        for status in [200, 401, 403, 429, 500, 503] {
+            assert!(!retry_decision(false, Some(status), 1));
+        }
+        assert!(!retry_decision(true, None, 1));
+        assert_eq!(http_status("pod deleted\nconnection reset"), None);
+        assert_eq!(http_status("status: 503"), None);
+        assert_eq!(http_status("HTTP/1.1 200 OK\n"), Some(200));
+    }
+
+    #[test]
+    fn retry_evidence_contains_no_credentials() {
+        let evidence = serde_json::json!({
+            "scenario": "drain",
+            "attempt": 1,
+            "transport": "error",
+            "http_status": null,
+            "retry": true,
+            "retry_reason": "transport_without_http_response",
+            "final": false,
+        });
+        let text = evidence.to_string();
+        assert!(!text.contains("Authorization"));
+        assert!(!text.contains("qualification-token"));
+        assert!(!text.contains("kubeconfig"));
+    }
+
+    #[test]
+    fn session_ids_are_reused_for_existing_and_unique_for_new_probes() {
+        let existing = session_id("existing", "consumer-a", 0);
+        assert_eq!(session_id("existing", "consumer-a", 0), existing);
+        let new_sessions = (0..4)
+            .map(|attempt| session_id("new-drain", "consumer-a", attempt))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(new_sessions.len(), 4);
+    }
+
+    #[test]
+    fn retry_matrix_covers_transport_sequences_and_final_attempts() {
+        let cases = [
+            ("timeout", vec![(false, None), (true, Some(200))], 2, true),
+            ("reset", vec![(false, None), (false, None), (true, Some(200))], 3, true),
+            (
+                "three failures",
+                vec![(false, None), (false, None), (false, None)],
+                3,
+                false,
+            ),
+            ("429", vec![(false, Some(429))], 1, false),
+            ("503", vec![(false, Some(503))], 1, false),
+            ("wrong attribution", vec![(true, Some(200))], 1, true),
+        ];
+        for (name, outcomes, expected_attempts, expected_success) in cases {
+            let decisions = outcomes
+                .iter()
+                .enumerate()
+                .map(|(index, (success, status))| {
+                    retry_decision(*success, *status, u8::try_from(index).unwrap_or(0) + 1)
+                })
+                .collect::<Vec<_>>();
+            let attempts = decisions.iter().position(|retry| !retry).map_or(3, |index| index + 1);
+            assert_eq!(attempts, expected_attempts, "{name}");
+            assert_eq!(
+                decisions.last().is_some_and(|retry| !retry && expected_success),
+                expected_success,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_evidence_is_ordered_structured_and_redacted() {
+        let evidence = [
+            retry_evidence("provider-drain", 1, false, None, None),
+            retry_evidence("provider-drain", 2, true, Some(200), Some("provider-a")),
+        ];
+        assert_eq!(
+            evidence.first().and_then(|item| item.get("attempt")),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            evidence.get(1).and_then(|item| item.get("attempt")),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            evidence.get(1).and_then(|item| item.get("provider")),
+            Some(&serde_json::json!("provider-a"))
+        );
+        assert_eq!(
+            evidence.get(1).and_then(|item| item.get("final")),
+            Some(&serde_json::json!(true))
+        );
+        let serialized = serde_json::to_string(&evidence).unwrap_or_else(|_| std::process::abort());
+        for secret in ["Authorization", "qualification-token", "kubeconfig", "secret-value"] {
+            assert!(!serialized.contains(secret), "serialized evidence leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn restoration_and_failure_containment_decisions_are_conservative() {
+        assert!(
+            !restoration_undrain(true),
+            "a true original drain state restores with undrain=false"
+        );
+        assert!(
+            restoration_undrain(false),
+            "a false original drain state restores with undrain=true"
+        );
+        assert_eq!(scenario("session setup", "FAIL", "transport error").result, "FAIL");
+        assert_eq!(scenario("later safe scenario", "PASS", "independent").result, "PASS");
+        assert_eq!(retry_reason(false, Some(200), 1), "http_response_received");
+        assert_eq!(retry_reason(false, None, 3), "transport_retry_limit_reached");
+    }
 
     #[test]
     fn cluster_layers_use_distinct_names() {

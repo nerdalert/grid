@@ -119,6 +119,16 @@ spec:
                 endpoint:
                   description: HTTP endpoint URL.
                   type: string
+                gatewayRef:
+                  description: |-
+                    Stable provider-gateway identity used by administrative operations.
+
+                    Providers with the same value are drained together by the gateway-wide
+                    operation. It is an explicit control-plane relationship; the operator
+                    never infers it from endpoint URLs.
+                  minLength: 1
+                  nullable: true
+                  type: string
                 gridNetworkRef:
                   description: |-
                     Name of the [`GridNetwork`] this provider belongs to.
@@ -517,6 +527,15 @@ spec:
                       default: {}
                       description: Label key-value pairs that must match.
                       type: object
+                  type: object
+                trafficPolicy:
+                  description: Optional administrative traffic policy.
+                  nullable: true
+                  properties:
+                    drain:
+                      default: false
+                      description: Stop new sessions while preserving existing affinity sessions.
+                      type: boolean
                   type: object
               required:
                 - backendKind
