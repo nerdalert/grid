@@ -46,7 +46,7 @@
 
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
-    aead::{Aead as _, AeadCore as _, KeyInit as _, OsRng},
+    aead::{Aead as _, Generate as _, KeyInit as _},
 };
 
 // ---------------------------------------------------------------------------
@@ -131,8 +131,9 @@ pub enum CryptoError {
 /// Returns [`CryptoError::EncryptFailed`] if GCM encryption fails (infallible
 /// in practice once the cipher and nonce are valid).
 pub fn encrypt(key: &SwimKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce = Aes256Gcm::generate_nonce(OsRng);
+    let cipher_key = Key::<Aes256Gcm>::from(*key);
+    let cipher = Aes256Gcm::new(&cipher_key);
+    let nonce = Nonce::generate();
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
         .map_err(|_e| CryptoError::EncryptFailed)?;
@@ -172,9 +173,10 @@ pub fn decrypt(key: &SwimKey, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let nonce_bytes = data.get(5..17).ok_or(CryptoError::TooShort)?;
     let ciphertext = data.get(17..).ok_or(CryptoError::TooShort)?;
 
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    cipher.decrypt(nonce, ciphertext).map_err(|_e| CryptoError::AuthFailed)
+    let nonce = Nonce::try_from(nonce_bytes).map_err(|_error| CryptoError::TooShort)?;
+    let cipher_key = Key::<Aes256Gcm>::from(*key);
+    let cipher = Aes256Gcm::new(&cipher_key);
+    cipher.decrypt(&nonce, ciphertext).map_err(|_e| CryptoError::AuthFailed)
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +334,11 @@ mod tests {
             ciphertext.get(4).copied().unwrap_or_else(|| std::process::abort()),
             ENCRYPTED_VERSION,
             "byte 4 must be version"
+        );
+        assert_eq!(
+            ciphertext.get(5..17).unwrap_or_else(|| std::process::abort()).len(),
+            NONCE_LEN,
+            "bytes 5..17 must contain the complete nonce"
         );
         assert_eq!(
             ciphertext.len(),
