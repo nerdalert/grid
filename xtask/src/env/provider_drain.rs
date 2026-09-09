@@ -289,10 +289,7 @@ fn read_overlay(
         .and_then(serde_json::Value::as_array)
         .and_then(|items| {
             items.iter().find(|item| {
-                item.get("metadata")
-                    .and_then(|metadata| metadata.get("name"))
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|name| name.contains(consumer))
+                is_overlay_config_map(item, network, consumer)
                     && item
                         .get("data")
                         .and_then(|data| data.get("routing-overlay.json"))
@@ -328,6 +325,25 @@ fn read_overlay(
         }
     }
     Ok((revision, states))
+}
+
+/// Match an operator-produced overlay by its structured identity labels.
+///
+/// Names are length-limited and may contain a hash suffix, so the labels are
+/// the authoritative lookup key. Exact equality also prevents a gateway or
+/// network whose name is a substring of another from being selected.
+fn is_overlay_config_map(item: &serde_json::Value, network: &str, consumer: &str) -> bool {
+    let Some(labels) = item.get("metadata").and_then(|metadata| metadata.get("labels")) else {
+        return false;
+    };
+    labels
+        .get("grid.praxis-proxy.io/network")
+        .and_then(serde_json::Value::as_str)
+        == Some(network)
+        && labels
+            .get("grid.praxis-proxy.io/gateway")
+            .and_then(serde_json::Value::as_str)
+            == Some(consumer)
 }
 
 /// Read exact accepted and serving revision fields from Praxis logs.
@@ -468,6 +484,39 @@ mod tests {
             .filter_map(|provider| provider.metadata.name)
             .collect();
         assert_eq!(names, ["match"]);
+    }
+
+    #[test]
+    fn overlay_lookup_requires_exact_network_and_gateway_labels() {
+        let matching = serde_json::json!({
+            "metadata": {"labels": {
+                "grid.praxis-proxy.io/network": "network-a",
+                "grid.praxis-proxy.io/gateway": "consumer-gateway-a"
+            }}
+        });
+        let wrong_network = serde_json::json!({
+            "metadata": {"labels": {
+                "grid.praxis-proxy.io/network": "network-a-backup",
+                "grid.praxis-proxy.io/gateway": "consumer-gateway-a"
+            }}
+        });
+        let wrong_gateway = serde_json::json!({
+            "metadata": {"labels": {
+                "grid.praxis-proxy.io/network": "network-a",
+                "grid.praxis-proxy.io/gateway": "consumer-gateway-a-backup"
+            }}
+        });
+        assert!(is_overlay_config_map(&matching, "network-a", "consumer-gateway-a"));
+        assert!(!is_overlay_config_map(
+            &wrong_network,
+            "network-a",
+            "consumer-gateway-a"
+        ));
+        assert!(!is_overlay_config_map(
+            &wrong_gateway,
+            "network-a",
+            "consumer-gateway-a"
+        ));
     }
 
     #[test]
