@@ -476,6 +476,7 @@ mod tests {
                 fresh: true,
                 credential: None,
                 stable_id: Some("abcd1234".to_owned()),
+                provider_ref: None,
                 admission_state: None,
                 selection_tier: None,
                 score: None,
@@ -520,6 +521,24 @@ mod tests {
         });
 
         assert_ne!(overlay_digest(&without_policy), overlay_digest(&with_policy));
+    }
+
+    #[test]
+    fn overlay_digest_includes_provider_reference() {
+        let scope = ExpectedScope {
+            network: "test-net".to_owned(),
+            gateway: "gw".to_owned(),
+            namespace: "ns".to_owned(),
+            local_site: "site-a".to_owned(),
+        };
+        let without_ref = test_overlay(&scope);
+        let mut with_ref = without_ref.clone();
+        with_ref.candidates[0].provider_ref = Some(crate::types::ProviderRef {
+            name: "provider-a".to_owned(),
+            site: "site-a".to_owned(),
+        });
+
+        assert_ne!(overlay_digest(&without_ref), overlay_digest(&with_ref));
     }
 
     fn test_provenance() -> crate::types::OverlayProvenance {

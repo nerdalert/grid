@@ -167,6 +167,10 @@ pub(crate) struct RoutingCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential: Option<ProjectedCredential>,
 
+    /// Trusted human-readable provider identity and site scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_ref: Option<ProviderRef>,
+
     /// Deterministic stable ID for session binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stable_id: Option<String>,
@@ -194,6 +198,17 @@ pub(crate) struct RoutingCandidate {
     /// Producer-assigned active selection group.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) selection_group: Option<u32>,
+}
+
+/// Provider identity projected by the Grid operator.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderRef {
+    /// `InferenceProvider` resource name.
+    pub(crate) name: String,
+
+    /// Site that owns the provider.
+    pub(crate) site: String,
 }
 
 /// Credential reference projected alongside a routing candidate.

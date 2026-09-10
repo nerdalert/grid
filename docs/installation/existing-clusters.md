@@ -204,9 +204,25 @@ separate trust boundaries:
 
 ## Candidate Identity
 
-The provider gateway's `provider_route` filter requires a `candidate_id` for
-each route. This value must match the `stable_id` in the routing overlay — it
-is **not** the InferenceProvider CR `.metadata.name`.
+The provider gateway's `provider_route` filter can identify a route using the
+opaque `stable_id` or the trusted `provider_ref` projected by Grid. The
+recommended form is the human-readable provider reference:
+
+```yaml
+routes:
+  - provider_ref:
+      name: qwen3-ifc1
+      site: west-provider
+    model: qwen3
+    paths: [/v1/chat/completions]
+    cluster: qwen3-backend
+```
+
+`provider_ref.name` is the `InferenceProvider` resource name and
+`provider_ref.site` prevents a same-named provider at another site from
+matching accidentally. The provider gateway consumes these fields only from
+the authenticated AI routing handoff; caller-supplied headers are not
+authoritative. Existing `candidate_id: <stable_id>` routes remain supported.
 
 The operator computes `stable_id` as a deterministic FNV-1a hash of
 `{kind}/{name}/{site}/{cluster}`. After the overlay ConfigMap converges, read
@@ -218,8 +234,9 @@ kubectl get configmap -l grid.praxis-proxy.io/network \
   | jq -r '.candidates[] | .name + " stable_id=" + .stable_id'
 ```
 
-Use the printed `stable_id` values as `candidate_id` in the provider Praxis
-configuration.
+Use the printed `stable_id` values as `candidate_id` in legacy provider Praxis
+configuration, or use the provider reference shown in the overlay when
+configuring new routes.
 
 ## GridSite Labels
 

@@ -367,6 +367,7 @@ mod tests {
                 fresh: true,
                 credential: None,
                 stable_id: Some("abcd1234".to_owned()),
+                provider_ref: None,
                 admission_state: None,
                 selection_tier: None,
                 score: None,

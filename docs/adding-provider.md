@@ -432,7 +432,20 @@ corresponding file from the mount path.
 
 The overlay assigns each InferenceProvider a deterministic `stable_id`
 (FNV-1a hash of `{kind}/{name}/{site}/{cluster}`). This value is
-NOT the CR's `.metadata.name`.
+NOT the CR's `.metadata.name`. New provider gateways should prefer the
+overlay's trusted `provider_ref`:
+
+```yaml
+routes:
+  - provider_ref:
+      name: qwen3-ifc1
+      site: west-provider
+```
+
+The site scope prevents a same-named provider at another site from satisfying
+the rule. `provider_ref` is carried through the authenticated AI routing hop;
+it is not taken from a caller-controlled header. Existing `candidate_id` rules
+using `stable_id` remain valid for backward compatibility.
 
 After running `install.sh` (which waits for the overlay), inspect
 the assigned stable IDs:
@@ -443,7 +456,7 @@ kubectl get configmap -l grid.praxis-proxy.io/network \
   | jq -r '.candidates[] | .name + " stable_id=" + .stable_id'
 ```
 
-`install.sh`'s `render_provider_config` automates this: it reads the
+For legacy stable-ID configurations, `install.sh`'s `render_provider_config` automates this: it reads the
 overlay, extracts stable IDs, and replaces `candidate_id` placeholders
 in the provider Praxis config template. When using `install.sh`, you
 write CR names as `candidate_id` values in the template and the script

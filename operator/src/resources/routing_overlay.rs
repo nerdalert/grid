@@ -263,6 +263,10 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
             cluster: provider.routing_cluster.clone(),
             fresh,
             credential: None,
+            provider_ref: Some(ProviderRef {
+                name: provider.provider_id.clone(),
+                site: provider.site_id.clone(),
+            }),
             stable_id: None,
             admission_state: None,
             selection_tier: None,
@@ -800,6 +804,22 @@ pub struct ProjectedCredential {
     pub secret_ref: ProjectedCredentialRef,
 }
 
+/// Trusted provider identity carried from an `InferenceProvider` into the
+/// routing overlay.
+///
+/// `InferenceProvider` is cluster-scoped, so `name` is unique within a Grid
+/// installation. `site` is included because remote providers are learned from
+/// other sites and the same name may legitimately exist there.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRef {
+    /// `InferenceProvider.metadata.name`.
+    pub name: String,
+
+    /// Site that owns the provider candidate.
+    pub site: String,
+}
+
 /// A single routing candidate for the Praxis `intelligent_route` filter.
 ///
 /// Each candidate represents one (model, site) pair offered by a provider.
@@ -851,6 +871,10 @@ pub struct RoutingCandidate {
     /// `None` for providers with `manual`, absent, or unsupported-strategy auth.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential: Option<ProjectedCredential>,
+
+    /// Trusted human-readable provider identity for provider-boundary routing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_ref: Option<ProviderRef>,
 
     /// Deterministic stable ID for consumer-side session binding.
     ///
@@ -1539,6 +1563,10 @@ fn candidates_from_provider(
                 cluster: cluster.to_owned(),
                 fresh,
                 credential: credential.clone(),
+                provider_ref: Some(ProviderRef {
+                    name: provider_name.to_owned(),
+                    site: (*site).to_owned(),
+                }),
                 stable_id: None,
                 admission_state: None,
                 selection_tier: None,
@@ -1781,6 +1809,7 @@ mod tests {
             cluster: cluster.to_owned(),
             fresh,
             credential: None,
+            provider_ref: None,
             stable_id: None,
             admission_state: Some(admission_state),
             selection_tier: Some(tier),
@@ -7034,6 +7063,8 @@ mod tests {
         let json: serde_json::Value = serde_json::to_value(&overlay).unwrap_or_else(|_| std::process::abort());
         let candidate = json["candidates"][0].as_object().unwrap();
         assert!(candidate.contains_key("stable_id"), "stable_id must be present");
+        assert_eq!(candidate["provider_ref"]["name"], "prov-a");
+        assert_eq!(candidate["provider_ref"]["site"], "site-a");
         assert!(
             candidate.contains_key("admission_state"),
             "admission_state must be present"
