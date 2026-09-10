@@ -175,3 +175,7 @@ See the [development guide](docs/development.md) and
 - [Operations](docs/architecture/operations.md)
 - [Consumer config](docs/architecture/consumer-config.md)
 - [Documentation index](docs/README.md)
+
+## License
+
+Apache-2.0
