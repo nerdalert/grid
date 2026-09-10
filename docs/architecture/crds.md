@@ -140,8 +140,10 @@ status:
 
 ### CRD-driven SWIM seeds
 
-`spec.seeds` is a list of socket addresses (`host:port`) used to bootstrap
-SWIM mesh formation.  Seeds are announced to the running SWIM runtime on every
+`spec.seeds` is a list of SWIM endpoints (`host:port`) used to bootstrap
+SWIM mesh formation. Each entry may be a literal IPv4 address, a bracketed IPv6
+address, or a DNS hostname. Hostnames are resolved with a bounded lookup before
+they are announced to the running SWIM runtime on every
 `GridNetwork` reconcile.  Re-announcing to an existing peer is idempotent — foca
 ignores redundant joins.
 

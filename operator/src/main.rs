@@ -9,7 +9,9 @@
 //! Set `GRID_SWIM_BIND_ADDR` (e.g. `"0.0.0.0:7946"`) to enable the SWIM
 //! runtime. Set `GRID_SWIM_ADVERTISE_ADDR` when the bind address is not
 //! directly reachable by peers, and set `GRID_SWIM_SEEDS` to a comma-separated
-//! list of seed peer socket addresses. When `GRID_SWIM_BIND_ADDR` is absent
+//! list of `host:port` seed endpoints. Both literal IP addresses and DNS
+//! hostnames are accepted; DNS is resolved once, with a bounded timeout, before
+//! the runtime starts. When `GRID_SWIM_BIND_ADDR` is absent
 //! the operator runs in static mode (`membership = None`);
 //! `GridNetwork.status.connectedSites` and `distributedProviderCount` remain
 //! 0, and the phase stays `Pending`/`Initializing` based on TLS configuration
@@ -43,7 +45,6 @@
 
 use std::{
     collections::BTreeMap,
-    net::SocketAddr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -68,6 +69,7 @@ use operator::{
         inference_provider::InferenceProvider,
     },
     gateway,
+    swim_endpoint::{SwimEndpoint, resolve_endpoint, resolve_endpoint_list_partial},
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
 
@@ -115,7 +117,13 @@ async fn main() {
         },
     };
 
-    let swim = maybe_start_swim(&client, &config.gateway).await;
+    let swim = match maybe_start_swim(&client, &config.gateway).await {
+        Ok(swim) => swim,
+        Err(error) => {
+            tracing::error!(%error, "SWIM startup failed");
+            std::process::exit(1);
+        },
+    };
 
     if let Some(handle) = &swim {
         tokio::spawn(gateway::run_discovery_poller(
@@ -147,8 +155,9 @@ async fn main() {
 /// Optionally start the SWIM runtime from environment variables.
 ///
 /// Returns `Some(handle)` if `GRID_SWIM_BIND_ADDR` is set and the runtime
-/// starts successfully.  Returns `None` when the variable is absent,
-/// unparseable, or the bind fails (all logged at error level).
+/// starts successfully, `None` when SWIM is not configured or a non-contract
+/// startup dependency is unavailable, and an error when an explicitly
+/// configured bind or advertise endpoint is invalid or cannot be resolved.
 ///
 /// Gateway address resolution uses [`operator::gateway::resolve`]:
 /// `GRID_GATEWAY_ADDRESS` env var wins; otherwise the operator discovers
@@ -159,17 +168,61 @@ async fn main() {
     clippy::large_stack_frames,
     reason = "sequential env-var parsing + runtime startup; splitting would obscure the startup sequence"
 )]
-async fn maybe_start_swim(client: &Client, config: &gateway::Config) -> Option<Arc<swim_runtime::SwimHandle>> {
-    let addr_str = std::env::var("GRID_SWIM_BIND_ADDR").ok()?;
+async fn maybe_start_swim(
+    client: &Client,
+    config: &gateway::Config,
+) -> Result<Option<Arc<swim_runtime::SwimHandle>>, String> {
+    let Some(addr_str) = std::env::var("GRID_SWIM_BIND_ADDR").ok() else {
+        return Ok(None);
+    };
     let bind_addr = match addr_str.parse() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(addr = %addr_str, error = %e, "GRID_SWIM_BIND_ADDR not a valid socket address");
-            return None;
+            return Err(format!("GRID_SWIM_BIND_ADDR is not a valid socket address: {e}"));
         },
     };
-    let advertise_addr = parse_optional_socket_addr_env("GRID_SWIM_ADVERTISE_ADDR");
-    let seeds = parse_socket_addr_list_env("GRID_SWIM_SEEDS");
+    let advertise_addr = match std::env::var("GRID_SWIM_ADVERTISE_ADDR") {
+        Ok(value) => {
+            let endpoint = match value.parse::<SwimEndpoint>() {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    tracing::error!(env = "GRID_SWIM_ADVERTISE_ADDR", value = %value, %error, "invalid SWIM endpoint");
+                    return Err(format!("GRID_SWIM_ADVERTISE_ADDR is invalid: {error}"));
+                },
+            };
+            match resolve_endpoint(&endpoint, "GRID_SWIM_ADVERTISE_ADDR").await {
+                Ok(addresses) => {
+                    let resolved = addresses.first().copied();
+                    if let Some(address) = resolved {
+                        tracing::info!(configured = %endpoint.as_text(), %address, "resolved SWIM advertise endpoint");
+                    }
+                    resolved
+                },
+                Err(error) => return Err(format!("cannot resolve GRID_SWIM_ADVERTISE_ADDR: {error}")),
+            }
+        },
+        Err(_) => None,
+    };
+    let seed_values = std::env::var("GRID_SWIM_SEEDS").unwrap_or_default();
+    let seed_values: Vec<String> = seed_values.split(',').map(str::to_owned).collect();
+    let seed_resolution = resolve_endpoint_list_partial(&seed_values, "GRID_SWIM_SEEDS").await;
+    for failure in &seed_resolution.failures {
+        tracing::warn!(
+            source = %failure.source,
+            endpoint = %failure.endpoint,
+            reason = %failure.reason,
+            "ignoring unusable SWIM seed"
+        );
+    }
+    if seed_resolution.configured && seed_resolution.addresses.is_empty() {
+        tracing::warn!(
+            source = "GRID_SWIM_SEEDS",
+            failures = seed_resolution.failures.len(),
+            "no configured SWIM seeds resolved; keeping SWIM active with a seedless bootstrap"
+        );
+    }
+    let seeds = seed_resolution.addresses;
     let site_name = std::env::var("GRID_SWIM_SITE_NAME").unwrap_or_else(|_| hostname_or_default());
     let gateway_address = match gateway::resolve(client, config).await {
         Ok(addr) => addr,
@@ -183,7 +236,7 @@ async fn maybe_start_swim(client: &Client, config: &gateway::Config) -> Option<A
         Ok(lease) => lease,
         Err(error) => {
             tracing::error!(%error, "failed to reserve SWIM revisions; running in static mode");
-            return None;
+            return Ok(None);
         },
     };
     let cfg = SwimConfig {
@@ -198,11 +251,11 @@ async fn maybe_start_swim(client: &Client, config: &gateway::Config) -> Option<A
     match swim_runtime::start(cfg).await {
         Ok(handle) => {
             tracing::info!(addr = %addr_str, "SWIM runtime started");
-            Some(handle)
+            Ok(Some(handle))
         },
         Err(e) => {
             tracing::error!(error = %e, "SWIM runtime failed to start; running in static mode");
-            None
+            Ok(None)
         },
     }
 }
@@ -408,42 +461,6 @@ fn parse_swim_key_env(name: &str) -> Option<swim::crypto::SwimKey> {
     }
     tracing::info!(env = name, "SWIM encryption key loaded from environment");
     Some(key)
-}
-
-/// Parse an optional socket address environment variable.
-fn parse_optional_socket_addr_env(name: &str) -> Option<SocketAddr> {
-    let value = std::env::var(name).ok()?;
-    match value.parse() {
-        Ok(addr) => Some(addr),
-        Err(e) => {
-            tracing::error!(env = name, value = %value, error = %e, "SWIM socket address env var is invalid");
-            None
-        },
-    }
-}
-
-/// Parse a comma-separated socket address environment variable.
-fn parse_socket_addr_list_env(name: &str) -> Vec<SocketAddr> {
-    let Ok(value) = std::env::var(name) else {
-        return Vec::new();
-    };
-
-    value
-        .split(',')
-        .filter_map(|raw| {
-            let item = raw.trim();
-            if item.is_empty() {
-                return None;
-            }
-            match item.parse() {
-                Ok(addr) => Some(addr),
-                Err(e) => {
-                    tracing::error!(env = name, value = %item, error = %e, "SWIM seed address is invalid");
-                    None
-                },
-            }
-        })
-        .collect()
 }
 
 /// Return the machine hostname or a safe fallback.

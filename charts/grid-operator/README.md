@@ -138,7 +138,7 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
 | `swim.bindAddress` | string | `0.0.0.0:7946` | SWIM protocol bind address. |
 | `swim.advertiseAddress` | string | `""` | Externally reachable SWIM address. Defaults to Pod IP. |
 | `swim.siteName` | string | `""` | Bootstrap SWIM site name. |
-| `swim.seeds` | string | `""` | Bootstrap SWIM seeds (comma-separated). |
+| `swim.seeds` | string | `""` | Bootstrap SWIM seed endpoints (comma-separated `ip:port`, `[ipv6]:port`, or `hostname:port`). |
 | `swim.service.enabled` | bool | `false` | Create a SWIM Service. |
 | `swim.service.type` | string | `ClusterIP` | SWIM Service type. |
 | `swim.service.port` | int | `7946` | SWIM Service port. |
