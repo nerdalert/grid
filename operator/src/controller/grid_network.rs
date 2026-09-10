@@ -39,6 +39,7 @@ use crate::{
         trust_bundle::{self, CertPemStatus},
     },
     swim::{MemberStatus, MembershipSnapshot},
+    swim_endpoint::{SeedResolution, resolve_endpoint_list_partial},
     swim_runtime::SwimHandle,
 };
 
@@ -92,8 +93,8 @@ pub struct OperatorCtx {
     /// and removals.  Seeds are always announced in full (idempotent); this
     /// state is used only for diagnostics.
     ///
-    /// Uses [`std::sync::Mutex`] because [`announce_crd_seeds`] is a synchronous
-    /// function called from within the async reconcile loop.
+    /// Uses [`std::sync::Mutex`] because seed tracking is updated synchronously
+    /// after async DNS resolution and the SWIM channel announcement.
     pub(crate) last_seeds: std::sync::Mutex<HashMap<String, Vec<SocketAddr>>>,
 }
 
@@ -256,7 +257,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         // without requiring the GRID_SWIM_SEEDS environment variable.
         // Re-announcing on each reconcile is idempotent (foca ignores existing members).
         // diff_seed_sets tracks additions/removals for diagnostic logging.
-        announce_crd_seeds(&network, swim, &ctx.last_seeds);
+        announce_crd_seeds(&network, swim, &ctx.last_seeds).await;
 
         // Broadcast the local site's public certificate PEM so remote peers can
         // populate GridSite.status.publicCertPem.  Only the public cert is read —
@@ -563,41 +564,6 @@ pub fn error_policy(_network: Arc<GridNetwork>, error: &OperatorError, _ctx: Arc
 // CRD-driven SWIM seeds
 // ---------------------------------------------------------------------------
 
-/// Parse and normalize SWIM seed addresses from `GridNetwork.spec.seeds`.
-///
-/// Each string is trimmed and parsed as a [`SocketAddr`].  Invalid entries
-/// are logged at `warn` level and skipped; they do not fail the reconcile.
-/// If `local_addr` is `Some`, any address equal to it is removed (self-seed).
-/// Duplicates are removed; the result is deterministically sorted.
-///
-/// Returns an empty `Vec` when `raw` is empty or all entries fail to parse.
-pub(crate) fn parse_crd_seeds(raw: &[String], local_addr: Option<SocketAddr>) -> Vec<SocketAddr> {
-    let mut seen = BTreeSet::new();
-    for s in raw {
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match trimmed.parse::<SocketAddr>() {
-            Ok(addr) => {
-                if local_addr.is_some_and(|local| addr == local) {
-                    tracing::debug!(addr = %addr, "GridNetwork spec.seeds: skipping self-address");
-                    continue;
-                }
-                seen.insert(addr);
-            },
-            Err(e) => {
-                tracing::warn!(
-                    seed = trimmed,
-                    error = %e,
-                    "GridNetwork spec.seeds contains invalid socket address, skipping"
-                );
-            },
-        }
-    }
-    seen.into_iter().collect()
-}
-
 /// Compute the difference between two seed sets.
 ///
 /// Returns `(added, removed)` as sorted `Vec<SocketAddr>` slices.
@@ -662,18 +628,14 @@ pub(crate) fn diff_seed_sets(previous: &[SocketAddr], desired: &[SocketAddr]) ->
 )]
 #[expect(
     clippy::too_many_lines,
-    reason = "linear announce sequence: parse → diff → log → announce → update tracker"
+    reason = "linear announce sequence: resolve → diff → log → announce → update tracker"
 )]
-fn announce_crd_seeds(
+async fn announce_crd_seeds(
     network: &GridNetwork,
     swim: &SwimHandle,
     last_seeds: &std::sync::Mutex<HashMap<String, Vec<SocketAddr>>>,
 ) {
-    let seeds = parse_crd_seeds(&network.spec.seeds, Some(swim.local_addr()));
     let name = network.metadata.name.as_deref().unwrap_or("?");
-
-    // Log what changed since the last reconcile using diff_seed_sets.
-    // Always announce the full set for robustness (idempotent, handles channel-full retries).
     let prev = last_seeds
         .lock()
         .unwrap_or_else(|e| {
@@ -683,6 +645,37 @@ fn announce_crd_seeds(
         .get(name)
         .cloned()
         .unwrap_or_default();
+    let resolution = resolve_endpoint_list_partial(&network.spec.seeds, "GridNetwork.spec.seeds").await;
+    for failure in &resolution.failures {
+        tracing::warn!(
+            network = name,
+            source = %failure.source,
+            endpoint = %failure.endpoint,
+            reason = %failure.reason,
+            "ignoring unusable GridNetwork seed"
+        );
+    }
+    let mut seeds = match crd_seed_decision(&resolution, &prev) {
+        CrdSeedDecision::Announce(seeds) => seeds,
+        CrdSeedDecision::Retain => {
+            tracing::warn!(
+                network = name,
+                "all configured GridNetwork seeds failed; retaining the last-known-good seed set"
+            );
+            return;
+        },
+        CrdSeedDecision::Seedless => {
+            tracing::warn!(
+                network = name,
+                "no configured GridNetwork seed resolved and no last-known-good set exists; keeping SWIM seedless"
+            );
+            return;
+        },
+    };
+    seeds.retain(|addr| *addr != swim.local_addr());
+
+    // Log what changed since the last reconcile using diff_seed_sets.
+    // Always announce the full set for robustness (idempotent, handles channel-full retries).
     let (added, removed) = diff_seed_sets(&prev, &seeds);
     if !added.is_empty() {
         let addrs: Vec<String> = added.iter().map(ToString::to_string).collect();
@@ -734,6 +727,29 @@ fn announce_crd_seeds(
             e.into_inner()
         })
         .insert(name.to_owned(), seeds);
+}
+
+/// Action for a CRD seed update after partial DNS resolution.
+enum CrdSeedDecision {
+    /// Announce the supplied resolved set.
+    Announce(Vec<SocketAddr>),
+    /// Keep the previous announced set because all current lookups failed.
+    Retain,
+    /// Keep SWIM active without seeds because no prior set exists.
+    Seedless,
+}
+
+/// Decide whether a CRD seed reconciliation may replace the announced set.
+fn crd_seed_decision(resolution: &SeedResolution, previous: &[SocketAddr]) -> CrdSeedDecision {
+    if !resolution.addresses.is_empty() {
+        CrdSeedDecision::Announce(resolution.addresses.clone())
+    } else if resolution.configured && !previous.is_empty() {
+        CrdSeedDecision::Retain
+    } else if resolution.configured {
+        CrdSeedDecision::Seedless
+    } else {
+        CrdSeedDecision::Announce(Vec::new())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2475,6 +2491,51 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::swim_endpoint::EndpointResolutionFailure;
+
+    fn seed_addr(value: &str) -> SocketAddr {
+        value.parse().unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn crd_seed_resolution_retains_last_known_good_when_all_current_lookups_fail() {
+        let resolution = SeedResolution {
+            configured: true,
+            addresses: Vec::new(),
+            failures: vec![EndpointResolutionFailure {
+                source: "GridNetwork.spec.seeds".to_owned(),
+                endpoint: "missing.example:7946".to_owned(),
+                reason: "DNS resolution failed".to_owned(),
+            }],
+        };
+        assert!(matches!(
+            crd_seed_decision(&resolution, &[seed_addr("10.0.0.1:7946")]),
+            CrdSeedDecision::Retain
+        ));
+    }
+
+    #[test]
+    fn crd_seed_resolution_announces_recovered_addresses() {
+        let resolution = SeedResolution {
+            configured: true,
+            addresses: vec![seed_addr("10.0.0.2:7946")],
+            failures: Vec::new(),
+        };
+        assert!(matches!(
+            crd_seed_decision(&resolution, &[seed_addr("10.0.0.1:7946")]),
+            CrdSeedDecision::Announce(addresses) if addresses == vec![seed_addr("10.0.0.2:7946")]
+        ));
+    }
+
+    #[test]
+    fn crd_seed_resolution_without_previous_seeds_stays_seedless() {
+        let resolution = SeedResolution {
+            configured: true,
+            addresses: Vec::new(),
+            failures: Vec::new(),
+        };
+        assert!(matches!(crd_seed_decision(&resolution, &[]), CrdSeedDecision::Seedless));
+    }
     use crate::{
         crd::grid_network::{BudgetPolicyConfig, TenantBudgetConfig},
         swim::MemberRecord,
@@ -4107,103 +4168,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_crd_seeds — pure seed normalization
+    // diff_seed_sets
     // -----------------------------------------------------------------------
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap_or_else(|_| std::process::abort())
     }
-
-    #[test]
-    fn parse_crd_seeds_empty_input_returns_empty() {
-        let result = parse_crd_seeds(&[], None);
-        assert!(result.is_empty(), "empty input must produce empty output");
-    }
-
-    #[test]
-    fn parse_crd_seeds_valid_address_parsed() {
-        let raw = vec!["10.0.0.1:7946".to_owned()];
-        let result = parse_crd_seeds(&raw, None);
-        assert_eq!(result, vec![addr("10.0.0.1:7946")], "valid address must be included");
-    }
-
-    #[test]
-    fn parse_crd_seeds_invalid_address_skipped() {
-        let raw = vec!["not-an-address".to_owned()];
-        let result = parse_crd_seeds(&raw, None);
-        assert!(result.is_empty(), "invalid address must be skipped without panic");
-    }
-
-    #[test]
-    fn parse_crd_seeds_mixed_valid_and_invalid() {
-        let raw = vec![
-            "10.0.0.1:7946".to_owned(),
-            "bad-addr".to_owned(),
-            "10.0.0.2:7946".to_owned(),
-        ];
-        let result = parse_crd_seeds(&raw, None);
-        assert_eq!(result.len(), 2, "only valid addresses must appear");
-        assert!(result.contains(&addr("10.0.0.1:7946")));
-        assert!(result.contains(&addr("10.0.0.2:7946")));
-    }
-
-    #[test]
-    fn parse_crd_seeds_deduplicates() {
-        let raw = vec!["10.0.0.1:7946".to_owned(), "10.0.0.1:7946".to_owned()];
-        let result = parse_crd_seeds(&raw, None);
-        assert_eq!(result.len(), 1, "duplicates must be removed");
-    }
-
-    #[test]
-    fn parse_crd_seeds_filters_self_addr() {
-        let local = addr("10.0.0.1:7946");
-        let raw = vec!["10.0.0.1:7946".to_owned(), "10.0.0.2:7946".to_owned()];
-        let result = parse_crd_seeds(&raw, Some(local));
-        assert_eq!(result.len(), 1, "self-address must be filtered out");
-        assert_eq!(
-            result.first().copied(),
-            Some(addr("10.0.0.2:7946")),
-            "non-self address must remain"
-        );
-    }
-
-    #[test]
-    fn parse_crd_seeds_no_local_filter_when_none() {
-        let raw = vec!["10.0.0.1:7946".to_owned()];
-        let result = parse_crd_seeds(&raw, None);
-        assert_eq!(result.len(), 1, "without local filter all valid addresses are kept");
-    }
-
-    #[test]
-    fn parse_crd_seeds_whitespace_trimmed() {
-        let raw = vec!["  10.0.0.1:7946  ".to_owned()];
-        let result = parse_crd_seeds(&raw, None);
-        assert_eq!(
-            result,
-            vec![addr("10.0.0.1:7946")],
-            "leading/trailing whitespace must be trimmed"
-        );
-    }
-
-    #[test]
-    fn parse_crd_seeds_empty_string_skipped() {
-        let raw = vec![String::new(), "  ".to_owned()];
-        let result = parse_crd_seeds(&raw, None);
-        assert!(result.is_empty(), "blank strings must be skipped");
-    }
-
-    #[test]
-    fn parse_crd_seeds_result_is_sorted() {
-        let raw = vec!["10.0.0.2:7946".to_owned(), "10.0.0.1:7946".to_owned()];
-        let result = parse_crd_seeds(&raw, None);
-        let mut expected = result.clone();
-        expected.sort();
-        assert_eq!(result, expected, "result must be sorted for deterministic ordering");
-    }
-
-    // -----------------------------------------------------------------------
-    // diff_seed_sets
-    // -----------------------------------------------------------------------
 
     #[test]
     fn diff_seed_sets_empty_to_empty_is_no_op() {

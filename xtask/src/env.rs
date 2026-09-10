@@ -479,6 +479,20 @@ pub(crate) enum Action {
         site: Option<String>,
     },
 
+    /// Prove SWIM discovery and provider-state propagation with DNS endpoints.
+    ///
+    /// Starts two operators with hostname-based advertise and seed values,
+    /// then verifies membership and real provider-state propagation.
+    VerifySwimDnsHostnames {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
     /// Run all validations in sequence and print a Markdown summary table.
     ///
     /// Runs, in order:
@@ -1184,6 +1198,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifySwimMembership { config, site } => env_verify_swim_membership(config, site.as_deref()),
         Action::VerifySwimState { config, site } => env_verify_swim_state(config, site.as_deref()),
         Action::VerifySwimCrdSeeds { config, site } => env_verify_swim_crd_seeds(config, site.as_deref()),
+        Action::VerifySwimDnsHostnames { config, site } => env_verify_swim_dns_hostnames(config, site.as_deref()),
         Action::ValidateAll { config, site } => env_validate_all(config, site.as_deref()),
         Action::VerifyApiFallback { config, site } => env_verify_api_fallback(config, site.as_deref()),
         Action::VerifyApiFallbackNative { config, site } => env_verify_api_fallback_native(config, site.as_deref()),
@@ -2390,9 +2405,8 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
 ///
 /// Both operators start with `GRID_SWIM_SEEDS=""` — no startup seeds at all.
 /// After the `GridNetwork` fixture is applied with `spec.seeds = [bind1]`,
-/// each operator reconciles the resource and calls `announce_crd_seeds`:
-/// - Primary: `parse_crd_seeds([bind1], Some(bind1)) → []` (self-filtered) → no announce
-/// - Secondary: `parse_crd_seeds([bind1], Some(bind2)) → [bind1]` → announces to primary
+/// each operator resolves the resource and calls `announce_crd_seeds`; the
+/// local address is filtered and the secondary announces to the primary.
 ///
 /// SWIM gossip then converges and `GridNetwork.status.phase` becomes `Active`.
 /// The `GRID_SWIM_SEEDS` env var is empty for both operators throughout.
@@ -2564,6 +2578,117 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
          distributedProviderCount={distributed_count})"
     );
     Ok(())
+}
+
+/// Prove SWIM membership and provider-state propagation using DNS endpoints.
+///
+/// `localhost` is intentional: the two out-of-cluster operators bind to
+/// distinct loopback ports, so this exercises the production hostname resolver
+/// without depending on public DNS or cluster DNS from the host.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one bounded qualification keeps startup, convergence, propagation, evidence, and cleanup together"
+)]
+fn env_verify_swim_dns_hostnames(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME, SWIM_STATUS_POLL_TIMEOUT, SWIM_TEST_NETWORK,
+        SWIM_TEST_PROVIDER, SWIM_TEST_PROVIDER_MODEL,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-swim-dns-hostnames: context={context}");
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_swim_test_resources(&context)?;
+
+    let (bind1, bind2) = reserve_swim_bind_addrs()?;
+    let advertise1 = hostname_for_swim_addr(&bind1)?;
+    let advertise2 = hostname_for_swim_addr(&bind2)?;
+    let rejected_seed = "missing.grid-swim.invalid:7946";
+    let seeds1 = format!("{rejected_seed},{advertise2}");
+    let seeds2 = format!("{rejected_seed},{advertise1}");
+
+    let evidence_dir = std::env::var("GRID_SWIM_DNS_EVIDENCE_DIR")
+        .map_or_else(|_| PathBuf::from("/tmp/grid-swim-dns-hostnames"), PathBuf::from);
+    std::fs::create_dir_all(&evidence_dir)?;
+    std::fs::write(
+        evidence_dir.join("summary.txt"),
+        format!(
+            "context={context}\nconfigured_advertise={advertise1},{advertise2}\n\
+             configured_seeds={seeds1};{seeds2}\nrejected_seed={rejected_seed}\n\
+             resolved_advertise={bind1},{bind2}\nresolution=bounded concurrent startup DNS; successful seed addresses retained, sorted, and deduplicated\n"
+        ),
+    )?;
+    std::fs::write(
+        evidence_dir.join("summary.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "context": context,
+            "configured_advertise": [advertise1, advertise2],
+            "configured_seeds": [seeds1, seeds2],
+            "intentionally_rejected_seed": rejected_seed,
+            "resolved_advertise": [bind1, bind2],
+            "seed_resolution": {
+                "mode": "partial_success_is_retained",
+                "aggregate_timeout_seconds": 10,
+                "ordering": "sorted_and_deduplicated",
+            },
+        }))?,
+    )?;
+
+    let op1 = operator::spawn_operator_with_swim_for_context(
+        &context,
+        &bind1,
+        &advertise1,
+        SWIM_NODE_PRIMARY_NAME,
+        &seeds1,
+        None,
+    )?;
+    let op1_guard = ProcGuard(Some(op1), "dns-operator-primary");
+    let op2 = operator::spawn_operator_with_swim_for_context(
+        &context,
+        &bind2,
+        &advertise2,
+        SWIM_NODE_SECONDARY_NAME,
+        &seeds2,
+        None,
+    )?;
+    let op2_guard = ProcGuard(Some(op2), "dns-operator-secondary");
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        operator::apply_swim_test_network(&context)?;
+        operator::apply_swim_test_provider(&context)?;
+        let connected = operator::wait_for_gridnetwork_active(&context, SWIM_TEST_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
+        let distributed =
+            operator::wait_for_gridnetwork_distributed_state(&context, SWIM_TEST_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
+        operator::verify_swim_status("Active", connected)?;
+        operator::verify_distributed_state_received(distributed)?;
+        eprintln!(
+            "verify-swim-dns-hostnames: PASS (configured DNS endpoints {advertise1}, {advertise2}; \
+             resolved {bind1}, {bind2}; provider={SWIM_TEST_PROVIDER}; model={SWIM_TEST_PROVIDER_MODEL}; \
+             connectedSites={connected}; distributedProviderCount={distributed})"
+        );
+        Ok(())
+    })();
+
+    drop(op2_guard);
+    drop(op1_guard);
+    for (site_name, log_name) in [
+        (SWIM_NODE_PRIMARY_NAME, "operator-primary.log"),
+        (SWIM_NODE_SECONDARY_NAME, "operator-secondary.log"),
+    ] {
+        let source = format!("/tmp/grid-operator-{site_name}.log");
+        drop(std::fs::copy(source, evidence_dir.join(log_name)));
+    }
+    operator::cleanup_swim_test_resources(&context)?;
+    result
+}
+
+/// Replace a loopback bind address with the equivalent DNS-based localhost endpoint.
+fn hostname_for_swim_addr(addr: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let (_, port) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| format!("SWIM bind address {addr:?} has no port"))?;
+    Ok(format!("localhost:{port}"))
 }
 
 /// Prove that SWIM transport AES-256-GCM encryption is enforced.

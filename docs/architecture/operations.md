@@ -284,12 +284,27 @@ and `auth.secretRef.namespace` in your CRD specs.
 The `Deployment` in `deploy/operator/deployment.yaml`
 exposes SWIM configuration through environment variables:
 
+SWIM endpoint values accept all of these forms:
+
+```text
+10.0.0.4:7946
+[2001:db8::4]:7946
+grid-swim.example.internal:7946
+```
+
+DNS names are resolved before the SWIM runtime starts. All usable seed
+addresses are retained, sorted, and deduplicated. For an advertised hostname,
+the first address in that deterministic ordering becomes the concrete address
+published to SWIM. Resolution is bounded; an invalid or unresolvable
+advertise endpoint prevents SWIM startup rather than silently advertising an
+unrelated address.
+
 | Variable | Purpose |
 |---|---|
 | `GRID_SWIM_BIND_ADDR` | UDP address to bind the SWIM listener |
-| `GRID_SWIM_ADVERTISE_ADDR` | Address advertised to peers (defaults to `$(POD_IP):7946`) |
+| `GRID_SWIM_ADVERTISE_ADDR` | Advertised SWIM endpoint; accepts `ip:port`, `[ipv6]:port`, or `hostname:port` and defaults to `$(POD_IP):7946` |
 | `GRID_SWIM_SITE_NAME` | Unique site identity for this operator instance |
-| `GRID_SWIM_SEEDS` | Comma-separated SWIM seed addresses |
+| `GRID_SWIM_SEEDS` | Comma-separated SWIM seed endpoints; accepts `ip:port`, `[ipv6]:port`, or `hostname:port` |
 | `GRID_GATEWAY_ADDRESS` | Explicit gateway address override (skips self-discovery) |
 | `GRID_GATEWAY_SERVICE_NAME` | Service name for gateway self-discovery (default: `provider-gateway`) |
 | `GRID_GATEWAY_NAMESPACE` | Namespace for gateway Service lookup (default: `grid-system`) |
@@ -349,11 +364,14 @@ The GridNetwork controller:
 ### CRD-driven seeds
 
 `spec.seeds` is **operator-consumed**: on every `GridNetwork` reconcile the
-controller parses the seed list, filters invalid addresses (logged at `warn`,
-no reconcile failure), removes the local advertise address to prevent self-
-announce noise, deduplicates, and calls `SwimHandle::announce_seeds` to deliver
-the batch to the running SWIM event loop.  Re-announcing to already-connected
-peers is idempotent — foca ignores redundant joins.
+controller parses and resolves each entry independently, logs invalid or
+temporarily unresolvable entries at `warn`, retains successful addresses,
+removes the local advertise address to prevent self-announce noise,
+deduplicates, and calls `SwimHandle::announce_seeds` to deliver the batch to
+the running SWIM event loop. Re-announcing to already-connected peers is
+idempotent — foca ignores redundant joins. If every non-empty configured seed
+fails, the controller retains the last-known-good resolved set; if none exists,
+SWIM remains active with a seedless bootstrap and a degradation warning.
 
 Startup seeds from `GRID_SWIM_SEEDS` (env var) and CRD seeds are additive.
 The env var seeds are applied once at startup; CRD seeds are applied on every
@@ -437,14 +455,17 @@ skipped for the current reconcile and retried on the next
 immediately under heavy broadcast load.
 
 **Seed format**
-Seeds must be `IP:port` socket addresses.  DNS names are not resolved.
-Example: `10.0.0.2:7946`.  Invalid addresses are skipped and logged at `warn`
-level; the reconcile does not fail.
+Seeds accept `IP:port`, `[IPv6]:port`, and `hostname:port`, for example
+`10.0.0.2:7946` or `grid-swim.example.internal:7946`. DNS is resolved during
+each reconciliation with per-endpoint and aggregate bounds; results are sorted
+and deduplicated. Invalid or failed entries are skipped with source and
+endpoint diagnostics. A partial result is announced, while a wholly failed
+non-empty list does not replace a working last-known-good set.
 
 **Troubleshooting seed changes**
 
 *New seed not joining:*
-- Verify the address is a valid `IP:port`.
+- Verify the address is a valid `IP:port`, `[IPv6]:port`, or `hostname:port`.
 - Check the operator log for `announcing CRD seeds to SWIM runtime` or
   `new CRD seeds added` — if absent, the reconcile may not have fired yet.
 - Check for `failed to queue CRD seeds for SWIM announcement` at `warn` level,
@@ -1151,6 +1172,7 @@ Available commands:
 | `cargo xtask env verify-stale-gc-ttl` | Verifies `GridNetwork.spec.staleCandidateTtlSeconds` evicts stale remote candidates from the rendered overlay |
 | `cargo xtask env verify-responses-routing` | Verifies `/v1/responses` request parsing and Grid overlay routing using `openai_responses_format` → `intelligent_route` filter chain |
 | `cargo xtask env verify-crd-schema` | Verifies required generated CRD schema fields without requiring kind clusters |
+| `cargo xtask env verify-swim-dns-hostnames` | Verifies hostname-based SWIM advertise/seeds, membership convergence, and CRDT provider-state propagation |
 | `cargo xtask env verify-operator-install-rbac` | Applies install manifests, runs positive/negative RBAC checks, proves minimal reconcile succeeds |
 | `cargo xtask env validate-all` | Runs the local validation suite and prints a Markdown result table |
 
@@ -1221,6 +1243,17 @@ state.
 ```console
 cargo xtask env verify-swim-state -c tests/env/operator-routing.toml
 ```
+
+To qualify hostname-based SWIM endpoints without relying on public DNS:
+
+```console
+GRID_SWIM_DNS_EVIDENCE_DIR=/tmp/grid-swim-dns-run-1 \
+  cargo xtask env verify-swim-dns-hostnames -c tests/env/operator-routing.toml
+```
+
+The qualification uses two distinct loopback ports with `localhost:port`
+advertise and seed endpoints, then proves membership and remote provider-state
+propagation before cleaning its resources.
 
 This command starts two SWIM-enabled operator processes,
 waits for gossip convergence, then applies a
