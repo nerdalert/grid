@@ -49,6 +49,7 @@ Topology and execution details are maintained in the
 |---|---|
 | `verify-swim-membership` | Real SWIM gossip drives GridNetwork membership state. |
 | `verify-swim-state` | CRDT-over-SWIM provider state propagates across sites. |
+| `verify-swim-dns-hostnames` | Hostname-based advertise and seed endpoints resolve before SWIM startup, then membership and provider-state propagation are verified. |
 | `verify-metrics-routing` | Live normalized metrics affect overlay ordering and request routing. |
 | `verify-stale-gc-ttl` | Aged stale candidates are omitted from rendered overlays when TTL is configured. |
 | `verify-api-fallback-native` | Provider credentials are injected from mounted Secret files, not overlay or ConfigMap token bytes. |

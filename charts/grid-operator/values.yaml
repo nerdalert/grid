@@ -68,13 +68,13 @@ metrics:
 swim:
   # -- SWIM bind address (host:port).
   bindAddress: "0.0.0.0:7946"
-  # -- Externally reachable SWIM advertise address (host:port). Defaults to
+  # -- Externally reachable SWIM advertise endpoint (ip:port, [ipv6]:port, or hostname:port). Defaults to
   # Pod IP and bind port. Must be set when a LoadBalancer or NodePort Service
   # fronts the SWIM port and remote peers connect through that address.
   advertiseAddress: ""
   # -- Bootstrap SWIM site name override.
   siteName: ""
-  # -- Bootstrap SWIM seed addresses (comma-separated).
+  # -- Bootstrap SWIM seed endpoints (comma-separated ip:port, [ipv6]:port, or hostname:port).
   seeds: ""
   # -- SWIM Service (disabled by default).
   service:

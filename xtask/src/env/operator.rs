@@ -1247,7 +1247,7 @@ pub(crate) fn spawn_operator(context: &str) -> Result<Child, Box<dyn std::error:
 ///
 /// `bind_addr` and `advertise_addr` are the SWIM UDP addresses.
 /// `site_name` is the stable SWIM site identity.
-/// `seeds` is a comma-separated list of seed addresses (empty = no seeds).
+/// `seeds` is a comma-separated list of seed endpoints (empty = no seeds).
 #[expect(
     clippy::too_many_lines,
     reason = "kubeconfig export + process spawn + sleep: splitting obscures the startup contract"
@@ -1729,10 +1729,9 @@ pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::
 ///
 /// Both operators are started with `GRID_SWIM_SEEDS=""`.  The secondary operator
 /// has no peer at startup.  After this fixture is applied, the secondary's
-/// `GridNetwork` reconcile calls `parse_crd_seeds(spec.seeds, local_addr)`
-/// which filters out the primary address only if it matches the secondary's
-/// own `local_addr`; since it does not, the secondary announces to the primary
-/// via the SWIM runtime channel.  SWIM gossip then converges and the `GridNetwork`
+/// `GridNetwork` reconcile resolves and normalizes `spec.seeds`, filters out
+/// the local address, and announces to the primary via the SWIM runtime
+/// channel.  SWIM gossip then converges and the `GridNetwork`
 /// reaches `Active`.
 ///
 /// # Errors
