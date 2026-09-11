@@ -47,6 +47,15 @@ pub struct InferenceProviderSpec {
     /// Backend deployment category.
     pub backend_kind: String,
 
+    /// Stable provider-gateway identity used by administrative operations.
+    ///
+    /// Providers with the same value are drained together by the gateway-wide
+    /// operation. It is an explicit control-plane relationship; the operator
+    /// never infers it from endpoint URLs.
+    #[schemars(length(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_ref: Option<String>,
+
     /// Cost information.
     pub cost: Option<CostConfig>,
 
@@ -92,6 +101,20 @@ pub struct InferenceProviderSpec {
     ///
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
     pub metrics_config: Option<MetricsConfig>,
+
+    /// Optional administrative traffic policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_policy: Option<TrafficPolicy>,
+}
+
+/// Administrative policy for provider traffic.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct TrafficPolicy {
+    /// Stop new sessions while preserving existing affinity sessions.
+    #[serde(default)]
+    pub drain: bool,
 }
 
 /// Prometheus metrics scraping configuration for an `InferenceProvider`.
@@ -486,6 +509,38 @@ mod tests {
         let spec: InferenceProviderSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert_eq!(spec.provider_kind, "anthropic", "provider kind");
         assert_eq!(spec.models.len(), 1, "model count");
+    }
+
+    #[test]
+    fn administrative_policy_round_trips_and_is_omitted_by_default() {
+        let base = serde_json::json!({
+            "gridNetworkRef": "production", "providerKind": "self_hosted",
+            "backendKind": "local", "endpoint": "http://backend:8080"
+        });
+        let spec: InferenceProviderSpec = serde_json::from_value(base).unwrap_or_else(|_| std::process::abort());
+        let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
+        assert!(serialized.get("gatewayRef").is_none());
+        assert!(serialized.get("trafficPolicy").is_none());
+
+        let drained: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
+            "gridNetworkRef": "production", "providerKind": "self_hosted",
+            "backendKind": "local", "endpoint": "http://backend:8080",
+            "gatewayRef": "provider-gateway-a", "trafficPolicy": {"drain": true}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(drained.gateway_ref.as_deref(), Some("provider-gateway-a"));
+        assert!(drained.traffic_policy.as_ref().is_some_and(|p| p.drain));
+    }
+
+    #[test]
+    fn crd_contains_administrative_provider_fields() {
+        let crd = crd_json();
+        let properties = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(properties.contains_key("gatewayRef"));
+        assert!(properties.contains_key("trafficPolicy"));
     }
 
     #[test]

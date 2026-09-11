@@ -17,6 +17,7 @@ pub(crate) mod kubectl;
 pub(crate) mod llmd_pool_metrics_demo;
 pub(crate) mod operator;
 pub(crate) mod operator_overlay;
+pub(crate) mod provider_drain;
 pub(crate) mod provider_traffic_qualification;
 pub(crate) mod providers;
 pub(crate) mod single_cluster_multi_gateway_qualification;
@@ -200,6 +201,33 @@ pub(crate) fn demo_root(forge_config: &Path) -> PathBuf {
 /// Actions for the `env` subcommand.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Action {
+    /// Drain or restore all providers explicitly assigned to a gateway.
+    ProviderDrain {
+        /// Kubernetes context containing the provider resources.
+        #[arg(long)]
+        context: String,
+        /// Explicit provider-gateway identity from `spec.gatewayRef`.
+        #[arg(long, conflicts_with = "provider")]
+        gateway: Option<String>,
+        /// Drain or restore one named `InferenceProvider`.
+        #[arg(long, conflicts_with = "gateway")]
+        provider: Option<String>,
+        /// Preview the exact selected providers without changing resources.
+        #[arg(long)]
+        dry_run: bool,
+        /// Restore providers instead of draining them.
+        #[arg(long)]
+        undrain: bool,
+        /// `GridNetwork` used to verify projected overlay convergence.
+        #[arg(long, requires = "consumer")]
+        network: Option<String>,
+        /// Consumer gateway Deployment(s) whose revisions must converge.
+        #[arg(long = "consumer", requires = "network")]
+        consumers: Vec<String>,
+        /// Maximum time to wait for observed status, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
+    },
     /// Materialize a Forge config with `GRID_XTASK_*` image overrides.
     MaterializeForgeConfig {
         /// Source Forge environment config.
@@ -1126,6 +1154,25 @@ mod llmd_pool_metrics_demo_cli_tests {
 )]
 pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
     match action {
+        Action::ProviderDrain {
+            context,
+            gateway,
+            provider,
+            dry_run,
+            undrain,
+            network,
+            consumers,
+            timeout_seconds,
+        } => provider_drain::run(
+            context,
+            gateway.as_deref(),
+            provider.as_deref(),
+            *dry_run,
+            *undrain,
+            Duration::from_secs(*timeout_seconds),
+            network.as_deref(),
+            consumers,
+        ),
         Action::MaterializeForgeConfig { forge_config, output } => {
             let resolved = forge_config::materialize(forge_config, output.as_deref())?;
             eprintln!("materialized Forge config: {}", resolved.display());

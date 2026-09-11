@@ -347,7 +347,10 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
             } else {
                 provider_admission::Observation::NotConfigured
             };
-            let state = memory.evaluate(&memory_key, observation, admission_policy, now);
+            let state = crate::resources::geography::apply_administrative_drain(
+                memory.evaluate(&memory_key, observation, admission_policy, now),
+                provider.spec.traffic_policy.as_ref().is_some_and(|p| p.drain),
+            );
             admission_keys.push(memory_key);
             admission_states.insert(identity, state);
         }

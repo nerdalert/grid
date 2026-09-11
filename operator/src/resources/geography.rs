@@ -140,6 +140,19 @@ pub(crate) fn derive_admission_state(metrics: Option<&scoring::BackendMetrics>) 
     AdmissionState::NewAndExisting
 }
 
+/// Apply administrative drain without overriding a hard exclusion.
+///
+/// This is deliberately pure: health, staleness, trust, and exclusion are
+/// resolved before this cap is applied. Clearing drain returns the supplied
+/// health/metrics-derived state unchanged.
+pub(crate) fn apply_administrative_drain(state: AdmissionState, drain: bool) -> AdmissionState {
+    if drain && state == AdmissionState::NewAndExisting {
+        AdmissionState::ExistingOnly
+    } else {
+        state
+    }
+}
+
 /// Deterministic stable ID for a routing candidate.
 ///
 /// Computed as `fnv1a_hex8("{kind}/{name}/{site}/{cluster}")`.
@@ -325,6 +338,38 @@ mod tests {
             derive_admission_state(Some(&m)),
             AdmissionState::Excluded,
             "unhealthy must be Excluded"
+        );
+    }
+
+    #[test]
+    fn administrative_drain_caps_only_eligible_providers() {
+        assert_eq!(
+            apply_administrative_drain(AdmissionState::NewAndExisting, true),
+            AdmissionState::ExistingOnly
+        );
+        assert_eq!(
+            apply_administrative_drain(AdmissionState::ExistingOnly, true),
+            AdmissionState::ExistingOnly
+        );
+        assert_eq!(
+            apply_administrative_drain(AdmissionState::Excluded, true),
+            AdmissionState::Excluded
+        );
+    }
+
+    #[test]
+    fn clearing_administrative_drain_preserves_derived_state() {
+        assert_eq!(
+            apply_administrative_drain(AdmissionState::NewAndExisting, false),
+            AdmissionState::NewAndExisting
+        );
+        assert_eq!(
+            apply_administrative_drain(AdmissionState::ExistingOnly, false),
+            AdmissionState::ExistingOnly
+        );
+        assert_eq!(
+            apply_administrative_drain(AdmissionState::Excluded, false),
+            AdmissionState::Excluded
         );
     }
 

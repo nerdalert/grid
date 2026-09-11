@@ -2545,6 +2545,7 @@ mod tests {
             access_policy: crate::crd::auth::AccessPolicy::default(),
             auth: None,
             backend_kind: "local".to_owned(),
+            gateway_ref: None,
             cost: None,
             endpoint: endpoint.to_owned(),
             health_check,
@@ -2556,6 +2557,7 @@ mod tests {
             provider_kind: "self_hosted".to_owned(),
             routing_cluster_ref: None,
             metrics_config: None,
+            traffic_policy: None,
             site_selector: crate::crd::auth::SelectorConfig::default(),
         }
     }
