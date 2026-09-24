@@ -62,6 +62,27 @@ spec:
         capUsd: 250.0
 ```
 
+### Routing policy fields
+
+These optional `GridNetwork.spec` fields control provider ordering, admission,
+and request selection. For guidance on composing them to achieve a routing
+behavior, see the [Grid Routing Guide](../routing.md).
+
+| Field | Supported values / shape | Default and interaction |
+|---|---|---|
+| `routingPolicy` | `geographyFirst`, `scoreFirst` | `geographyFirst`. Controls candidate ordering and selection-group boundaries. |
+| `scoringPolicy.strategy` | `noMetrics`, `queueDepth`, `kvCachePressure` | `noMetrics`; when `scoringPolicy` is present, `strategy` is required. |
+| `selectionPolicy.mode` | `deterministic`, `roundRobin`, `random`, `weightedRandom` | Omitted from the overlay when unset; Praxis then uses deterministic selection. |
+| `placementPolicy.strategy` | `static` | Required if and only if selection mode is `weightedRandom`; rejected with other modes. |
+| `admissionPolicy.mode` | `instantaneous`, `stabilized` | `instantaneous`; stabilized behavior requires repeated pressure/recovery observations. |
+| `admissionPolicy.missingMetrics` | `existingOnly`, `excluded` | `existingOnly` when admission policy is configured. Applies when an active scoring strategy and provider signal are configured but the signal is missing or expired; it does not activate metrics observation. |
+| `admissionPolicy.pressure` | Six fields: `enterThreshold`, `exitThreshold`, `failureThreshold`, `successThreshold`, `minimumStateDuration`, `recoveryHoldDown` | When `pressure` is omitted, defaults are `0.85`, `0.70`, `2`, `3`, `10s`, and `30s`, respectively. When supplied, all six fields are required. Exit must be lower than enter; durations must be positive whole seconds (for example, `10s`). |
+| `metricsRefreshInterval` | Seconds or milliseconds, at least one second | `300s`; TLS-protected metrics cap the effective interval at `60s`. Controls metric refresh/re-ranking, not request-time selection. |
+
+`geographyFirst` and `scoreFirst` are the only current routing-policy values.
+Explicit grouping fields such as `selectionPolicy.grouping.localityScope` are
+not part of this CRD.
+
 **Phases**: Pending → Initializing → Active → Degraded
 
 **Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
@@ -484,23 +505,19 @@ grid.
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: InferenceProvider
 metadata:
-  name: anthropic-api
+  name: openai-api
 spec:
   gridNetworkRef: production
-  providerKind: anthropic       # open_ai | anthropic | bedrock | vertex | self_hosted
+  providerKind: open_ai          # open_ai | anthropic | bedrock | vertex | self_hosted
   backendKind: api_provider     # local | remote | cloud_managed | api_provider
-  endpoint: https://api.anthropic.com
+  endpoint: https://api.openai.com
   models:
-    - name: claude-sonnet-4
-      contextWindow: 200000
-      capabilities: [tool_calling, vision, streaming]
-  cost:
-    perMillionInputTokens: 3.0
-    perMillionOutputTokens: 15.0
+    - name: gpt-5-mini
+      capabilities: [text_generation]
   auth:
     strategy: bearer_token      # current native path; see Auth doc
     secretRef:
-      name: anthropic-token
+      name: openai-token
       namespace: praxis-system
       key: token
   accessPolicy:
@@ -508,26 +525,22 @@ spec:
       matchLabels: {}           # empty = all sites
   siteSelector:
     matchLabels: {}
-  healthCheck:
-    interval: 30s
-    path: /v1/messages
-  metricsConfig:
-    path: /metrics
-    timeout: 2s
-    signalNames:
-      queueDepth: provider_queue_depth_normalized
-      kvCacheUtilization: provider_kv_cache_utilization
-      latencyP99Ms: provider_latency_p99_ms
-      prefixCacheHitRatio: provider_prefix_cache_hit_ratio
-      errorRate: provider_error_rate
-      healthy: provider_healthy
-    tls:
-      caSecretRef:
-        name: metrics-ca
-        namespace: grid-system
 ```
 
+This external API example intentionally omits `healthCheck`: Grid probes health
+with an unauthenticated HTTP `GET`, which is not the provider's authenticated
+inference API. It also omits metrics scraping because the external API does not
+provide the provider-pool metrics used by Grid scoring. The referenced
+`openai-token` Secret must exist in `praxis-system` before controller-managed
+credential projection can become available.
+
 **Phases**: Pending → Available → Degraded → Unavailable
+
+`spec.capacityWeight` is an optional positive relative provider capacity from
+`1` through `1000`, used only with `GridNetwork.spec.selectionPolicy.mode:
+weightedRandom` and `placementPolicy.strategy: static`. If omitted, the
+effective weight is `1`. Grid copies this value to the overlay's
+`traffic_weight`; it does not represent a percentage.
 
 ### Backend kind
 
@@ -543,6 +556,11 @@ spec:
 The value influences scoring and routing policy. It does not require a specific
 transport implementation; for example, a `cloud_managed` backend can still be
 fronted by Praxis.
+
+The current CRD schema represents `backendKind` as a string rather than an
+enum. The four values above are the categories Grid recognizes for routing and
+scoring conversion; an unrecognized value is not converted into a normal
+scoring candidate. Use a listed value unless the implementation is extended.
 
 ### Credential projection
 
@@ -580,16 +598,21 @@ feeds the resulting `BackendMetrics` into overlay scoring.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `path` | `/metrics` | HTTP path, relative to `spec.endpoint`. |
+| `metricsEndpoint` | absent | Optional metrics-service base URL. When set, it replaces `spec.endpoint` as the scrape base; `path` is appended to the selected base. |
+| `path` | `/metrics` | HTTP path, relative to `metricsEndpoint` when set, otherwise `spec.endpoint`. |
 | `timeout` | `2s` | Scrape timeout. `s` and `ms` suffixes are recognized. |
+| `poolName` | absent | Selects samples whose Prometheus `name` label matches this pool. When set, the scrape must contain at least one configured signal for that pool. |
+| `queueCapacity` | absent | For raw queue-depth counts, divide by this positive capacity and clamp the normalized value to `0.0..1.0`. Without it, queue depth must already be normalized. |
 | `signalNames` | all unset | Mapping from scoring signals to Prometheus metric names. |
-| `staleMetricsSeconds` | absent | Grace period (seconds) for using a cached sample when the current scrape fails.  When absent, scrape failures immediately produce neutral scoring.  Minimum: `1`. |
+| `staleMetricsSeconds` | absent | Maximum age in seconds for reusing the last successful sample after a failed scrape. Minimum: `1`. For plaintext metrics, absence means immediate neutral fallback; when TLS is configured, an expired/absent sample makes the provider unhealthy and excluded. |
 | `tls` | absent | TLS configuration for metrics scraping.  See [TLS and mTLS](#tls-and-mtls). |
 
-Providers without `metricsConfig`, providers with failed scrapes (outside any
-configured grace period), and signals without configured metric names use neutral
-metric scores.  See [Stale metrics grace period](routing.md#stale-metrics-grace-period)
-in the routing architecture for the full semantics.
+Providers without `metricsConfig` and signals without configured metric names
+use neutral metric scores. For scrape failures, plaintext configuration retains
+the neutral-scoring compatibility behavior; TLS-configured metrics fail closed
+after any configured stale-sample grace period expires. See
+[Stale metrics grace period](routing.md#stale-metrics-grace-period) in the
+routing architecture for full semantics.
 
 #### Signal names
 
@@ -616,7 +639,7 @@ requests to this provider's metrics endpoint.
 | `tls.clientCertificateSecretRef.certificateKey` | no | Key within `Secret.data` for the certificate PEM. Default: `tls.crt`. |
 | `tls.clientCertificateSecretRef.privateKeyKey` | no | Key within `Secret.data` for the private key PEM. Default: `tls.key`. |
 
-`caSecretRef` follows the same [`SecretRef`](#secretref) schema used by
+`caSecretRef` follows the same [`SecretRef`](#credential-projection) schema used by
 `spec.auth.secretRef`.  `clientCertificateSecretRef` adds explicit
 `certificateKey` and `privateKeyKey` fields with serde defaults.
 
@@ -630,13 +653,13 @@ machine-readable `status.reason`:
 | `MetricsTlsKeyMissing` | reconcile-time | The expected key is absent from `Secret.data`. |
 | `MetricsTlsMaterialInvalid` | reconcile-time | PEM material could not be parsed. |
 | `MetricsTlsIdentityMismatch` | reconcile-time | Client certificate and private key do not match. |
-| `MetricsTlsHandshakeFailed` | scrape-time | TLS handshake failed (wrong CA, expired cert, hostname mismatch). |
-| `MetricsUnauthorized` | scrape-time | Metrics endpoint returned HTTP 401 or 403. |
-| `MetricsScrapeTimeout` | scrape-time | Metrics scrape timed out before receiving a response. |
 
-Scrape-time failures are logged with the classified reason.  The provider
-falls back to the stale metrics cache (if `staleMetricsSeconds` is set) or
-is excluded from routing with `UNOBSERVABLE_METRICS` (`healthy: false`).
+Scrape-time handshake, authorization, timeout, and transport failures are
+classified in operator logs, not surfaced as `InferenceProvider.status.reason`.
+The last successful sample is reused only within `staleMetricsSeconds`; after
+that, a TLS-configured provider is marked unhealthy (`healthy: false`) and
+excluded from routing. Without TLS, scrape failures retain the neutral-scoring
+compatibility behavior.
 
 There is no `insecureSkipVerify` option.
 

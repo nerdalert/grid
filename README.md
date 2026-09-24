@@ -83,6 +83,10 @@ llm-d pools can opt into `queueDepth` or `kvCachePressure`.
 Request-specific prefix affinity remains inside llm-d EPP,
 which selects a pod after Grid selects a provider pool.
 
+See the [Grid Routing Guide](docs/routing.md) for configuration by routing
+need, selection groups, request-time selection modes, affinity, and runnable
+examples.
+
 ## Request Flow
 
 Once the overlay is loaded, a request flows through
@@ -169,7 +173,8 @@ See the [development guide](docs/development.md) and
 
 - [Architecture overview](docs/architecture/overview.md)
 - [Custom resources](docs/architecture/crds.md)
-- [Routing](docs/architecture/routing.md)
+- [Routing Guide](docs/routing.md)
+- [Routing Architecture and Overlay Contract](docs/architecture/routing.md)
 - [Scoring](docs/architecture/scoring.md)
 - [Auth and policy](docs/architecture/auth.md)
 - [Operations](docs/architecture/operations.md)

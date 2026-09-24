@@ -111,8 +111,8 @@ Add the InferenceProvider to the `inferenceProviders` array:
 inferenceProviders:
   - name: existing-mock-provider
     gridNetworkRef: my-grid
-    providerKind: InCluster
-    backendKind: MockInference
+    providerKind: self_hosted
+    backendKind: local
     endpoint: "http://mock-inference-existing.grid-system.svc.cluster.local:8080"
     siteSelector:
       matchLabels:
@@ -123,8 +123,8 @@ inferenceProviders:
 
   - name: my-new-provider                    # new
     gridNetworkRef: my-grid
-    providerKind: InCluster
-    backendKind: MockInference
+    providerKind: self_hosted
+    backendKind: local
     endpoint: "http://mock-inference-new-provider.grid-system.svc.cluster.local:8080"
     siteSelector:
       matchLabels:

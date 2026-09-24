@@ -448,6 +448,8 @@ metadata:
   name: mock-west1-a         # becomes overlay candidate cluster name
 spec:
   gridNetworkRef: my-grid
+  providerKind: self_hosted
+  backendKind: local
   endpoint: "http://mock-inference-a.grid-system.svc.cluster.local:8080"
   siteSelector:
     matchLabels:
@@ -462,6 +464,8 @@ metadata:
   name: mock-west1-b
 spec:
   gridNetworkRef: my-grid
+  providerKind: self_hosted
+  backendKind: local
   endpoint: "http://mock-inference-b.grid-system.svc.cluster.local:8080"
   siteSelector:
     matchLabels:

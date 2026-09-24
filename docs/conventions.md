@@ -664,6 +664,5 @@ its code. The gates:
   the policy above. Human's are responsible for the code they
   submit, and must know it and understand it prior to
   submission, regardless of what tooling they used to produce it.
-- **Proposals**: proposal files must satisfy the
-  frontmatter and lifecycle rules in
-  [proposals.md](proposals.md).
+- **Proposals**: this repository has no proposal-specific file or lifecycle
+  guide. Discuss proposed changes through the normal issue and PR process.

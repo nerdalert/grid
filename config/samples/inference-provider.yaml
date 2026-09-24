@@ -1,38 +1,28 @@
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: InferenceProvider
 metadata:
-  name: anthropic-production
+  name: openai-production
 spec:
   # Link to the GridNetwork
   gridNetworkRef: example
 
   # Provider configuration
-  providerKind: anthropic
+  providerKind: open_ai
   backendKind: api_provider
-  endpoint: https://api.anthropic.com
+  endpoint: https://api.openai.com
 
   # Models served
   models:
-    - name: claude-3-5-sonnet-20241022
-      capabilities: ["text_generation", "tool_use"]
-      contextWindow: 200000
-    - name: claude-3-5-haiku-20241022
-      capabilities: ["text_generation", "tool_use"]
-      contextWindow: 200000
+    - name: gpt-5-mini
+      capabilities: ["text_generation"]
 
   # Authentication (requires Secret)
   auth:
-    strategy: api_key
-    manual: false
+    strategy: bearer_token
     secretRef:
-      name: anthropic-api-key
+      name: openai-api-key
       namespace: default
-      key: api-key
-
-  # Cost information (approximate)
-  cost:
-    perMillionInputTokens: 3.00
-    perMillionOutputTokens: 15.00
+      key: token
 
   # Site selector (matches all sites)
   siteSelector:
@@ -59,8 +49,4 @@ spec:
   #       name: client-cert
   #       namespace: grid-system
 
-  # No metrics scraping for external API
-  metricsConfig: null
-
-  # Use provider name as routing cluster
-  routingClusterRef: null
+  # Omit metricsConfig because this external API has no provider-pool metrics.

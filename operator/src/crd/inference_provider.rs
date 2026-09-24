@@ -127,8 +127,10 @@ pub struct TrafficPolicy {
 /// The operator scrapes `{spec.endpoint}{path}` (or `{metrics_endpoint}{path}`
 /// when set) and parses the Prometheus text using the `signal_names` mapping.
 /// Signals without a configured name receive the neutral default (`0.5`) in
-/// scoring.  Scrape failures are non-fatal: the provider falls back to
-/// locality and cost scoring.
+/// scoring. Plaintext scrape failures retain neutral-scoring compatibility
+/// behavior. When TLS is configured, a failed scrape uses a successful cached
+/// sample only within `stale_metrics_seconds`; after that the provider is
+/// marked unhealthy and excluded from routing.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsConfig {
@@ -198,17 +200,18 @@ pub struct MetricsConfig {
     /// Maximum age in seconds for which a previously-scraped metric sample may be
     /// used when the current scrape fails.
     ///
-    /// When a Prometheus scrape fails (connection refused, timeout, HTTP error) the
-    /// operator normally drops the provider's metrics and falls back to neutral
-    /// (`0.5`) scoring for all signals.  Setting this field enables a grace period:
-    /// if the last *successful* scrape is no older than `stale_metrics_seconds`, that
-    /// cached sample is used instead of neutral scoring.
+    /// When a Prometheus scrape fails (connection refused, timeout, HTTP error),
+    /// setting this field enables a grace period: if the last *successful* scrape
+    /// is no older than `stale_metrics_seconds`, that cached sample is reused.
     ///
-    /// After the grace period expires, or when no successful scrape has ever been
-    /// recorded for this reconcile epoch, the provider returns to neutral scoring.
+    /// For plaintext metrics, after the grace period expires or before any
+    /// successful scrape, metrics fall back to neutral scoring. When TLS is
+    /// configured, the same condition marks the provider unhealthy and excludes
+    /// it from routing.
     ///
-    /// **Default (absent):** no grace period — scrape failures immediately produce
-    /// neutral scoring.  This preserves backward-compatible behaviour.
+    /// **Default (absent):** no grace period. Plaintext scrape failures immediately
+    /// produce neutral scoring; TLS-configured failures without a cached sample
+    /// fail closed.
     ///
     /// **Minimum value:** `1` second.  The schema rejects `0`; the operator also
     /// treats zero defensively as absent.

@@ -609,9 +609,12 @@ pub struct GridNetworkSpec {
     /// Provider admission and pressure-recovery policy.
     ///
     /// When omitted, Grid preserves the historical instantaneous admission
-    /// behaviour and providers without metrics remain eligible. New
-    /// stabilized deployments should set this explicitly so missing metrics
-    /// fail closed according to `missingMetrics`.
+    /// behaviour and providers without metrics remain eligible. Stabilized
+    /// pressure transitions require an active metrics scoring strategy and a
+    /// matching provider signal name. Without those, the observation is
+    /// `NotConfigured` and the provider remains `new_and_existing`; the
+    /// `missingMetrics` policy applies only after a configured signal is
+    /// missing or stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_policy: Option<AdmissionPolicyConfig>,
 

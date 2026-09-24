@@ -1,22 +1,20 @@
 # Grid Documentation
 
+## Routing
+
+- [Routing Guide](routing.md): choose a routing behavior and configure policy,
+  scoring, selection groups, affinity, and selection modes.
+- [Routing Architecture and Overlay Contract](architecture/routing.md):
+  overlay format, revision lifecycle, scope, provenance, security, and delivery.
+- [Provider Scoring](architecture/scoring.md): metrics input, normalization,
+  stale data, and scoring implementation.
+- [Custom Resource Definitions](architecture/crds.md): complete API fields
+  and defaults, including routing configuration.
+
 ## Architecture
 
 - [Overview](architecture/overview.md) — operator responsibilities, data-plane
   boundaries, workspace crates, and terminology.
-- [Custom Resource Definitions](architecture/crds.md) — `GridNetwork`,
-  `GridSite`, `InferenceProvider`, and provider status shape.
-- [Routing](architecture/routing.md) — versioned overlay contract, revision
-  lifecycle, candidate ordering, `intelligent_route`, `peer_identity_trust`, and
-  provider-side request forwarding.
-- [Provider Selection and Load Balancing](architecture/provider-selection-and-load-balancing.md) —
-  eligibility, routing groups, scoring, selection modes, affinity, and
-  overlay lifecycle.
-- [Static Provider Weighting](architecture/static-weighting.md) — configured
-  relative capacity, policy precedence, cross-site propagation, and weighted
-  request selection.
-- [Scoring](architecture/scoring.md) — operator-side candidate scoring,
-  metrics input, and request-time scoring boundaries.
 - [Auth and Policy](architecture/auth.md) — provider authentication strategies,
   access policy, and trust model.
 - [Consumer Config](architecture/consumer-config.md) — operator-generated

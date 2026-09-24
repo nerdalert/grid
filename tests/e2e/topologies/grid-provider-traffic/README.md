@@ -226,7 +226,7 @@ sequenceDiagram
 
 ## Related documentation
 
-- [Provider Selection and Load Balancing](../../../../docs/architecture/provider-selection-and-load-balancing.md)
+- [Round-robin selection in the Grid Routing Guide](../../../../docs/routing.md#3-round-robin-selection)
 - [Routing](../../../../docs/architecture/routing.md)
 - [Provider Scoring](../../../../docs/architecture/scoring.md)
 - [Consumer Config](../../../../docs/architecture/consumer-config.md)

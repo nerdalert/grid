@@ -153,18 +153,16 @@ stringData:
   token: sk-provider-token
 ```
 
+Partial `InferenceProvider.spec.auth` snippet (merge it into a complete
+`InferenceProvider` using the `grid.praxis-proxy.io/v1alpha1` API):
+
 ```yaml
-apiVersion: inference.networking.x-k8s.io/v1alpha1
-kind: InferenceProvider
-metadata:
-  name: api-provider
-spec:
-  auth:
-    strategy: bearer_token
-    secretRef:
-      name: api-provider-creds
-      namespace: default
-      key: token
+auth:
+  strategy: bearer_token
+  secretRef:
+    name: api-provider-creds
+    namespace: default
+    key: token
 ```
 
 The difference is where the resolved token lands:

@@ -1,9 +1,8 @@
 # Provider Scoring
 
-For the complete relationship between scoring, routing groups, and request-time
-selection, see [Provider Selection and Load Balancing](provider-selection-and-load-balancing.md).
-Scores influence candidate ordering; they are not traffic weights and do not
-split selection groups.
+For how scoring interacts with routing policy, selection groups, and request-time
+selection, see the [Grid Routing Guide](../routing.md). This page covers metric
+inputs, normalization, and the provider scoring implementation.
 
 Grid scores provider pools when the operator renders a Praxis routing overlay.
 Praxis reads that overlay from memory at request time; it does not call Grid,
@@ -125,6 +124,10 @@ has a real provider-level signal with defined freshness and normalization.
 Use `metricsEndpoint` when metrics are exposed by an llm-d EPP service rather
 than the inference endpoint:
 
+The signal names below are illustrative. Match them to the deployed exporter's
+`/metrics` output and pool labels; scheduler versions and adapters can expose
+different names. They are not guaranteed defaults for every llm-d deployment.
+
 ```yaml
 spec:
   endpoint: http://inference-pool.inference.svc:8000
@@ -136,9 +139,9 @@ spec:
     queueCapacity: 64
     staleMetricsSeconds: 30
     signalNames:
-      queueDepth: llm_d_router_epp_average_queue_size
-      kvCacheUtilization: llm_d_router_epp_average_kv_cache_utilization
-      healthy: llm_d_router_epp_ready_endpoints
+      queueDepth: inference_pool_average_queue_size
+      kvCacheUtilization: inference_pool_average_kv_cache_utilization
+      healthy: inference_pool_ready_pods
 ```
 
 | Field | Purpose |
@@ -160,55 +163,16 @@ NaN and infinite samples are discarded. Ratio values received through remote
 state are clamped before scoring. A local scrape failure may reuse the last
 successful sample while it remains within `staleMetricsSeconds`.
 
-A provider with no live metrics currently falls back to neutral signal values
-(0.5 for ratio signals, `healthy = true`). This compatibility behavior means a
-provider with missing telemetry can score competitively with a provider under
-real pressure. Production deployments using `queueDepth` or `kvCachePressure`
-should ensure every competing provider exposes fresh, comparable telemetry for
-the selected signal. `noMetrics` does not require a metrics endpoint.
-
-## Admission and Ordering
-
-Admission remains a harder boundary than score:
-
-| State | New requests | Existing sessions |
-|---|---|---|
-| `new_and_existing` | Allowed | Allowed |
-| `existing_only` | Rejected | Allowed |
-| `none` | Rejected | Rejected |
-
-`routingPolicy` then determines how the selected score interacts with
-geography:
-
-- `geographyFirst` keeps a same-site provider ahead of a remote provider.
-- `scoreFirst` allows the provider with the better selected signal to outrank
-  a local provider.
-
-Use `scoreFirst` when queue or KV pressure is intended to drive cross-site
-selection:
-
-```yaml
-spec:
-  routingPolicy: scoreFirst
-  scoringPolicy:
-    strategy: queueDepth
-```
-
-The routing overlay still contains the total score and score breakdown. A
-metric strategy has only its selected contribution; `noMetrics` has all-zero
-contributions. This keeps the decision easy to explain.
-
-## Scoring Is Not Request Distribution
-
-Grid scoring determines provider preference and overlay ordering. It does not
-perform a request-time control-plane lookup and does not itself guarantee a
-traffic ratio. Praxis performs local selection, session affinity, retry, and
-failover from its current overlay snapshot.
-
-If multiple providers should actively receive new traffic, the overlay must
-place them in the same eligible selection group or publish an explicit traffic
-distribution contract that Praxis understands. Recalculating a rank every few
-seconds is not a substitute for request-time load balancing.
+A provider with no live metrics and no configured metrics TLS currently falls
+back to neutral signal values (0.5 for ratio signals, `healthy = true`). This
+compatibility behavior means a provider with missing telemetry can score
+competitively with a provider under real pressure. For a provider configured
+with `metricsConfig.tls`, a failed scrape can reuse a successful sample only
+within `staleMetricsSeconds`; after that, Grid marks the provider unhealthy so
+it is excluded from routing. Production deployments using `queueDepth` or
+`kvCachePressure` should ensure every competing provider exposes fresh,
+comparable telemetry for the selected signal. `noMetrics` does not require a
+metrics endpoint.
 
 ## Current Limits
 
@@ -224,5 +188,6 @@ seconds is not a substitute for request-time load balancing.
   expose comparable telemetry; use `noMetrics` for heterogeneous providers.
 - Strategy changes alter the overlay on the next successful reconciliation.
 
-See [Routing and Overlays](routing.md) for admission, selection, stale-candidate
-retention, and overlay revision behavior.
+See the [Grid Routing Guide](../routing.md) for the operator-facing policy and
+selection model. See [Routing Architecture and Overlay Contract](routing.md)
+for candidate admission, stale-candidate retention, and overlay revision behavior.

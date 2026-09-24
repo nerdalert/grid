@@ -1,4 +1,8 @@
-# Routing
+# Routing Architecture and Overlay Contract
+
+For operator-facing routing choices and configuration examples, see the
+[Grid Routing Guide](../routing.md). This page describes how Grid renders,
+versions, distributes, and secures routing state.
 
 Grid routing is split between the Grid Operator control plane and the Praxis
 data plane. The operator renders routing state. Praxis consumes that state and
@@ -32,11 +36,10 @@ llm-d / EPP / inference backend
 
 Grid does not proxy traffic. It writes the overlay used by Praxis filters.
 
-For the complete provider-selection model, including selection groups and the
-`deterministic`, `roundRobin`, and `random` modes, see [Provider Selection
-and Load Balancing](provider-selection-and-load-balancing.md). Routing policy
-defines candidate ordering and hard group boundaries; selection policy controls
-request distribution within the first viable group.
+Grid orders candidates and assigns group metadata before publishing the
+overlay. Praxis consumes that state locally; the user-facing semantics of
+routing policies, selection groups, and picker modes are described in the
+[Grid Routing Guide](../routing.md).
 
 ## Control-plane rendering path
 
@@ -209,6 +212,9 @@ The envelope is the authoritative observable contract consumed by Praxis AI:
   "overlay": {
     "network": "production",
     "local_site": "site-east",
+    "selection_policy": {
+      "mode": "weightedRandom"
+    },
     "candidates": []
   }
 }
@@ -220,20 +226,27 @@ The nested `overlay` is the compact routing payload:
 {
   "network": "production",
   "local_site": "site-east",
+  "selection_policy": {
+    "mode": "weightedRandom"
+  },
   "candidates": [
     {
       "kind": "inference_model",
-      "name": "model-east",
+      "name": "shared-model",
       "site": "site-east",
       "cluster": "gateway-site-east",
-      "fresh": true
+      "fresh": true,
+      "selection_group": 0,
+      "traffic_weight": 50
     },
     {
       "kind": "inference_model",
-      "name": "model-west",
+      "name": "shared-model",
       "site": "site-west",
       "cluster": "gateway-site-west",
       "fresh": true,
+      "selection_group": 0,
+      "traffic_weight": 30,
       "credential": {
         "strategy": "bearer_token",
         "secretRef": {
@@ -247,6 +260,15 @@ The nested `overlay` is the compact routing payload:
 }
 ```
 
+`selection_group` is a zero-based, contiguous priority group for each
+capability (the candidate's `kind` and `name`). Praxis considers the first
+viable group and applies the overlay-level `selection_policy` within it.
+`traffic_weight` is a relative weight for `weightedRandom`, not a percentage
+or a score. Grid emits it from configured provider capacity when static
+weighted placement is enabled. If `selection_policy` is omitted, Praxis uses
+deterministic selection. Unknown selection modes and malformed policy
+structures are rejected rather than silently changed to a different mode.
+
 ### Revision semantics
 
 The v1 revision is the lowercase SHA-256 digest of the RFC 8785 canonical form
@@ -255,12 +277,13 @@ of these routing-relevant fields:
 - `network`
 - `local_site`
 - the ordered `candidates` array
+- `selection_policy`, when present
 
 Timestamps, provenance, Kubernetes metadata, and envelope annotations are not
 part of the semantic payload. Re-rendering identical routing state therefore
 produces the same revision. Candidate membership, order, admission, locality,
-freshness, credential references, or other serialized candidate content
-changes the revision.
+freshness, `selection_group`, `traffic_weight`, credential references, or other
+serialized candidate content changes the revision.
 
 In schema v1, `revision.value` and `content_digest.value` are identical. Praxis
 AI rejects an envelope when either value is malformed, the values disagree, or
@@ -314,24 +337,27 @@ correlation; they do not replace mTLS identity or provider-local route policy.
 
 Candidate fields:
 
-| Field | Meaning |
-|-------|---------|
-| `kind` | Capability kind, currently `inference_model` for model routing. |
-| `name` | Model or capability name matched by the consumer gateway. |
-| `site` | Grid site advertising the capability. |
-| `cluster` | Praxis load-balancer cluster identity used for upstream routing. |
-| `fresh` | Whether provider status is considered fresh enough for normal routing. |
-| `credential` | Optional. Secret reference for upstream authentication. Present only for `api_provider` or authenticated `cloud_managed` candidates. **Never contains the token value** — only the Kubernetes Secret locating information. |
-| `stable_id` | Optional. Deterministic FNV-1a hash of `{kind}/{name}/{site}/{cluster}`. Used as `candidate_id` in provider gateway `provider_route` configuration. This is distinct from the InferenceProvider CR `.metadata.name`. Also suitable for consumer-side session binding keys. |
-| `admission_state` | Optional. Bounded admission state: `"new_and_existing"`, `"existing_only"`, or `"none"` (excluded). Derived from provider health and capacity metrics. |
-| `selection_tier` | Optional. Locality tier between consumer gateway and provider: `"same_site"`, `"same_zone"`, `"same_region"`, `"cross_region"`, or `"unknown"`. Derived from `GridSite` region and zone. |
-| `rank` | Optional. Zero-based position in the final sorted overlay. |
+|Field|Meaning|
+|---|---|
+|`kind`|Capability kind, currently `inference_model` for model routing.|
+|`name`|Model or capability name matched by the consumer gateway.|
+|`site`|Grid site advertising the capability.|
+|`cluster`|Praxis load-balancer cluster identity used for upstream routing.|
+|`fresh`|Whether provider status is considered fresh enough for normal routing.|
+|`credential`|Optional. Projected when auth is non-manual `bearer_token` and the Secret reference has non-empty `name`, `namespace`, and `key`, regardless of `backendKind`. Contains only Secret locating information, never the token value.|
+|`stable_id`|Optional. Deterministic FNV-1a hash of `{kind}/{name}/{site}/{cluster}`. Used as `candidate_id` in provider gateway `provider_route` configuration. This differs from InferenceProvider `.metadata.name`; it can also key consumer-side affinity.|
+|`admission_state`|Optional Praxis value: `new_and_existing`, `existing_only`, or `none`. Grid removes excluded candidates before serialization and does not currently emit `none`.|
+|`selection_tier`|Optional locality tier: `same_site`, `same_zone`, `same_region`, `cross_region`, or `unknown`. Derived from `GridSite` region and zone.|
+|`rank`|Optional zero-based position in the final sorted overlay.|
+|`selection_group`|Optional zero-based, contiguous priority group per capability. Praxis selects within the first viable group; mixing grouped and ungrouped candidates for one capability is invalid.|
+|`traffic_weight`|Optional positive bounded relative weight for `weightedRandom`. Required for every candidate in weighted mode and rejected by other modes. It is neither a percentage nor a score.|
 
 Overlay-level fields:
 
-| Field | Meaning |
-|-------|---------|
-| `generated_at` | Optional. RFC 3339 timestamp of when the overlay was rendered. |
+|Field|Meaning|
+|---|---|
+|`generated_at`|Optional RFC 3339 timestamp for when the overlay was rendered.|
+|`selection_policy`|Optional object with mode `deterministic`, `roundRobin`, `random`, or `weightedRandom`. Omission means deterministic. Invalid policies are rejected; the field contributes to the semantic revision.|
 
 The metadata fields above belong to the generic Praxis AI routing contract.
 Grid supplies Grid-specific values through that contract. The generated Praxis
@@ -407,18 +433,23 @@ instantaneous behavior:
 | Condition | State |
 |-----------|-------|
 | No metrics available | `new_and_existing` |
-| `healthy = false` | `none` (excluded from overlay) |
+| `healthy = false` | `none` (excluded; current Grid omits the candidate from its overlay) |
 | `queue_depth > 0.85` or `kv_cache_utilization > 0.90` | `existing_only` |
 | Otherwise | `new_and_existing` |
 
-New installations from the `grid-site` Helm chart explicitly select the
-stabilized policy. Stabilized admission requires repeated pressure observations
-before entering `existing_only`, and repeated low-pressure observations plus a
-minimum state duration and recovery hold-down before returning to
-`new_and_existing`. Missing or expired metrics fail closed to `existing_only`
-by default (or `none` when `missingMetrics: excluded`). Hard health failures
-still move immediately to `none`. The evaluator is control-plane state keyed by
-provider identity; no admission check runs in the request path.
+New installations from the `grid-site` Helm chart render stabilized admission
+parameters, but do not select a metrics scoring strategy by default. Pressure
+transitions therefore require operators to configure an active metrics strategy
+and matching provider signal names. When a configured signal is missing or
+expired, the policy fails closed to `existing_only` by default (or `none` when
+`missingMetrics: excluded`). Stabilized admission requires repeated pressure
+observations before entering `existing_only`, and repeated low-pressure
+observations plus a minimum state duration and recovery hold-down before
+returning to `new_and_existing`. Hard health failures still move immediately to
+`none`. The evaluator is control-plane state keyed by provider identity; no
+admission check runs in the request path. With no active signal configured,
+Grid treats the observation as `NotConfigured` and keeps otherwise healthy
+providers `new_and_existing`.
 
 The wire states remain `new_and_existing`, `existing_only`, and `none`, so this
 change is compatible with existing Praxis consumers. Restarting the operator
@@ -884,25 +915,27 @@ NaN/Inf; callers must not propagate non-finite values.
 
 ### Stale metrics grace period
 
-By default, a Prometheus scrape failure immediately causes the provider to
-fall back to neutral (0.5) scoring for all signals.  When
+For metrics without `tls`, a Prometheus scrape failure immediately causes the
+provider to fall back to neutral (0.5) scoring for all signals. When
 `spec.metricsConfig.staleMetricsSeconds` is set, the operator keeps a
 cross-reconcile cache of the last successful scrape for each provider.  If
 the current scrape fails but the cached sample is no older than
 `staleMetricsSeconds`, the cached values are used instead of neutral
 scoring.
 
-After the grace period expires the provider reverts to neutral scoring.
-The cache is per-operator-process; restarting the operator clears all
-cached samples.
+After the grace period expires, plaintext metrics failures use the neutral
+compatibility behavior. When `metricsConfig.tls` is configured, a TLS
+resolution or scrape failure with no unexpired successful sample instead
+marks the provider unhealthy, excluding it from routing. The cache is
+per-operator-process; restarting the operator clears all cached samples.
 
 `staleMetricsSeconds` has no effect on successful scrapes — fresh scraped
 values always win.  Setting it only extends the window in which a
 temporarily-unavailable endpoint's last known metrics influence scoring.
 
-The field is optional.  When absent (default), the behaviour is unchanged
-from before it was added: scrape failures produce neutral scoring
-immediately.
+The field is optional. When absent (default), plaintext scrape failures
+produce neutral scoring immediately; TLS-configured failures fail closed once
+there is no usable last-known-good sample.
 
 ### KV-cache affinity
 

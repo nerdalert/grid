@@ -7,8 +7,10 @@ gridNetwork:
   swim: {}
   tls: {}
   gatewayRefs: []
-  # New chart installations fail closed on missing metrics and stabilize
-  # pressure admission. Omit this block only for legacy instantaneous mode.
+  # New chart installations use stabilized admission parameters. Pressure
+  # transitions require an active scoringPolicy and matching provider metrics
+  # signalNames; otherwise admission remains new_and_existing. Omit this block
+  # only for legacy instantaneous mode.
   admissionPolicy:
     mode: stabilized
     pressure:
