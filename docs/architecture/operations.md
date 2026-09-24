@@ -1,14 +1,14 @@
-# Grid Operations
+# AI Grid Network (AGN) Operations
 
-This guide covers production installation, grid formation, site lifecycle,
+This guide covers production installation, AGN formation, site lifecycle,
 routing configuration, security, and observability. Development-only
 orchestration is isolated under **Development Validation Environments**.
 
-## 1. Deploy the Grid Operator
+## 1. Deploy the AGN Operator (`grid-operator`)
 
 ### Install
 
-Grid provides a Helm chart and Kustomize manifests for the operator and CRDs.
+AGN provides a Helm chart and Kustomize manifests for the operator and CRDs.
 
 **Option 1: Helm (recommended)**
 
@@ -353,7 +353,7 @@ spec:
       namespace: praxis-system
 ```
 
-The GridNetwork controller:
+The AGN `GridNetwork` controller:
 1. Generates a grid CA via `certs`
 2. Generates this site's certificate (DNS SAN:
    `{site-name}.grid.internal`, dual EKU for mTLS)
@@ -410,7 +410,7 @@ unqualified rolling update.
 
 **Transport-security contract**
 
-SWIM is the Grid control-plane membership and state broadcast channel.  When
+SWIM is the AGN control-plane membership and state broadcast channel.  When
 `spec.tls.swimKeyRef` is configured and the referenced Secret resolves to a
 valid 32-byte key, reconcile applies the key before announcing CRD seeds or
 publishing certificate/provider state.  From that point, outgoing SWIM UDP
@@ -760,7 +760,7 @@ The sidecar adds correctness controls as well as lower latency:
 - a dedicated ServiceAccount token is mounted only into the init and sidecar
   containers. Praxis has no Kubernetes API access.
 
-The sidecar does not change the metrics scrape interval or force the Grid
+The sidecar does not change the metrics scrape interval or force the AGN
 operator to reconcile. End-to-end convergence is still:
 
 ```text
@@ -794,7 +794,7 @@ load_balancer
   -> forwards to the selected provider cluster
 ```
 
-The token is not stored in the Grid overlay or consumer
+The token is not stored in the AGN overlay or consumer
 Praxis `ConfigMap`.
 
 For direct API-provider and cloud-provider fallback, the
@@ -986,7 +986,7 @@ includes `gridsites/status` with verbs `get` and `patch`.
 
 ## Consumer Config
 
-When `GatewayRef.consumerConfig.enabled: true`, the Grid operator applies a
+When `GatewayRef.consumerConfig.enabled: true`, the AGN operator applies a
 `ConfigMap` in the gateway's namespace on every reconcile.  The
 `grid-operator-resources` `ClusterRole` includes `configmaps` with verbs
 `create` and `patch`.  A `RoleBinding` in the gateway's namespace is required
@@ -1009,7 +1009,7 @@ to credential Secrets in the gateway namespace for config generation.
 The final-hop gateway or provider-side component making the final backend call
 needs the credential Secret mounted.  Secret provisioning in that cluster is
 the responsibility of external tooling (platform automation, External Secrets,
-Vault, or a manual process).  The Grid operator does not copy Secrets across
+Vault, or a manual process).  The AGN operator does not copy Secrets across
 clusters.
 
 ### Cross-cluster limitations
@@ -1036,7 +1036,7 @@ site lifecycle cleanup by the deployment owner.
 
 ## Adding a New Site to an Existing Grid
 
-1. Deploy the Grid Operator on the new cluster
+1. Deploy the AGN Operator (`grid-operator`) on the new cluster
 2. Create a `GridNetwork` with any existing cluster
    as a seed
 3. SWIM discovers the existing cluster, which shares
@@ -1393,7 +1393,7 @@ localhost UDP sockets and ephemeral fixtures — they are
 not a substitute for in-cluster production deployment.
 
 In the production architecture, continuous reconciliation
-is the responsibility of the Grid Operator and its
+is the responsibility of the AGN Operator and its
 controllers. `xtask env` commands are a validation
 convenience layer, not a production orchestrator.
 
@@ -1430,7 +1430,7 @@ provider endpoints in the environment config.
 ### Separation from production reconciliation
 
 The production architecture is operator-driven. The
-Grid Operator reconciliation path owns long-lived
+AGN Operator (`grid-operator`) reconciliation path owns long-lived
 management of:
 
 - `GridNetwork`, `GridSite`, and `InferenceProvider`
@@ -1441,7 +1441,7 @@ management of:
 `xtask env` is a development convenience layer that
 uses the same config and cert infrastructure, not a
 production orchestrator. Production reconciliation
-semantics are defined by the Grid Operator controllers,
+semantics are defined by the AGN Operator controllers,
 not by the imperative `xtask env` command flow.
 
 ### Opinionated walkthroughs and topology fixtures
@@ -1453,7 +1453,7 @@ in the accompanying research-spikes repository.
 
 Grid keeps generic, config-driven, reusable commands.
 Topology-specific fixtures, static manifests, and
-presentation walkthroughs belong outside the Grid
+presentation walkthroughs belong outside AGN
 repository.
 
 ## References

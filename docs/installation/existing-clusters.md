@@ -1,6 +1,6 @@
 # Existing-Cluster Helm Installation
 
-This Helm-based installation workflow installs the Grid Operator and Praxis
+This Helm-based installation workflow installs the AGN Operator (`grid-operator`) and Praxis
 gateways on existing Kubernetes clusters. Two topology layouts use the
 same charts and installer scripts. The workflow has been validated through
 chart rendering, disposable local clusters, and existing single-node
@@ -10,7 +10,7 @@ Kubernetes clusters.
 
 - **[Adding an Inference Provider](../adding-provider.md)** —
   step-by-step workflow for adding in-cluster, existing-service, or
-  external HTTPS providers to a running Grid installation.
+  external HTTPS providers to a running AGN installation.
 
 ## Topologies
 
@@ -70,8 +70,8 @@ Grid topology CRs (GridNetwork, GridSite, InferenceProvider) and mock
 inference backends are now managed by the `grid-site` and
 `grid-mock-providers` Helm charts respectively.
 
-The routing overlay ConfigMap is created automatically by the Grid
-Operator once SWIM membership converges. Its name follows the pattern
+The routing overlay ConfigMap is created automatically by the AGN Operator
+(`grid-operator`) once SWIM membership converges. Its name follows the pattern
 `grid-overlay-{network}-{gateway}`, where `{network}` is the
 GridNetwork CR name and `{gateway}` is the consumer gateway Service
 name (set by `fullnameOverride` in the gateway values or derived from
@@ -187,7 +187,7 @@ install between the operator and gateways.
 
 Both topologies use the same charts:
 
-- `charts/grid-operator` -- Grid Operator with SWIM, CRD management
+- `charts/grid-operator` -- AGN Operator (`grid-operator`) with SWIM, CRD management
 - `charts/grid-site` -- Grid topology CRs (GridNetwork, GridSite, InferenceProvider)
 - `charts/grid-mock-providers` -- Mock inference backends, Services, NetworkPolicy
 - `charts/praxis-gateway` -- Praxis AI Gateway (consumer or provider role)
@@ -557,7 +557,7 @@ candidate ID:
 ### NetworkPolicy for Multiple Backends
 
 The NetworkPolicy must allow ingress from **both** the provider gateway
-and the grid operator. The operator probes each InferenceProvider's
+and the AGN operator. The operator probes each InferenceProvider's
 `spec.endpoint` for health checks — if blocked, the provider stays
 `Unavailable` and the overlay has no candidates:
 
@@ -669,8 +669,8 @@ imagePullSecrets:
 
 ### Service Names
 
-Set `fullnameOverride` to control the exact Service name. The Grid
-Operator's `gateway.serviceName` must match:
+Set `fullnameOverride` to control the exact Service name. The AGN Operator's
+(`grid-operator`) `gateway.serviceName` must match:
 
 ```yaml
 # consumer-gateway-overrides.yaml
@@ -914,7 +914,7 @@ the mock-inference Deployment.
 **Symptom:** Both InferenceProviders show `phase: Unavailable`; overlay
 has no candidates; consumer gateway returns 503.
 
-**Cause:** A NetworkPolicy blocks the grid operator from reaching the
+**Cause:** A NetworkPolicy blocks the AGN operator from reaching the
 mock backend health endpoint. The operator must probe each
 InferenceProvider's `spec.endpoint` — if the health check fails, the
 provider stays Unavailable and is excluded from the overlay.
@@ -945,7 +945,7 @@ Never rely on the default context. Pass `--context` to manual
 ## Requirements
 
 - Helm 3.12+
-- Grid operator image v0.1.1+ (the Helm chart requires `/healthz` and `/readyz`
+- AGN operator image (`grid-operator`) v0.1.1+ (the Helm chart requires `/healthz` and `/readyz`
   health endpoints on the metrics port; v0.1.0 images lack these endpoints and
   will fail liveness probes)
 - kubectl configured with contexts for all clusters

@@ -1,4 +1,4 @@
-//! Live SWIM membership runtime for the Grid Operator.
+//! Live SWIM membership runtime for the AGN Operator (`grid-operator`).
 //!
 //! Starts a `SwimNode` event loop over a UDP socket and exposes a cheap
 //! `SwimHandle::snapshot` method so the `GridNetwork` reconcile loop can

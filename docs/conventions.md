@@ -1,5 +1,20 @@
 # Development Conventions
 
+## Product naming and compatibility
+
+The product's display name is **AI Grid Network (AGN)**. Use **AGN** for the
+project and its control plane in prose, headings, and architecture diagrams.
+Use the exact established name when referring to a technical API or artifact.
+
+The display-name change does not rename compatibility-sensitive identifiers.
+These remain `GridNetwork`, `GridSite`, `InferenceProvider`, the
+`grid.praxis-proxy.io` API group and labels, the `grid-operator` binary and
+Helm chart, the `grid-*` image names, and established certificate identity
+values (including organization `ai-grid` and CA common name `AI Grid Test CA`).
+Existing installations need no
+migration for the display-name change; changing any of those identifiers
+requires a separate, explicit compatibility plan.
+
 ## Coding Style
 
 ### General Principles

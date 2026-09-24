@@ -12,7 +12,7 @@ use super::grid_network::SecretRef;
 /// Authentication configuration for consuming a provider.
 ///
 /// Declares how consumers authenticate to this provider.
-/// The Grid Operator manages credential lifecycle and
+/// The AGN Operator (`grid-operator`) manages credential lifecycle and
 /// configures Praxis to inject them transparently.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -14,7 +14,7 @@ Kubernetes, the operator, or an EPP metrics endpoint on the request path.
 Grid and llm-d make different decisions:
 
 ```text
-Grid operator (before the request)
+AGN operator (`grid-operator`, before the request)
   EPP pool metrics -> select and score a provider pool -> routing overlay
 
 Praxis edge (during the request)
@@ -36,7 +36,7 @@ the current request's prefix is cached. Prefix affinity belongs in EPP.
 
 `GridNetwork.spec.scoringPolicy.strategy` selects one provider-level strategy.
 This follows llm-d's independent-scorer model without exposing a plugin system
-or an arbitrary matrix of weights in the Grid API.
+or an arbitrary matrix of weights in the AGN API.
 
 When `scoringPolicy` is present, `strategy` is required. Omit the entire
 `scoringPolicy` object to use the `noMetrics` default. This also makes manifests
@@ -151,7 +151,7 @@ spec:
 | `signalNames` | Maps Grid signals to exporter metric names. |
 | `staleMetricsSeconds` | Grace period for reusing the last successful local scrape. |
 
-One `InferenceProvider` represents a schedulable pool. Grid does not rank the
+One `InferenceProvider` represents a schedulable pool. AGN does not rank the
 individual vLLM pods in that pool.
 
 ## Missing and Stale Metrics
@@ -212,7 +212,7 @@ seconds is not a substitute for request-time load balancing.
 
 ## Current Limits
 
-- No request-specific prefix affinity at the Grid layer.
+- No request-specific prefix affinity at the AGN layer.
 - No independent remote metric sample timestamp yet.
 - Stabilized admission is available through `spec.admissionPolicy`; it uses
   bounded pressure/recovery counters and hold-down timers, while omitting the

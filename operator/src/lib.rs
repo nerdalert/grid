@@ -1,7 +1,7 @@
-//! AI Grid Kubernetes operator library.
+//! AI Grid Network (AGN) Kubernetes operator library.
 //!
 //! Provides CRD definitions, controllers, and resource builders
-//! for the Grid Operator. The operator orchestrates a peer-to-peer
+//! for the AGN Operator (`grid-operator`). The operator orchestrates a peer-to-peer
 //! mesh of Praxis AI gateways across clusters.
 
 #![deny(unsafe_code)]

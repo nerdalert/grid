@@ -1,13 +1,13 @@
 # Provider Selection and Load Balancing
 
-Grid and Praxis divide provider routing into two parts:
+AGN and Praxis divide provider routing into two parts:
 
-- Grid observes provider state asynchronously, decides which providers are
+- AGN observes provider state asynchronously, decides which providers are
   eligible, orders them, and publishes a versioned routing overlay.
 - Praxis consumes that overlay and makes the final request-time choice locally
   in the `intelligent_route` filter.
 
-This separation keeps Kubernetes, Grid reconciliation, EPP metrics, and remote
+This separation keeps Kubernetes, AGN reconciliation, EPP metrics, and remote
 coordination out of the request hot path.
 
 ```mermaid
@@ -30,7 +30,7 @@ bucket and does not represent a traffic percentage.
 This layer balances requests across provider gateways. After a provider gateway
 is selected, its local serving stack can make a separate backend-level decision.
 For example, an llm-d provider gateway can delegate endpoint selection to EPP.
-Grid does not use round-robin to choose individual inference replicas hidden
+AGN does not use round-robin to choose individual inference replicas hidden
 behind one provider gateway.
 
 ## Choose a configuration
@@ -161,7 +161,7 @@ For detailed metric input and normalization, see [Provider Scoring](scoring.md).
 
 `spec.selectionPolicy.mode` controls request-time selection inside the first
 viable group. The selection mode is applied from an accepted in-memory
-snapshot by Praxis; Grid is not called for each request.
+snapshot by Praxis; AGN is not called for each request.
 
 - **`deterministic`** selects the first provider after Grid has ordered the
   active group. Use it for strict preference or primary/fallback routing.
@@ -418,7 +418,7 @@ a different coordination design and would add hot-path trade-offs.
 ```mermaid
 flowchart TD
     signals[Provider health and optional EPP metrics]
-    reconcile[Grid operator reconciliation<br/>eligibility, admission, ordering,<br/>scores, groups, selection policy]
+    reconcile[AGN operator reconciliation<br/>eligibility, admission, ordering,<br/>scores, groups, selection policy]
     overlay[Content-addressed routing overlay]
     publish[Overlay validation and publication]
     snapshot[Praxis atomically loads snapshot<br/>group index + local selection state]
@@ -456,7 +456,7 @@ explicitly provides it.
 
 ## Overlay contract and static weighting
 
-`selectionPolicy` is optional in both the Grid API and the overlay. An omitted
+`selectionPolicy` is optional in both the AGN API and the overlay. An omitted
 field remains omitted, and Praxis interprets it as deterministic selection.
 The Helm chart explicitly renders `roundRobin` by default. Users applying a
 `GridNetwork` directly can either set the selection mode explicitly or omit the policy

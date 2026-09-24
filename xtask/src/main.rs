@@ -1,4 +1,4 @@
-//! Development task runner for the AI Grid workspace.
+//! Development task runner for the AI Grid Network (AGN) workspace.
 #![expect(
     clippy::print_stdout,
     clippy::print_stderr,
@@ -21,9 +21,9 @@ use clap::{Parser, Subcommand};
 // CLI
 // ---------------------------------------------------------------------------
 
-/// AI Grid development tasks.
+/// AI Grid Network (AGN) development tasks.
 #[derive(Debug, Parser)]
-#[command(name = "xtask", about = "AI Grid development tasks")]
+#[command(name = "xtask", about = "AI Grid Network (AGN) development tasks")]
 pub(crate) struct Cli {
     /// Subcommand to run.
     #[command(subcommand)]

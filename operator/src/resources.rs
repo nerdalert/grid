@@ -1,4 +1,4 @@
-//! Kubernetes resource builders for the Grid Operator.
+//! Kubernetes resource builders for the AGN Operator (`grid-operator`).
 
 /// Site-level geography and load-aware admission for routing overlays.
 pub(crate) mod geography;

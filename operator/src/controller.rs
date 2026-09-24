@@ -1,4 +1,4 @@
-//! Kubernetes controllers for the Grid Operator.
+//! Kubernetes controllers for the AGN Operator (`grid-operator`).
 
 /// [`AgentToolProvider`] controller.
 ///

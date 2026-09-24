@@ -1,7 +1,7 @@
 # Signal propagation
 
 Signals are the provider load a site observes, such as queue depth and KV-cache
-pressure. `signalTransport` on the `GridNetwork` selects, grid-wide, how they
+pressure. `signalTransport` on the `GridNetwork` selects, across the AGN network, how they
 cross sites. It names the dissemination path, not the transport: SWIM membership
 runs either way and only where the load signal travels changes, which is why the
 modes are `gossip` and `poll` rather than `swim`.
@@ -25,7 +25,7 @@ local scoring off so the gateway ranks from what it pulls. A peer's poll URL is
 its SWIM-advertised host at the signals port, so a reachable member is a
 reachable signals endpoint.
 
-The field is optional. Absent, the grid gossips, so existing deployments are
+The field is optional. Absent, the AGN network gossips, so existing deployments are
 unaffected. The mode is read once at operator start, so changing it is a
 restart, not a live flip, which keeps the mTLS listener bound only under `poll`.
 While a `GridNetwork` spec and the resolved mode disagree, the reconcile warns

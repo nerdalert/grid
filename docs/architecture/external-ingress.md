@@ -1,7 +1,7 @@
 # External Client Ingress
 
-External client ingress extends Grid's workload-routing model to a stable
-public endpoint. A global traffic manager selects an edge. Grid and Praxis then
+External client ingress extends AGN's workload-routing model to a stable
+public endpoint. A global traffic manager selects an edge. AGN and Praxis then
 select and reach an eligible provider.
 
 This document defines the production architecture contract. The
@@ -61,14 +61,14 @@ process or a single Grid controller.
 | Component | Owned behavior |
 |---|---|
 | Global traffic manager | Public DNS/Anycast, client-to-edge proximity and latency steering, edge health withdrawal, controlled failback, public-edge DDoS/WAF integration. |
-| Grid operator | Site/provider discovery, policy eligibility, provider and metric state, edge-perspective scoring, admission state, ordered overlay generation. |
+| AGN operator (`grid-operator`) | Site/provider discovery, policy eligibility, provider and metric state, edge-perspective scoring, admission state, ordered overlay generation. |
 | Overlay distribution | Delivery of a versioned local snapshot to the edge without entering the request path. |
 | Praxis AI edge | External identity/policy filters, model extraction, `intelligent_route`, session binding, selected-cluster metadata, provider credential injection when the edge is the final hop. |
 | Praxis provider gateway | Edge-peer authentication, destination-side authorization, provider-local limits/policy, and private backend forwarding. |
 | Praxis core / Pingora | Listener TLS, mTLS, peer identity extraction, connection pooling, health checks, load balancing, timeouts, graceful drain, and upstream I/O. |
 
-Grid is a routing control plane. It does not proxy inference traffic. Praxis AI
-does not join SWIM or query Kubernetes, Grid operators, DNS control APIs, or
+AGN is a routing control plane. It does not proxy inference traffic. Praxis AI
+does not join SWIM or query Kubernetes, AGN operators, DNS control APIs, or
 the filesystem while processing a request.
 
 ## Request Path
@@ -231,7 +231,7 @@ stream.
 Route-aware readiness belongs with the accepted Grid routing snapshot because
 generic process or cluster health cannot prove that the edge has fresh, usable
 public route coverage. The traffic manager consumes readiness but never reads
-the Grid overlay or selects a provider.
+the AGN overlay or selects a provider.
 
 ## Retry and Streaming Rules
 
@@ -317,7 +317,7 @@ using that revision.
 
 ## Repository Implementation
 
-The Grid and Praxis integration provides:
+The AGN and Praxis integration provides:
 
 - per-`GatewayRef` routing overlay generation;
 - candidate model/site/cluster identity;

@@ -4,7 +4,7 @@
 // Operator Error
 // ---------------------------------------------------------------------------
 
-/// Errors produced by the Grid Operator.
+/// Errors produced by the AGN Operator (`grid-operator`).
 #[derive(Debug, thiserror::Error)]
 pub enum OperatorError {
     /// Certificate generation failed.

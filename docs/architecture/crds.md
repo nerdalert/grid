@@ -6,7 +6,7 @@ All CRDs are cluster-scoped.
 
 ## GridNetwork
 
-The grid itself. Top-level tenancy scope. A single
+The AGN network itself. Top-level tenancy scope. A single
 cluster can host multiple `GridNetworks` for
 multi-tenancy.
 
@@ -81,7 +81,7 @@ render/apply attempt.
 tracking. Grid merges each site's locally recorded spend for a tenant into a
 per-tenant CRDT counter (a `GCounter`, one slot per originating site) that is
 gossiped over SWIM alongside provider state, so the reported total reflects
-spend recorded anywhere in the grid, not just the local site.
+spend recorded anywhere in the AGN network, not just the local site.
 
 For every tenant declared in `budgetPolicy`, `budgetStatus[]` reports:
 
@@ -90,7 +90,7 @@ For every tenant declared in `budgetPolicy`, `budgetStatus[]` reports:
 - `spendUsd` — the converged cross-site total, in USD
 - `spendRatio` — `spendUsd / capUsd`, for at-a-glance dashboarding
 
-`budgetStatus[]` is a status **signal only**. Grid does not itself degrade or
+`budgetStatus[]` is a status **signal only**. AGN does not itself degrade or
 reject traffic when a tenant's `spendRatio` reaches or exceeds `1.0` — that
 enforcement decision is expected to live in a gateway-side policy filter
 (cross-repo, `praxis-ai`), the same split used for `provider_route`
@@ -245,7 +245,7 @@ cloud-provider fallback routes.  For remote provider sites, provider credentials
 should be mounted only in the remote site or provider-side component that makes
 the final backend call.
 
-The `credential_inject` filter is a Praxis AI runtime dependency.  The Grid
+The `credential_inject` filter is a Praxis AI runtime dependency.  AGN
 operator can render the config shape, but the deployed Praxis AI image must
 include that filter for the generated config to start successfully.
 
@@ -254,7 +254,7 @@ When `enabled: false` or `consumerConfig` is absent, this gateway behaves as bef
 
 ## GridSite
 
-Represents another site in the grid. Created manually
+Represents another site in the AGN network. Created manually
 for seed peers or automatically by SWIM discovery.
 
 ```yaml
@@ -293,7 +293,7 @@ SWIM discovery, authentication, and authorization are separate concerns:
 - Authentication proves the peer gateway identity, normally through mTLS
   certificate validation.
 - Authorization decides whether that authenticated peer is allowed to
-  participate in the Grid or carry traffic for a given policy scope.
+participate in AGN or carry traffic for a given policy scope.
 
 A discovered SWIM peer is not automatically authorized for routing.
 
@@ -675,12 +675,12 @@ metricsConfig:
 
 #### Queue depth normalization
 
-Grid does not normalize raw queue counts. Exporters should publish
+AGN does not normalize raw queue counts. Exporters should publish
 `queueDepth` as a normalized `0.0`–`1.0` gauge before the operator scrapes it.
 
 ## AgentToolProvider
 
-Represents MCP tool servers available over the grid.
+Represents MCP tool servers available over the AGN network.
 
 ```yaml
 apiVersion: grid.praxis-proxy.io/v1alpha1
@@ -742,7 +742,7 @@ telemetry-only labels (`grid_mcp_probe_total`, Events), not persisted to
 
 ## AgentToAgentProvider
 
-Represents A2A agents available over the grid.
+Represents A2A agents available over the AGN network.
 
 ```yaml
 apiVersion: grid.praxis-proxy.io/v1alpha1

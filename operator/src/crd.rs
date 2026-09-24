@@ -1,4 +1,4 @@
-//! Custom resource definitions for the AI Grid.
+//! Custom resource definitions for AI Grid Network (AGN).
 
 /// [`AgentToAgentProvider`] — A2A agents available over the grid.
 ///

@@ -3,7 +3,7 @@
     clippy::print_stderr,
     reason = "generate-crds is a CLI tool that prints to the terminal"
 )]
-//! Generate Grid operator CRD manifests as a JSON `List` for `kubectl apply`.
+//! Generate AGN operator (`grid-operator`) CRD manifests as a JSON `List` for `kubectl apply`.
 //!
 //! Output is written to stdout.  Pipe directly to `kubectl apply -f -` to
 //! install or update the CRDs in a cluster:
@@ -13,7 +13,7 @@
 //! ```
 //!
 //! The output is a single JSON `v1/List` containing all CRDs required by the
-//! Grid operator controllers.  `kubectl apply` processes each item in the list
+//! AGN operator controllers.  `kubectl apply` processes each item in the list
 //! independently.
 
 use kube::CustomResourceExt as _;

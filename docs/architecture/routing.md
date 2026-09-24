@@ -1,6 +1,6 @@
 # Routing
 
-Grid routing is split between the Grid Operator control plane and the Praxis
+AGN routing is split between the AGN Operator control plane and the Praxis
 data plane. The operator renders routing state. Praxis consumes that state and
 proxies requests.
 
@@ -12,7 +12,7 @@ GridNetwork + InferenceProvider CRDs
   + CRDT provider records
         |
         v
-Grid Operator
+AGN Operator (`grid-operator`)
         |
         v
 Versioned routing overlay ConfigMap
@@ -30,7 +30,7 @@ Praxis provider gateway
 llm-d / EPP / inference backend
 ```
 
-Grid does not proxy traffic. It writes the overlay used by Praxis filters.
+AGN does not proxy traffic. It writes the overlay used by Praxis filters.
 
 For the complete provider-selection model, including selection groups and the
 `deterministic`, `roundRobin`, and `random` modes, see [Provider Selection
@@ -62,8 +62,8 @@ Both keys describe the same routing state.
 
 ## How re-ranking updates
 
-Grid does not re-rank a provider inside the request path. Re-ranking happens
-when the Grid operator reconciles a `GridNetwork` and publishes a new routing
+AGN does not re-rank a provider inside the request path. Re-ranking happens
+when the AGN operator reconciles a `GridNetwork` and publishes a new routing
 overlay. Praxis then uses the most recent overlay that it has accepted.
 
 The complete update path is:
@@ -72,7 +72,7 @@ The complete update path is:
 provider metrics / Kubernetes state / remote Grid state changes
                               |
                               v
-                    Grid operator reconcile
+                    AGN operator reconcile
                               |
               scrape and normalize provider metrics
                               |
@@ -274,7 +274,7 @@ encoded overlay intended for a different gateway. Enabling expected scope also
 requires the envelope format; the consumer cannot silently downgrade to the
 unscoped legacy payload.
 
-Provenance identifies the producing Grid operator and source `GridNetwork`.
+Provenance identifies the producing AGN operator (`grid-operator`) and source `GridNetwork`.
 Praxis AI validates required values and bounds before accepting the envelope.
 Provenance supports audit and diagnosis but is not an authorization credential.
 
@@ -288,8 +288,8 @@ The contract distinguishes four observable stages:
 
 | Stage | Owner | Evidence |
 |---|---|---|
-| **Rendered** | Grid operator | `GridNetwork.status.overlayStatus[].renderedRevision` |
-| **Distributed** | Grid operator and Kubernetes | `distributedRevision` plus the applied `ConfigMap` `resourceVersion` |
+| **Rendered** | AGN operator (`grid-operator`) | `GridNetwork.status.overlayStatus[].renderedRevision` |
+| **Distributed** | AGN operator and Kubernetes | `distributedRevision` plus the applied `ConfigMap` `resourceVersion` |
 | **Accepted** | Praxis AI | Successful validation and atomic snapshot-load event |
 | **Serving** | Praxis AI request path | The selected immutable snapshot revision attached to provider-hop telemetry |
 
@@ -658,11 +658,11 @@ configured `file:` path at filter construction time.
 
 In production, the same rule applies at the final-hop point: mount the Secret
 only into the final-hop gateway or provider-side component that makes the final
-backend call. Grid does not copy Secret values across clusters.
+backend call. AGN does not copy Secret values across clusters.
 
 The token does NOT appear in:
 
-- The Grid operator overlay `ConfigMap` (JSON).
+- The AGN operator overlay `ConfigMap` (JSON).
 - The `intelligent_route` filter candidates YAML.
 - The consumer Praxis `ConfigMap`.
 - The `intelligent_route.*` in-process filter metadata.
@@ -682,7 +682,7 @@ regardless of how the final-hop Secret is provisioned.
 
 ## Routing eligibility
 
-The Grid operator enforces a routing eligibility gate on remote provider state
+The AGN operator enforces a routing eligibility gate on remote provider state
 received over SWIM CRDT broadcasts.  A remote provider record is included in the
 routing overlay only when the corresponding `GridSite.status.phase` is `Active`.
 
@@ -819,7 +819,7 @@ Grid chooses the provider site. llm-d or the provider-local scheduler chooses
 the concrete pod, GPU, or endpoint inside that site. Envoy ExternalProcessor
 service integration is owned by
 [`praxis-proxy/extproc`](https://github.com/praxis-proxy/extproc); it is an
-optional provider-local integration and is not part of the Grid overlay
+optional provider-local integration and is not part of the AGN overlay
 contract.
 
 ## Metrics and CRDT inputs
@@ -857,7 +857,7 @@ context. When an llm-d EPP exposes an absolute average queue size, set
 clamps the result to `[0.0, 1.0]`.
 
 For cloud-managed providers and third-party APIs where the destination
-cannot export normalized metrics, the Grid operator may apply an adapter
+cannot export normalized metrics, the AGN operator may apply an adapter
 when the normalization contract is stable.
 
 ### Missing-value defaults
@@ -913,7 +913,7 @@ implement affinity-aware routing.
 
 ## When the routing overlay regenerates
 
-The overlay `ConfigMap` is regenerated by the Grid Operator whenever the owning
+The overlay `ConfigMap` is regenerated by the AGN Operator whenever the owning
 `GridNetwork` reconciles.
 
 | Trigger | Effect |

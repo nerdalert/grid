@@ -386,7 +386,7 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
 
     eprintln!();
     eprintln!(
-        "[SETUP {}/{total_phases}] Installing MetalLB, SWIM services, and Grid operators",
+        "[SETUP {}/{total_phases}] Installing MetalLB, SWIM services, and AGN operators",
         next()
     );
     apply_foundation_stacks_with_mode(&context.forge_bin, &context.resolved_config, context.ingress_mode)?;
@@ -1594,7 +1594,7 @@ fn prove_restart_recovery_and_soak(
     prove_operator_restarts(narrator, &fixtures, request_fixture)?;
     let (samples, edge_count, provider_count) = run_request_soak(narrator, &fixtures, request_fixture)?;
     let evidence = format!(
-        "4 Grid operators restarted; {samples} soak requests passed across {edge_count} edges and {provider_count} provider(s)"
+        "4 AGN operators restarted; {samples} soak requests passed across {edge_count} edges and {provider_count} provider(s)"
     );
     narrator.narrate(&format!("[PASS] {evidence}."));
     Ok(evidence)
@@ -1611,7 +1611,7 @@ fn prove_operator_restarts(
     narrator.wrapped(
         "[RESTART] ",
         "          ",
-        "Restarting each Grid operator one at a time. After every restart, both edge overlays must converge and one inference request must succeed.",
+        "Restarting each AGN operator one at a time. After every restart, both edge overlays must converge and one inference request must succeed.",
     );
     for (index, cluster) in GRID_CLUSTERS.iter().enumerate() {
         narrator.narrate(&format!(
@@ -1630,7 +1630,7 @@ fn prove_operator_restarts(
             request_fixture,
         )?;
         narrator.narrate(&format!(
-            "[PASS] Restarted {cluster} Grid operator; routing recovered via {} -> {} ({overlay_evidence}).",
+            "[PASS] Restarted {cluster} AGN operator; routing recovered via {} -> {} ({overlay_evidence}).",
             sample.edge, sample.provider
         ));
     }
@@ -1722,7 +1722,7 @@ fn restart_grid_operator(cluster: &str) -> Result<(), Box<dyn std::error::Error>
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "failed to restart {cluster} Grid operator: {}",
+            "failed to restart {cluster} AGN operator: {}",
             safe_truncate_str(&String::from_utf8_lossy(&output.stderr), 160)
         )
         .into());

@@ -1,6 +1,6 @@
 # Operator-Generated Consumer Config
 
-The Grid operator can generate the consumer Praxis `ConfigMap` from routing overlay
+The AGN operator can generate the consumer Praxis `ConfigMap` from routing overlay
 data.  This is an opt-in feature on each `GatewayRef`.
 
 ## Migration: `clusterEndpoints` transport shape change

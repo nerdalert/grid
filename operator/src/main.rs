@@ -1,4 +1,4 @@
-//! AI Grid operator binary.
+//! AI Grid Network (AGN) operator binary (`grid-operator`).
 //!
 //! Runs Kubernetes controllers for [`GridNetwork`], [`GridSite`], and
 //! [`InferenceProvider`] resources, and optionally starts a live SWIM
@@ -91,7 +91,7 @@ use operator::{
 )]
 async fn main() {
     tracing_subscriber::fmt::init();
-    tracing::info!("starting grid-operator");
+    tracing::info!("starting AGN operator (grid-operator)");
 
     // Install the process-wide crypto provider the TLS stack requires, once,
     // up front, before any reconciler builds a client.

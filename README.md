@@ -1,17 +1,25 @@
-# Grid
+# AI Grid Network (AGN)
 
-Grid is a distributed control plane that connects AI
+AI Grid Network (AGN) is a distributed control plane that connects AI
 inference backends across Kubernetes clusters, cloud
 providers, and third-party APIs into a single routable
-mesh. It figures out where models are, which backends
+mesh. AGN figures out where models are, which backends
 are healthy, and which one should handle the next
 request - then tells the [Praxis] gateway how to route.
+
+The display name is **AI Grid Network (AGN)**. AGN is the control plane in
+this repository; Praxis AI is the request-serving gateway. Technical
+identifiers such as `GridNetwork`, `GridSite`, the `grid-operator` binary and
+chart, API groups, image names, Kubernetes labels, and certificate identity
+values (including organization `ai-grid` and CA common name `AI Grid Test CA`)
+remain unchanged for compatibility. Use **AGN** for the project in prose and
+the exact technical name when referring to an API or artifact.
 
 [Praxis]:https://github.com/praxis-proxy/praxis
 
 ## How It Works
 
-Grid is an orchestrator, not a proxy. It watches
+AGN is an orchestrator, not a proxy. It watches
 Kubernetes resources, discovers peer sites over a
 gossip protocol (SWIM), propagates provider state
 with CRDTs, scores candidates, and writes a routing
@@ -22,7 +30,7 @@ overlay that Praxis consumes at request time.
 |  Site A (Kubernetes)      |     |  Site B (Kubernetes)      |
 |                           |     |                           |
 |  +---------------------+  |     |  +---------------------+  |
-|  | Grid Operator       |  |     |  | Grid Operator       |  |
+|  | AGN Operator        |  |     |  | AGN Operator        |  |
 |  | - SWIM membership   |  |     |  | - SWIM membership   |  |
 |  | - CRDT state sync   |  |     |  | - CRDT state sync   |  |
 |  | - scoring engine    |  |     |  | - scoring engine    |  |
@@ -49,10 +57,10 @@ overlay that Praxis consumes at request time.
 
 The gateways communicate over mTLS.
 
-The Grid operators exchange membership and provider state over SWIM and CRDT
+The AGN operators exchange membership and provider state over SWIM and CRDT
 replication.
 
-Grid handles the **control plane** (what should be
+AGN handles the **control plane** (what should be
 routable). Praxis handles the **data plane** (routing
 and proxying actual requests).
 
@@ -71,17 +79,17 @@ site: model name, backend kind (self-hosted,
 cloud-managed, or API provider), health config, and
 auth strategy.
 
-**Routing overlay** - a versioned ConfigMap that Grid
+**Routing overlay** - a versioned ConfigMap that AGN
 writes for each gateway. Contains scored candidates,
 cluster definitions with mTLS config, and credential
 references. Praxis hot-reloads this without restarts.
 
-**Scoring** - Grid applies one provider-level strategy before
+**Scoring** - AGN applies one provider-level strategy before
 writing the overlay. `noMetrics` is the generic default for
 external APIs and providers without comparable telemetry.
 llm-d pools can opt into `queueDepth` or `kvCachePressure`.
 Request-specific prefix affinity remains inside llm-d EPP,
-which selects a pod after Grid selects a provider pool.
+which selects a pod after AGN selects a provider pool.
 
 ## Request Flow
 
@@ -100,7 +108,7 @@ client request
   -> response returns to the client
 ```
 
-Grid is never in the request path. All routing
+AGN is never in the request path. All routing
 decisions use a pre-computed local overlay file.
 
 ## Install
@@ -125,13 +133,13 @@ For Kustomize or raw manifests, see
 
 ## Getting Started
 
-[Grid QuickStarts](https://github.com/praxis-proxy/demos)
+[AGN QuickStarts](https://github.com/praxis-proxy/demos)
 — deployable demonstrations with automated runtime
 proofs of routing, failover, security boundaries,
 and provider lifecycle.
 
 [Existing-cluster installation](docs/installation/existing-clusters.md)
-— install Grid and Praxis on running Kubernetes
+— install AGN and Praxis on running Kubernetes
 clusters with Helm.
 
 ## Workspace Crates

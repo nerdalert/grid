@@ -1,12 +1,12 @@
-# Static provider weighting
+# AI Grid Network (AGN): Static Provider Weighting
 
-Static weighting publishes relative provider capacity to Praxis. Weights such
+AGN static weighting publishes relative provider capacity to Praxis. Weights such
 as `50/30/20` are relative, not percentages or request guarantees, and are
 sampled statistically among candidates in the first eligible selection group.
 
 ```mermaid
 flowchart LR
- A[Provider capacity] --> B[Grid and CRDT propagation] --> C[Weighted overlay] --> D[Praxis picker] --> E[Attributed providers]
+ A[Provider capacity] --> B[AGN and CRDT propagation] --> C[Weighted overlay] --> D[Praxis picker] --> E[Attributed providers]
 ```
 
 ```yaml
@@ -16,10 +16,10 @@ placementPolicy:
   strategy: static
 ```
 
-`capacityWeight` is an integer from 1 through 1000. Grid publishes that value
+`capacityWeight` is an integer from 1 through 1000. AGN publishes that value
 directly as the relative overlay `traffic_weight`; it does not multiply or
 normalize it. Thus equivalent ratios have equivalent selection probabilities.
-Static weights do not override routing precedence. Grid first removes candidates
+Static weights do not override routing precedence. AGN first removes candidates
 that fail capability, authorization, trust, health, freshness, or admission
 requirements. The routing policy then forms priority groups: `geographyFirst`
 keeps the closest viable locality tier active and treats more distant tiers as

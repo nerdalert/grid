@@ -99,7 +99,7 @@ pub struct InferenceProviderSpec {
 
     /// Prometheus metrics scraping configuration.
     ///
-    /// When set, the Grid operator scrapes the provider's metrics endpoint during
+    /// When set, the AGN operator (`grid-operator`) scrapes the provider's metrics endpoint during
     /// each [`GridNetwork`] reconcile and incorporates the parsed signals into the
     /// routing overlay scoring pass.  When absent, the provider uses locality and
     /// cost as the only scoring signals (static ordering).

@@ -1,6 +1,6 @@
 # Administrative provider draining
 
-Grid supports graceful maintenance of inference providers through the
+AGN supports graceful maintenance of inference providers through the
 optional `InferenceProvider.spec.trafficPolicy.drain` field. The omitted or
 false value preserves the existing health and metrics behavior. When true,
 the operator keeps an otherwise healthy candidate in the routing overlay but

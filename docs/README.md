@@ -1,4 +1,8 @@
-# Grid Documentation
+# AI Grid Network (AGN) Documentation
+
+AGN is the product and control-plane name. Technical identifiers such as
+`GridNetwork`, `GridSite`, `grid-operator`, chart and image names, API groups,
+labels, and certificate identity values remain unchanged for compatibility.
 
 ## Architecture
 
@@ -42,7 +46,7 @@
 - [Provider Traffic Selection](../tests/e2e/topologies/grid-provider-traffic/README.md) —
   runnable three-cluster topology for Grid selection groups and request-time
   round-robin provider choice.
-- [Grid QuickStarts](https://github.com/praxis-proxy/demos) — deployable
+- [AGN QuickStarts](https://github.com/praxis-proxy/demos) — deployable
   examples with automated runtime proofs of routing, failover, security
   boundaries, and provider lifecycle.
 
@@ -71,7 +75,7 @@ image preparation, execution, evidence, and cleanup.
 ## Installation
 
 - [Existing-Cluster Helm Installation](installation/existing-clusters.md) —
-  install Grid and Praxis on running Kubernetes clusters with Helm.
+  install AGN and Praxis on running Kubernetes clusters with Helm.
 
 ## Development
 

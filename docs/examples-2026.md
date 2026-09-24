@@ -1,7 +1,7 @@
 # Example Scenarios - 2026
 
-Example scenarios for the AI Grid, progressing from
-simple multi-cluster routing to full grid operations
+Example scenarios for AI Grid Network (AGN), progressing from
+simple multi-cluster routing to full network operations
 with metrics-driven failover.
 
 ## Example 1: Basic Multi-Cluster Model Routing
@@ -15,7 +15,7 @@ different models.
 
 **Flow**: A workload on Cluster A requests
 `model: llama-3.2-8b`. The local cluster doesn't
-have it, so the grid scores Cluster B (which does)
+have it, so AGN scores Cluster B (which does)
 and routes the request there via mTLS. The response
 returns transparently.
 
@@ -130,7 +130,7 @@ to cheap backends.
 third cluster joins.
 
 - Cluster A + B: existing GridNetwork "production"
-- Cluster C: new, deploying the Grid Operator
+- Cluster C: new, deploying the AGN Operator (`grid-operator`)
 
 **Flow**: Cluster C creates a GridNetwork with Cluster
 A as a seed. SWIM discovers A, then B (via A's

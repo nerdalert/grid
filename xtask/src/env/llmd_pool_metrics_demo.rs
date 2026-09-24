@@ -730,7 +730,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
 
     // Phase 5: Install MetalLB and Grid operators
     eprintln!();
-    eprintln!("[SETUP {}/{}] Installing MetalLB and Grid operators", next(), total);
+    eprintln!("[SETUP {}/{}] Installing MetalLB and AGN operators", next(), total);
     for cluster in CLUSTERS {
         let ctx = kind_context(cluster);
         run_forge_stack(&context.forge_bin, &context.resolved_config, cluster, "metallb")?;

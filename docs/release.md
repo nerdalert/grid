@@ -2,20 +2,20 @@
 
 ## Versioning
 
-Grid uses [Semantic Versioning][semver]. The workspace version is defined in
+AI Grid Network (AGN) uses [Semantic Versioning][semver]. The workspace version is defined in
 `workspace.package.version` in the root `Cargo.toml`. Workspace crates inherit
 that version.
 
-Each Helm chart has its own `version`, which must match the Grid release. The
-`appVersion` for Grid-owned workloads also matches the Grid tag. The
+Each Helm chart has its own `version`, which must match the AGN release. The
+`appVersion` for AGN-owned workloads also matches the AGN tag. The
 `praxis-gateway` chart is different: its `appVersion` identifies the default
-Praxis AI image and may advance independently of Grid.
+Praxis AI image and may advance independently of AGN.
 
 [semver]: https://semver.org/
 
 ## Release Artifacts
 
-A Grid release publishes:
+An AGN release publishes:
 
 - `ghcr.io/praxis-proxy/grid-operator`;
 - `ghcr.io/praxis-proxy/grid-mock-providers`;
@@ -24,14 +24,14 @@ A Grid release publishes:
   `grid-mock-providers` Helm charts; and
 - a GitHub Release containing generated notes and immutable artifact digests.
 
-Grid does not publish a Praxis AI image or an AI rollup. The release workflow
+AGN does not publish a Praxis AI image or an AI rollup. The release workflow
 verifies the pinned official Praxis AI image used by the `praxis-gateway` chart,
 including its digest and OCI provenance.
 
 Optional Praxis AI filters are an explicit deployment dependency. Examples or
 qualifications that require optional filters must document the required Cargo
 features and require the caller to provide a compatible image. They must not
-silently substitute a Grid-owned AI build.
+silently substitute an AGN-owned AI build.
 
 ## Pre-release Checklist
 
@@ -39,7 +39,7 @@ Before opening a release preparation pull request:
 
 - [ ] Update the workspace version in `Cargo.toml` and regenerate `Cargo.lock`.
 - [ ] Update every Helm chart `version`.
-- [ ] Update Grid workload chart `appVersion` values to the Grid tag.
+- [ ] Update AGN workload chart `appVersion` values to the AGN tag.
 - [ ] Verify the `praxis-gateway` `appVersion` and default image match the
       intended official Praxis AI release.
 - [ ] Update the release workflow's pinned AI tag, digest, and source revision
@@ -151,13 +151,13 @@ notes, run it and report its evidence independently.
 
 | Area | Behavior proved | Images and overrides | Evidence, runtime, and cleanup |
 |---|---|---|---|
-| Provider traffic selection and round-robin | Grid publishes stable provider candidates and groups; Praxis AI accepts the overlay and returns trusted attribution while eligible providers receive round-robin traffic. | Official compatible Praxis AI gateway image, plus the locally built Grid operator, overlay-sync, mock-provider, and VCR images. Use the `GRID_XTASK_*_IMAGE` overrides above when validating unreleased Grid code. | Write to the run’s UTC-stamped `EVIDENCE_DIR`; the full run is typically several minutes. `--teardown` removes run-owned resources. |
-| Distributed token quota | Basic Auth precedes admission; Alice’s sliding-window budget is shared across consumers; routing spans sites; concurrency, expiry, restart persistence, Valkey fail-closed behavior, recovery, and NetworkPolicy are exercised. | Praxis AI must be built with `token-rate-limit-filter,praxis-filter/basic-auth-filter`; use `--image-tag` and the exact feature-enabled local AI image, with local Grid operator/overlay-sync/VCR images as required by the README. | Record structured quota and routing evidence under `EVIDENCE_DIR`; runtime is variable and materially longer than a smoke test. The command cleans up on completion or failure; do not use `--keep` for release evidence. |
+| Provider traffic selection and round-robin | AGN publishes stable provider candidates and groups; Praxis AI accepts the overlay and returns trusted attribution while eligible providers receive round-robin traffic. | Official compatible Praxis AI gateway image, plus the locally built AGN operator (`grid-operator`), overlay-sync, mock-provider, and VCR images. Use the `GRID_XTASK_*_IMAGE` overrides above when validating unreleased AGN code. | Write to the run’s UTC-stamped `EVIDENCE_DIR`; the full run is typically several minutes. `--teardown` removes run-owned resources. |
+| Distributed token quota | Basic Auth precedes admission; Alice’s sliding-window budget is shared across consumers; routing spans sites; concurrency, expiry, restart persistence, Valkey fail-closed behavior, recovery, and NetworkPolicy are exercised. | Praxis AI must be built with `token-rate-limit-filter,praxis-filter/basic-auth-filter`; use `--image-tag` and the exact feature-enabled local AI image, with local AGN operator (`grid-operator`)/overlay-sync/VCR images as required by the README. | Record structured quota and routing evidence under `EVIDENCE_DIR`; runtime is variable and materially longer than a smoke test. The command cleans up on completion or failure; do not use `--keep` for release evidence. |
 | Single-cluster multi-gateway | Two consumer gateways independently accept and serve the same three-provider overlay inside one Kubernetes cluster and one GridSite; attributed round-robin selection, provider withdrawal/restoration, consumer failure/recovery, concurrent traffic, and NetworkPolicy boundaries are exercised. | The fixed `grid-operator:single-cluster-qualification`, `grid-overlay-sync:single-cluster-qualification`, and `praxis-ai:single-cluster-qualification` references are local-development defaults. Release validation should set `GRID_XTASK_OPERATOR_IMAGE`, `GRID_XTASK_OVERLAY_SYNC_IMAGE`, and `GRID_XTASK_GATEWAY_IMAGE` to unique references; set `GRID_XTASK_VCR_IMAGE` as needed. All resolved references are loaded into Kind under `imagePullPolicy: Never`. | The command records timestamped structured evidence and performs automatic cleanup unless `--keep` is explicitly supplied. It does not claim multi-site SWIM, WAN behavior, or a globally shared round-robin cursor. |
-| Combined-site lifecycle | Combined-site bootstrap, trusted round-robin, provider drain and restoration, secondary add/remove/re-add, session fallback, revision convergence, and lifecycle cleanup. | Official compatible Praxis AI image plus local Grid operator, overlay-sync, mock-provider, and VCR images through the overrides above. | Save lifecycle timelines and request attribution under `EVIDENCE_DIR`; a full run is typically on the order of tens of minutes. `--teardown` performs bounded cleanup of owned clusters, pods, processes, and networks. |
+| Combined-site lifecycle | Combined-site bootstrap, trusted round-robin, provider drain and restoration, secondary add/remove/re-add, session fallback, revision convergence, and lifecycle cleanup. | Official compatible Praxis AI image plus local AGN operator (`grid-operator`), overlay-sync, mock-provider, and VCR images through the overrides above. | Save lifecycle timelines and request attribution under `EVIDENCE_DIR`; a full run is typically on the order of tens of minutes. `--teardown` performs bounded cleanup of owned clusters, pods, processes, and networks. |
 | GLB | Global load-balancing and network-boundary behavior, including provider attribution and the configured ingress path. | Official compatible Praxis AI image plus the topology’s required local Grid/operator/mock-provider/VCR images; use the listed overrides and `Never` pull policy for local images. | Save results under `EVIDENCE_DIR`; use `--quick` for bounded diagnostics or `--full` for qualification. `--teardown` removes only run-owned resources. |
 | Workload inference / no ingress | Workload inference through the no-ingress path and its provider/network behavior. This reuses the GLB command with `--no-ingress`; it is not a separate invented CLI command. | Same image set and overrides as GLB, with any optional AI features required by that topology’s README. | Save no-ingress evidence under `EVIDENCE_DIR`; use `--quick` for diagnostics or `--full` for qualification. `--teardown` removes only run-owned resources. |
-| llm-d pool metrics pressure and recovery | Pool-metrics observation, pressure-aware placement, availability during transitions, and recovery after metrics return below threshold. | Official compatible Praxis AI image plus local Grid operator/overlay-sync and the llm-d/EPP images required by its README; `--metrics-mtls` and `--kv-cache` are optional command flags when the topology enables them. | Save metric, overlay, reload, request, and recovery timelines under `EVIDENCE_DIR`; runtime is variable and may be long. `--teardown` performs bounded owned-resource cleanup. |
+| llm-d pool metrics pressure and recovery | Pool-metrics observation, pressure-aware placement, availability during transitions, and recovery after metrics return below threshold. | Official compatible Praxis AI image plus local AGN operator (`grid-operator`)/overlay-sync and the llm-d/EPP images required by its README; `--metrics-mtls` and `--kv-cache` are optional command flags when the topology enables them. | Save metric, overlay, reload, request, and recovery timelines under `EVIDENCE_DIR`; runtime is variable and may be long. `--teardown` performs bounded owned-resource cleanup. |
 
 ## Tagging A Release
 

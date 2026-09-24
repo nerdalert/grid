@@ -441,7 +441,7 @@ fn wait_for_environment_ready() -> Result<String, Box<dyn std::error::Error>> {
     // Wait for Grid operators to converge
     for cluster in CLUSTERS {
         let context = format!("kind-grid-provider-traffic-{cluster}");
-        eprintln!("  [WAIT] {cluster}: Grid operator convergence");
+        eprintln!("  [WAIT] {cluster}: AGN operator convergence");
 
         // Wait for deployment to be ready
         wait_for_deployment("grid-operator", "grid-system", &context)?;
@@ -2129,12 +2129,12 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
     eprintln!("  [OK] Infrastructure stacks applied");
 
     eprintln!();
-    eprintln!("[SETUP {}/{}] Verifying Grid operators are ready", next(), total_phases);
+    eprintln!("[SETUP {}/{}] Verifying AGN operators are ready", next(), total_phases);
 
     for cluster in CLUSTERS {
         let ctx = format!("kind-grid-provider-traffic-{cluster}");
         wait_for_deployment("grid-operator", GRID_SYSTEM_NS, &ctx)?;
-        eprintln!("  [OK] {cluster}: Grid operator ready");
+        eprintln!("  [OK] {cluster}: AGN operator ready");
     }
 
     eprintln!();

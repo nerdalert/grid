@@ -1,5 +1,8 @@
 # Development
 
+Development of AI Grid Network (AGN) follows the shared project conventions
+and validation requirements below.
+
 ## Requirements
 
 - Rust stable 1.96+

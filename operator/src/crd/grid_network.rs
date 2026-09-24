@@ -1,6 +1,6 @@
 //! [`GridNetwork`] custom resource definition.
 //!
-//! The top-level tenancy boundary for the AI Grid. A cluster
+//! The top-level tenancy boundary for AI Grid Network (AGN). A cluster
 //! can host multiple `GridNetworks` for multi-tenancy.
 
 use std::collections::BTreeMap;
@@ -1094,10 +1094,10 @@ pub enum GridNetworkPhase {
     /// CA and certs being generated, SWIM starting.
     Initializing,
 
-    /// Grid is operational with connected sites.
+    /// AGN is operational with connected sites.
     Active,
 
-    /// Grid is degraded (sites unreachable).
+    /// AGN is degraded (sites unreachable).
     Degraded,
 }
 

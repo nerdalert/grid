@@ -6,7 +6,7 @@ use crate::gateway;
 
 /// grid-operator command-line interface.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "grid-operator", about = "AI Grid Kubernetes operator")]
+#[command(name = "grid-operator", about = "AI Grid Network (AGN) Kubernetes operator")]
 pub struct Cli {
     /// Gateway self-discovery options.
     #[command(flatten)]
