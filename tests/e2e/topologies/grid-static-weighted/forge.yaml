@@ -183,7 +183,7 @@ spec:
           interval: "2s"
 
     vcr-backend:
-      description: vllm-vcr inference backend for demo scenarios
+      description: llm-d inference simulator backend for demo scenarios
       steps:
         - type: manifest
           path: resources/common/grid-system-namespace.yaml
