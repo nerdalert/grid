@@ -11,18 +11,31 @@ Each Helm chart has its own `version`, which must match the Grid release. The
 `praxis-gateway` chart is different: its `appVersion` identifies the default
 Praxis AI image and may advance independently of Grid.
 
+The project-owned `grid-gateway` operand is versioned with Grid and must be
+built from the same tagged Grid source. It is distinct from the separately
+released Praxis AI image used by the `praxis-gateway` chart.
+
 [semver]: https://semver.org/
 
 ## Release Artifacts
 
 A Grid release publishes:
 
+- `ghcr.io/praxis-proxy/grid-gateway:v<version>`;
 - `ghcr.io/praxis-proxy/grid-operator`;
 - `ghcr.io/praxis-proxy/grid-mock-providers`;
 - `ghcr.io/praxis-proxy/grid-overlay-sync`;
 - the `grid-operator`, `grid-site`, `praxis-gateway`, and
   `grid-mock-providers` Helm charts; and
 - a GitHub Release containing generated notes and immutable artifact digests.
+
+Build `grid-gateway:v<version>` from the matching Grid release tag and record
+its immutable digest in the release manifest. Image publication does not depend
+on a chart or operator consuming the image.
+
+The `praxis-gateway` chart uses the separately released
+`ghcr.io/praxis-proxy/ai:<tag>` image. Qualify any chart or operator that
+consumes `grid-gateway` separately, as described below.
 
 Grid does not publish a Praxis AI image or an AI rollup. The release workflow
 verifies the pinned official Praxis AI image used by the `praxis-gateway` chart,
@@ -42,6 +55,10 @@ Before opening a release preparation pull request:
 - [ ] Update Grid workload chart `appVersion` values to the Grid tag.
 - [ ] Verify the `praxis-gateway` `appVersion` and default image match the
       intended official Praxis AI release.
+- [ ] Confirm the release workflow builds
+      `ghcr.io/praxis-proxy/grid-gateway:v<version>` from the same tagged Grid
+      source, publishes the version tag, and records the resulting immutable
+      digest.
 - [ ] Update the release workflow's pinned AI tag, digest, and source revision
       when the default Praxis AI image changes.
 - [ ] Run `cargo +nightly-2026-03-28 fmt --all -- --check`.
@@ -112,6 +129,10 @@ export GRID_XTASK_VCR_IMAGE=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
 export GRID_XTASK_IMAGE_PULL_POLICY=Never
 ```
 
+In the current qualification tooling, `GRID_XTASK_GATEWAY_IMAGE` names the
+Praxis AI gateway image used by the fixtures. It does not refer to the
+project-owned `grid-gateway` operand.
+
 The distributed token-quota qualification requires Praxis AI built with:
 
 ```text
@@ -161,13 +182,15 @@ notes, run it and report its evidence independently.
 
 ## Tagging A Release
 
-Tags use `v<MAJOR>.<MINOR>.<PATCH>`, for example `v0.1.4`. Create the tag only
+Tags use `v<MAJOR>.<MINOR>.<PATCH>`. Create the tag only
 from the reviewed commit after its pull request and CI checks pass. Sign the tag
 using the project's normal Git signing configuration:
 
 ```console
-git tag -s v0.1.4 -m "Grid v0.1.4"
-git push origin v0.1.4
+VERSION="${VERSION:?set VERSION to the workspace release version}"
+TAG="v${VERSION}"
+git tag -s "$TAG" -m "Grid $TAG"
+git push origin "$TAG"
 ```
 
 Do not move or recreate a published release tag. Prepare a new patch release
@@ -180,13 +203,37 @@ Pushing a valid release tag triggers the **Release** workflow. The workflow:
 1. verifies that the tag matches the workspace version;
 2. reruns lint, tests, and documentation validation from the tagged source;
 3. verifies the pinned official Praxis AI image and provenance;
-4. builds and publishes immutable Grid container images with SBOM and
-   provenance attestations;
+4. builds and publishes the version-tagged Grid container images, including
+   `grid-gateway`, with SBOM and provenance attestations;
 5. validates, packages, and publishes all Helm charts; and
 6. creates the GitHub Release with generated notes and immutable digests.
 
 The workflow can also be dispatched for an existing immutable release tag. A
 manual dispatch does not replace the requirement for a reviewed, signed tag.
+
+## Post-publication Verification
+
+For every release:
+
+- [ ] Confirm `ghcr.io/praxis-proxy/grid-gateway:v<version>` exists and its
+      registry digest matches the digest recorded in the GitHub Release
+      manifest.
+- [ ] Confirm that deployments using the `praxis-gateway` chart still resolve
+      the separately released `ghcr.io/praxis-proxy/ai:<tag>` image; that chart
+      is not evidence that the Grid gateway operand is wired.
+
+### Grid gateway consumer qualification
+
+Before deploying the Grid gateway operand:
+
+- [ ] Identify the intended chart or operator consumer and verify that its
+      rendered image reference uses the release's `grid-gateway` image by its
+      recorded immutable digest, or a version tag that resolves to that digest.
+- [ ] Preserve the rendered consumer reference with the deployment evidence.
+
+Until that consumer exists and passes this check, record Grid gateway
+consumption as **NOT QUALIFIED**. This does not block publication of
+`grid-gateway` or the other Grid release artifacts.
 
 ## Release Notes
 
