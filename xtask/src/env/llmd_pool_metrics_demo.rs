@@ -559,11 +559,13 @@ fn prepare_setup(
 
     let resolved_config = materialize_config_with_images(
         forge_config,
-        metrics_transport,
-        scoring_flavor,
-        images.nginx.as_deref(),
-        Some(&images),
-        Some(run_id),
+        &MaterializeConfigOptions {
+            metrics_transport,
+            scoring_flavor,
+            nginx_image: images.nginx.as_deref(),
+            images: Some(&images),
+            run_id: Some(run_id),
+        },
     )?;
     verify_materialized_images(&resolved_config, &images)?;
     let forge_bin = glb::resolve_forge_binary()
@@ -2427,7 +2429,16 @@ fn materialize_config(
     scoring_flavor: ScoringFlavor,
     nginx_image: Option<&str>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    materialize_config_with_images(forge_config, metrics_transport, scoring_flavor, nginx_image, None, None)
+    materialize_config_with_images(
+        forge_config,
+        &MaterializeConfigOptions {
+            metrics_transport,
+            scoring_flavor,
+            nginx_image,
+            images: None,
+            run_id: None,
+        },
+    )
 }
 
 /// Materialize a Forge config and inject all explicitly selected images.
@@ -2436,14 +2447,32 @@ fn materialize_config(
 /// overlay-sync sidecar values. Keeping this injection here ensures the image
 /// references used by Forge, Kind loading, and the environment variables are
 /// identical before any cluster is created.
+#[derive(Clone, Copy)]
+struct MaterializeConfigOptions<'inputs> {
+    /// Metrics transport to render into the resolved Forge config.
+    metrics_transport: MetricsTransport,
+    /// Scoring implementation selected by this qualification.
+    scoring_flavor: ScoringFlavor,
+    /// Optional nginx image used by the metrics TLS proxy manifests.
+    nginx_image: Option<&'inputs str>,
+    /// Optional explicitly resolved image set to materialize.
+    images: Option<&'inputs ResolvedImages>,
+    /// Optional run ID used to isolate generated manifest paths.
+    run_id: Option<&'inputs str>,
+}
+
+/// Materialize a Forge config with optional image and run-specific overrides.
 fn materialize_config_with_images(
     forge_config: &Path,
-    metrics_transport: MetricsTransport,
-    scoring_flavor: ScoringFlavor,
-    nginx_image: Option<&str>,
-    images: Option<&ResolvedImages>,
-    run_id: Option<&str>,
+    options: &MaterializeConfigOptions<'_>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let MaterializeConfigOptions {
+        metrics_transport,
+        scoring_flavor,
+        nginx_image,
+        images,
+        run_id,
+    } = *options;
     let dir = forge_config.parent().unwrap_or_else(|| Path::new("."));
     let run_suffix = run_id.map_or_else(String::new, |id| format!(".{id}"));
     let resolved = dir.join(format!(".forge.resolved{run_suffix}.yaml"));
@@ -3975,45 +4004,67 @@ fn proof_tls_routing() -> ProofResult {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::*;
     use std::collections::BTreeSet;
 
-    use serde::Deserialize;
+    use serde::Deserialize as _;
+
+    use super::*;
 
     #[test]
-    fn pool_metrics_topology_uses_deterministic_selection_for_pressure_recovery() {
+    fn pool_metrics_topology_uses_deterministic_selection_for_pressure_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
         let config_source = include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml");
-        let config: serde_yaml::Value = serde_yaml::from_str(config_source).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(config_source)?;
 
         for site in ["pool-a-site", "pool-b-site"] {
-            let selection_mode =
-                config["spec"]["stacks"][site]["steps"][0]["values"]["gridNetwork"]["selectionPolicy"]["mode"].as_str();
+            let selection_mode = config
+                .get("spec")
+                .and_then(|spec| spec.get("stacks"))
+                .and_then(|stacks| stacks.get(site))
+                .and_then(|site| site.get("steps"))
+                .and_then(|steps| steps.get(0))
+                .and_then(|step| step.get("values"))
+                .and_then(|values| values.get("gridNetwork"))
+                .and_then(|network| network.get("selectionPolicy"))
+                .and_then(|policy| policy.get("mode"))
+                .and_then(serde_yaml::Value::as_str);
             assert_eq!(
                 selection_mode,
                 Some("deterministic"),
                 "{site} must use deterministic selection because this qualification asserts rank-0 preference, not equal-turn round robin"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn pool_metrics_simulator_backends_use_the_same_dummy_tokenizer_mode() {
+    fn pool_metrics_simulator_backends_use_the_same_dummy_tokenizer_mode() -> Result<(), Box<dyn std::error::Error>> {
         for source in [
             include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/resources/pool-a/vcr-deployment.yaml"),
             include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/resources/pool-b/vcr-deployment.yaml"),
         ] {
             let mut deployments = BTreeSet::new();
             for document in serde_yaml::Deserializer::from_str(source) {
-                let value = serde_yaml::Value::deserialize(document).unwrap();
-                if value["kind"].as_str() != Some("Deployment") {
+                let value = serde_yaml::Value::deserialize(document)?;
+                if value.get("kind").and_then(serde_yaml::Value::as_str) != Some("Deployment") {
                     continue;
                 }
-                let Some(name) = value["metadata"]["name"].as_str() else {
+                let Some(name) = value
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("name"))
+                    .and_then(serde_yaml::Value::as_str)
+                else {
                     continue;
                 };
-                let args = value["spec"]["template"]["spec"]["containers"][0]["args"]
-                    .as_sequence()
-                    .expect("simulator args must be a sequence");
+                let args = value
+                    .get("spec")
+                    .and_then(|spec| spec.get("template"))
+                    .and_then(|template| template.get("spec"))
+                    .and_then(|spec| spec.get("containers"))
+                    .and_then(|containers| containers.get(0))
+                    .and_then(|container| container.get("args"))
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .ok_or_else(|| std::io::Error::other(format!("{name} simulator args must be a YAML sequence")))?;
                 assert!(
                     args.iter().any(|arg| arg.as_str() == Some("--force-dummy-tokenizer")),
                     "{name} must use dummy tokenization; otherwise llm-d-inference-sim calls its absent localhost:8082 renderer"
@@ -4022,6 +4073,7 @@ mod tests {
             }
             assert_eq!(deployments, BTreeSet::from(["vcr-1".to_owned(), "vcr-2".to_owned()]));
         }
+        Ok(())
     }
 
     #[test]
