@@ -3771,7 +3771,7 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
     }
 
     let gateway =
-        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "ghcr.io/praxis-proxy/ai:0.3.0".to_owned());
+        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "ghcr.io/praxis-proxy/ai:0.4.0".to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
     let vcr = crate::env::image_overrides::sim_image();
@@ -4676,7 +4676,7 @@ fn materialize_external_provider_stack(
 )]
 fn apply_image_overrides(config: &mut serde_yaml::Value) {
     let gateway_image =
-        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "ghcr.io/praxis-proxy/ai:0.3.0".to_owned());
+        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "ghcr.io/praxis-proxy/ai:0.4.0".to_owned());
     let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
     let vcr_image = crate::env::image_overrides::sim_image();
