@@ -42,6 +42,9 @@ env:
   #   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/praxis-proxy/ai:<tag>
   GATEWAY_IMAGE_REF: ghcr.io/praxis-proxy/ai:0.4.0
   GATEWAY_IMAGE_DIGEST: sha256:0f619d4a0b533093f94a76921cfbba0ecdec51557dffee1615a29721ee1fc878
+  # The GLB Forge topology runs with imagePullPolicy=Never, so materialize its
+  # simulator locally and pin it just like the gateway image.
+  SIM_IMAGE_REF: ghcr.io/neuralmagic/vllm-vcr@sha256:cf98f91f12210893f63b3afd3b1ea5bd3c35640379ce2bbf702a4cefddf9e5a4
   # Pinned identity/date/message-suffix for the local PR-merge reconstruction
   # in resolve-source's "Resolve source" step and glb-e2e's "Reconstruct PR
   # merge" step (see grid#66). Both jobs build a merge commit from the same
@@ -552,6 +555,18 @@ jobs:
           fi
           echo "Digest verification: PASS"
 
+      - name: Pull pinned simulator image
+        run: |
+          set -euo pipefail
+          docker pull "${SIM_IMAGE_REF}"
+          ACTUAL_ID=$(docker image inspect --format='{{.Id}}' "${SIM_IMAGE_REF}")
+          EXPECTED_ID="sha256:cf98f91f12210893f63b3afd3b1ea5bd3c35640379ce2bbf702a4cefddf9e5a4"
+          if [[ "${ACTUAL_ID}" != "${EXPECTED_ID}" ]]; then
+            echo "::error::Simulator image ID mismatch: expected ${EXPECTED_ID}, got ${ACTUAL_ID}"
+            exit 1
+          fi
+          echo "Simulator image verified: ${SIM_IMAGE_REF} (${ACTUAL_ID})"
+
       # ----------------------------------------------------------------------
       # Image verification
       # ----------------------------------------------------------------------
@@ -619,10 +634,14 @@ jobs:
             docker inspect --format='  ID: {{.Id}}' "${GATEWAY_IMAGE_REF}"
             echo "  Digest: ${RESOLVED_DIGEST}"
             echo ""
+            echo "${SIM_IMAGE_REF}  (pinned GLB simulator — not built by Grid)"
+            docker inspect --format='  ID: {{.Id}}' "${SIM_IMAGE_REF}"
+            echo ""
             echo "=== Override Environment ==="
             echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
             echo "GRID_XTASK_MOCK_PROVIDER_IMAGE=grid-mock-providers:${TAG}"
             echo "GRID_XTASK_GATEWAY_IMAGE=${GATEWAY_IMAGE_REF}"
+            echo "GRID_XTASK_SIM_IMAGE=${SIM_IMAGE_REF}"
             echo "GRID_XTASK_IMAGE_PULL_POLICY=Never"
           } | tee "${GITHUB_WORKSPACE}/image-manifest.txt"
 
@@ -651,6 +670,7 @@ jobs:
           GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
           GRID_XTASK_MOCK_PROVIDER_IMAGE: grid-mock-providers:${{ steps.tags.outputs.tag }}
           GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
+          GRID_XTASK_SIM_IMAGE: ${{ env.SIM_IMAGE_REF }}
           GRID_XTASK_IMAGE_PULL_POLICY: Never
         run: |
           set -euo pipefail
