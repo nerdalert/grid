@@ -559,13 +559,14 @@ jobs:
         run: |
           set -euo pipefail
           docker pull "${SIM_IMAGE_REF}"
-          ACTUAL_ID=$(docker image inspect --format='{{.Id}}' "${SIM_IMAGE_REF}")
-          EXPECTED_ID="sha256:cf98f91f12210893f63b3afd3b1ea5bd3c35640379ce2bbf702a4cefddf9e5a4"
-          if [[ "${ACTUAL_ID}" != "${EXPECTED_ID}" ]]; then
-            echo "::error::Simulator image ID mismatch: expected ${EXPECTED_ID}, got ${ACTUAL_ID}"
+          EXPECTED_DIGEST="${SIM_IMAGE_REF##*@}"
+          REPO_DIGESTS=$(docker image inspect --format='{{json .RepoDigests}}' "${SIM_IMAGE_REF}")
+          if ! jq -e --arg digest "${EXPECTED_DIGEST}" 'any(.[]; endswith($digest))' <<< "${REPO_DIGESTS}" > /dev/null; then
+            echo "::error::Pulled simulator does not report the pinned repository digest ${EXPECTED_DIGEST}: ${REPO_DIGESTS}"
             exit 1
           fi
-          echo "Simulator image verified: ${SIM_IMAGE_REF} (${ACTUAL_ID})"
+          ACTUAL_ID=$(docker image inspect --format='{{.Id}}' "${SIM_IMAGE_REF}")
+          echo "Simulator image verified: ${SIM_IMAGE_REF} (image ID ${ACTUAL_ID})"
 
       # ----------------------------------------------------------------------
       # Image verification
