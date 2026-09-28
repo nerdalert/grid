@@ -691,7 +691,8 @@ jobs:
             echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
             echo "GRID_XTASK_MOCK_PROVIDER_IMAGE=grid-mock-providers:${TAG}"
             echo "GRID_XTASK_GATEWAY_IMAGE=${GATEWAY_IMAGE_REF}"
-            echo "GRID_XTASK_SIM_IMAGE=${SIM_IMAGE_REF}"
+            echo "GRID_XTASK_SIM_IMAGE=${SIM_IMAGE_TAG}"
+            echo "  materialized from pinned ${SIM_IMAGE_REF}"
             echo "GRID_XTASK_IMAGE_PULL_POLICY=Never"
           } | tee "${GITHUB_WORKSPACE}/image-manifest.txt"
 
