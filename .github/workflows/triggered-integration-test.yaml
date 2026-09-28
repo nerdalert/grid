@@ -387,6 +387,34 @@ jobs:
           echo "sha=${DEMOS_SHA}" >> "${GITHUB_OUTPUT}"
           echo "Demos repo SHA: ${DEMOS_SHA}"
 
+      - name: Allow the GLB test's private backend endpoints
+        run: |
+          set -euo pipefail
+          DEMO_DIR="${GITHUB_WORKSPACE}/praxis-demos/demos/grid-glb-demo"
+          for provider in east-provider west-provider; do
+            config="${DEMO_DIR}/configs/${provider}/praxis.yaml"
+            if [[ ! -f "${config}" ]]; then
+              echo "::error::Missing GLB provider config: ${config}"
+              exit 1
+            fi
+
+            if grep -q '^insecure_options:' "${config}"; then
+              if ! grep -Eq '^  allow_private_endpoints:[[:space:]]*true[[:space:]]*(#.*)?$' "${config}" \
+                || ! grep -Eq '^  allow_private_upstreams:[[:space:]]*true[[:space:]]*(#.*)?$' "${config}"; then
+                echo "::error::${config} has an unexpected insecure_options block; refusing to rewrite it"
+                exit 1
+              fi
+            else
+              tmp_config="$(mktemp "${config}.XXXXXX")"
+              {
+                printf 'insecure_options:\n  allow_private_endpoints: true\n  allow_private_upstreams: true\n\n'
+                cat "${config}"
+              } > "${tmp_config}"
+              mv "${tmp_config}" "${config}"
+            fi
+            echo "Prepared private Kind backend allowances in configs/${provider}/praxis.yaml"
+          done
+
       - name: Validate immutable gateway input
         run: |
           set -euo pipefail
