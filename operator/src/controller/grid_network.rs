@@ -35,7 +35,7 @@ use crate::{
     error::OperatorError,
     resources::{
         consumer_config::{self, ConsumerConfigError},
-        overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
+        overlay_envelope, placement, provider_admission, provider_metrics, routing_overlay, secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
@@ -85,6 +85,9 @@ pub struct OperatorCtx {
     /// Admission is evaluated in the control plane and the resulting wire
     /// state is copied into the overlay. It is never consulted by a request.
     pub(crate) admission_memory: Mutex<provider_admission::AdmissionMemory>,
+
+    /// Pressure smoothing state, keyed by `GridNetwork` and gateway identity.
+    pub(crate) placement_states: std::sync::Mutex<HashMap<String, placement::PlacementState>>,
 
     /// Tracks the seed set announced on the last reconcile per `GridNetwork`.
     ///
@@ -166,6 +169,7 @@ impl OperatorCtx {
             swim: swim.map(std::sync::OnceLock::from).unwrap_or_default(),
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
+            placement_states: std::sync::Mutex::new(HashMap::new()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
@@ -595,6 +599,22 @@ fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorErr
         .map_err(|error| OperatorError::InvalidResource(format!("invalid budgetPolicy: {error}")))
 }
 
+/// Pressure-weighted placement consumes the operator's live poll-mode stores;
+/// reject it rather than silently reverting to static or scoring behavior.
+fn reject_invalid_placement_mode(network: &GridNetwork, running_mode: SignalMode) -> Result<(), OperatorError> {
+    let pressure_weighted = network
+        .spec
+        .placement_policy
+        .as_ref()
+        .is_some_and(|policy| policy.strategy == crate::crd::grid_network::PlacementStrategy::PressureWeighted);
+    if pressure_weighted && running_mode != SignalMode::Poll {
+        return Err(OperatorError::InvalidResource(
+            "pressureWeighted placement requires the operator to run with signalTransport.mode=poll; restart the operator after changing the mode".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Reconcile
 // ---------------------------------------------------------------------------
@@ -617,6 +637,7 @@ fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorErr
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
     let name = grid_network_name(&network)?;
     reject_invalid_budget_policy(&network)?;
+    reject_invalid_placement_mode(&network, ctx.signal_mode)?;
 
     info!(name, "reconciling GridNetwork");
 
@@ -817,6 +838,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         serving_retry,
     } = reconcile_routing_overlay_inner(
         &network,
+        &ctx,
         client,
         &providers,
         &remote_crdt_providers,
@@ -1324,10 +1346,11 @@ async fn apply_site_secret(
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "scoring_weights is threaded through overlay rendering without hiding the selected strategy"
+    reason = "pre-fetched reconcile inputs and controller context are passed explicitly to the overlay renderer"
 )]
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
+    ctx: &OperatorCtx,
     client: &Client,
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
@@ -1347,6 +1370,49 @@ async fn reconcile_routing_overlay_inner(
     } else {
         Some(&metrics_by_str)
     };
+
+    let pressure_config = network
+        .spec
+        .placement_policy
+        .as_ref()
+        .filter(|policy| policy.strategy == crate::crd::grid_network::PlacementStrategy::PressureWeighted)
+        .and_then(|policy| policy.pressure_weighted.as_ref());
+    let pressure_metric = pressure_config.map(|config| match config.signal {
+        crate::crd::grid_network::PressureSignal::QueueDepth => placement::QUEUE_PRESSURE_METRIC,
+        crate::crd::grid_network::PressureSignal::KvCacheUtilization => placement::KV_CACHE_PRESSURE_METRIC,
+    });
+    let pressure_values = pressure_metric.map_or_else(HashMap::new, |metric| {
+        let collect = [metric.to_owned()];
+        let (local, _) = ctx.signals.render_unrestricted(None, &collect);
+        let (peers, _) = ctx.peers.render_unrestricted(None, &collect);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+            .unwrap_or(i64::MAX);
+        let max_age = Duration::from_secs(u64::from(
+            pressure_config.map_or(120, |config| config.stale_signal_seconds),
+        ));
+        placement::fresh_signal_values(&local, &peers, metric, now_ms, max_age)
+    });
+    let signal_origin_site = ctx
+        .swim
+        .as_ref()
+        .map_or_else(String::new, |swim| swim.site_name().to_owned());
+
+    if pressure_config.is_some() {
+        let active_state_keys: BTreeSet<String> = network
+            .spec
+            .gateway_refs
+            .iter()
+            .map(|gateway| format!("{network_name}/{}/{}", gateway.namespace, gateway.name))
+            .collect();
+        let mut states = ctx
+            .placement_states
+            .lock()
+            .map_err(|error| OperatorError::InvalidResource(format!("placement state lock poisoned: {error}")))?;
+        states.retain(|key, _| active_state_keys.contains(key));
+    }
 
     let observed_generation = network.metadata.generation.unwrap_or(0);
     let mut consumer_statuses: Vec<ConsumerConfigStatus> = Vec::new();
@@ -1379,17 +1445,43 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let overlay = match routing_overlay::render_routing_overlay_with_admission(
-            network,
-            &sites,
-            providers,
-            &eligible_remote_owned,
-            local_site,
-            metrics_arg,
-            timestamp.as_deref(),
-            scoring_weights,
-            Some(admission_states),
-        ) {
+        let render_result = if pressure_config.is_some() {
+            let state_key = format!("{network_name}/{}/{}", gw_ref.namespace, gw_ref.name);
+            let mut states = ctx
+                .placement_states
+                .lock()
+                .map_err(|error| OperatorError::InvalidResource(format!("placement state lock poisoned: {error}")))?;
+            let state = states.entry(state_key).or_default();
+            let rendered = routing_overlay::render_routing_overlay_with_pressure(
+                network,
+                &sites,
+                providers,
+                &eligible_remote_owned,
+                local_site,
+                metrics_arg,
+                timestamp.as_deref(),
+                scoring_weights,
+                Some(admission_states),
+                &pressure_values,
+                &signal_origin_site,
+                state,
+            );
+            drop(states);
+            rendered
+        } else {
+            routing_overlay::render_routing_overlay_with_admission(
+                network,
+                &sites,
+                providers,
+                &eligible_remote_owned,
+                local_site,
+                metrics_arg,
+                timestamp.as_deref(),
+                scoring_weights,
+                Some(admission_states),
+            )
+        };
+        let overlay = match render_result {
             Ok(overlay) => overlay,
             Err(error) => {
                 tracing::warn!(
@@ -3240,6 +3332,21 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    #[test]
+    fn peer_identity_uses_swim_site_id_for_network_prefixed_grid_site() {
+        let site = peer_grid_site("net-pool-b", Some("pool-b"), &["AB"]);
+        let records = peer_identities(&[site], signals::PeerTrustMode::Pin);
+        let identities = signals::PeerIdentities::new();
+        identities.set(records);
+
+        assert!(!identities.refuses("pool-b"), "poller addresses peers by SWIM site ID");
+        assert_eq!(identities.pins_for("pool-b"), vec!["ab"]);
+        assert!(
+            identities.refuses("net-pool-b"),
+            "the Kubernetes GridSite name is not the SWIM peer lookup key"
+        );
+    }
+
     fn ref_name(refs: Option<ObjectRef<GridNetwork>>) -> String {
         refs.unwrap_or_else(|| std::process::abort()).name
     }
@@ -3468,6 +3575,31 @@ mod tests {
                 "non-finite capUsd ({bad_cap}) must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn pressure_weighted_placement_requires_poll_mode_at_operator_startup() {
+        let mut network = base_network();
+        network.spec.selection_policy = Some(crate::crd::grid_network::SelectionPolicyConfig {
+            mode: crate::crd::grid_network::SelectionMode::WeightedRandom,
+        });
+        network.spec.placement_policy = Some(crate::crd::grid_network::PlacementPolicyConfig {
+            strategy: crate::crd::grid_network::PlacementStrategy::PressureWeighted,
+            pressure_weighted: Some(crate::crd::grid_network::PressureWeightedConfig {
+                signal: crate::crd::grid_network::PressureSignal::QueueDepth,
+                minimum_weight: 1,
+                maximum_weight: 1000,
+                availability_floor_percent: 5,
+                smoothing_factor: 0.35,
+                change_threshold_percent: 5,
+                stale_signal_seconds: 120,
+            }),
+        });
+        assert!(
+            matches!(reject_invalid_placement_mode(&network, SignalMode::Poll), Ok(())),
+            "pressure-weighted placement is valid with poll transport"
+        );
+        assert!(reject_invalid_placement_mode(&network, SignalMode::Gossip).is_err());
     }
 
     fn alive_snapshot(count: usize) -> MembershipSnapshot {

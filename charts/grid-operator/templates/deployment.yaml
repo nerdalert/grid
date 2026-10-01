@@ -103,6 +103,8 @@ spec:
             {{- end }}
             - name: GRID_METRICS_ADDR
               value: {{ .Values.metrics.bindAddress | quote }}
+            - name: GRID_SIGNALS_ADDR
+              value: "0.0.0.0:9091"
             - name: RUST_LOG
               value: {{ .Values.log.level | quote }}
             {{- with include "grid-operator.enrollment.env" . | trim }}
