@@ -76,7 +76,8 @@ fn start_grid_routing(
     registry: &mut praxis_filter::FilterRegistry,
 ) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
     let config = ai_grid_filters::load_serving_config(path)?;
-    let runtime = ai_grid_filters::spawn_grid_routing(&config)?;
+    let mut runtime = ai_grid_filters::spawn_grid_routing(&config)?;
+    runtime.watch_config(path)?;
     ai_grid_filters::register_grid_filters(registry, runtime.snapshot())?;
     Ok(runtime)
 }

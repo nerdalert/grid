@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use http::header::{HeaderName, HeaderValue};
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 
@@ -16,6 +17,13 @@ use crate::{
     descriptor::{AdmissionState, CapabilityKind, RouteCandidate, validate_model_header},
     snapshot::RouteSnapshot,
 };
+
+/// Internal request header carrying the selected candidate's stable ID.
+const SELECTED_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
+/// Internal request header carrying the provider-hop request correlation ID.
+const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
+/// Internal request header carrying the serving overlay revision.
+const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
 
 /// Default request header carrying the model name.
 fn default_model_header() -> String {
@@ -43,7 +51,7 @@ pub(crate) struct GridSiteRouteFilter {
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
 
     /// Header the request carries the model name in.
-    model_header: http::header::HeaderName,
+    model_header: HeaderName,
 }
 
 impl GridSiteRouteFilter {
@@ -75,7 +83,21 @@ impl HttpFilter for GridSiteRouteFilter {
         true
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "header scrubbing, candidate selection, and attribution form one request-context operation"
+    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Never accept client-controlled provider-hop context. When this route
+        // selects an explicitly configured mTLS provider gateway, it writes a
+        // fresh candidate identity and request ID after the removal is queued.
+        ctx.request_headers_to_remove
+            .push(HeaderName::from_static(SELECTED_CANDIDATE_HEADER));
+        ctx.request_headers_to_remove
+            .push(HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER));
+        ctx.request_headers_to_remove
+            .push(HeaderName::from_static(OVERLAY_REVISION_HEADER));
+
         // An earlier cluster-selecting filter wins; never override its choice.
         if ctx.cluster.is_some() {
             return Ok(FilterAction::Continue);
@@ -98,6 +120,22 @@ impl HttpFilter for GridSiteRouteFilter {
             return Ok(FilterAction::Reject(Rejection::status(404)));
         };
         ctx.cluster = Some(Arc::clone(&candidate.cluster));
+        if snapshot.provider_hop_clusters.contains(candidate.cluster.as_ref()) {
+            if candidate.stable_id.trim().is_empty() {
+                return Err("grid_site_route: provider-hop candidate has no stable ID".into());
+            }
+            let candidate_id = HeaderValue::from_str(candidate.stable_id.as_ref()).map_err(|error| {
+                FilterError::from(format!("grid_site_route: invalid provider-hop candidate ID: {error}"))
+            })?;
+            let request_id = ctx.id_generator.generate(ctx.time_source);
+            let request_id = HeaderValue::from_str(&request_id).map_err(|error| {
+                FilterError::from(format!("grid_site_route: invalid provider-hop request ID: {error}"))
+            })?;
+            ctx.request_headers_to_set
+                .push((HeaderName::from_static(SELECTED_CANDIDATE_HEADER), candidate_id));
+            ctx.request_headers_to_set
+                .push((HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER), request_id));
+        }
         Ok(FilterAction::Continue)
     }
 }
@@ -145,6 +183,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: model.to_owned(),
             site: site.to_owned(),
+            stable_id: None,
         }])
         .unwrap();
         candidates[0].admission_state = admission;
