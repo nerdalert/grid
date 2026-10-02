@@ -750,11 +750,22 @@ pub struct GatewayRef {
     #[serde(default)]
     pub supports_empty_overlay: bool,
 
+    /// Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
+    /// serving config. This allowlist is independent of `consumerConfig`, so a
+    /// missing or disabled generated Praxis config cannot alter embedded
+    /// serving behavior. Every entry must declare `mutual_tls` and a nonblank
+    /// SNI; the embedded gateway's upstream configuration must use that
+    /// verified TLS identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_hop_endpoints: Vec<ProviderHopEndpointConfig>,
+
     /// Opt-in configuration for operator-managed consumer Praxis config generation.
     ///
-    /// When absent or `enabled: false`, this gateway behaves exactly as before —
-    /// only the routing overlay `ConfigMap` is applied.  When `enabled: true`, the
-    /// operator additionally renders a consumer Praxis `ConfigMap` whose
+    /// When absent or `enabled: false`, no generated consumer Praxis `ConfigMap`
+    /// is applied. The routing overlay is still applied, and embedded
+    /// `grid-gateway` serving behavior is configured independently through
+    /// `providerHopEndpoints`. When `enabled: true`, the operator additionally
+    /// renders a consumer Praxis `ConfigMap` whose
     /// `intelligent_route` reads the versioned routing overlay from the gateway
     /// namespace. The generated config includes `load_balancer` entries for the
     /// full configured endpoint inventory. It includes `credential_inject` for
@@ -935,6 +946,19 @@ pub struct EndpointTransport {
     /// must not be set when mode is `plaintext`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
+}
+
+/// Explicit verified-mTLS endpoint identity trusted for embedded provider-hop
+/// context. This does not configure the gateway's upstream TLS connection; the
+/// embedded gateway must separately use verified TLS with this SNI.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderHopEndpointConfig {
+    /// Cluster name used by the embedded gateway's `load_balancer` filter.
+    pub cluster: String,
+
+    /// TLS mode and SNI configured for that embedded gateway upstream.
+    pub transport: EndpointTransport,
 }
 
 /// Endpoint configuration for one consumer `load_balancer` cluster.
@@ -1677,6 +1701,7 @@ mod tests {
             namespace: "ns".to_owned(),
             local_site_name: None,
             supports_empty_overlay: false,
+            provider_hop_endpoints: Vec::new(),
             consumer_config: None,
         };
         let json = serde_json::to_value(&gw).unwrap_or_else(|_| std::process::abort());
@@ -1696,6 +1721,10 @@ mod tests {
         assert!(
             gateway_ref_properties.contains_key("consumerConfig"),
             "CRD schema must include consumerConfig field on GatewayRef"
+        );
+        assert!(
+            gateway_ref_properties.contains_key("providerHopEndpoints"),
+            "CRD schema must include independent providerHopEndpoints on GatewayRef"
         );
         let consumer_config_properties = gateway_ref_properties
             .get("consumerConfig")

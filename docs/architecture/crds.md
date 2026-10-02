@@ -234,6 +234,16 @@ candidates are evicted from the rendered overlay.
 Local and healthy remote candidates are never evicted.  CRDT storage records
 are not deleted by this mechanism.
 
+### GatewayRef.providerHopEndpoints
+
+`spec.gatewayRefs[].providerHopEndpoints` independently configures the
+provider-hop trust allowlist used by the embedded `grid-gateway`. Each entry
+names a provider cluster and declares its verified mTLS mode and SNI. The
+embedded gateway's startup upstream configuration must use that TLS identity.
+This field is independent of `consumerConfig`; absent or disabled generated
+consumer Praxis config cannot make embedded serving fail validation or change
+its provider-hop allowlist.
+
 ### GatewayRef.consumerConfig
 
 `spec.gatewayRefs[].consumerConfig` opts a gateway into operator-managed consumer
@@ -308,8 +318,10 @@ are retained. In projected mode, the generated config uses an empty credential
 table and resolves the selected Secret reference at request time, failing
 closed when it cannot read it.
 
-When `enabled: false` or `consumerConfig` is absent, this gateway behaves as
-before — only the routing overlay `ConfigMap` is applied.
+When `enabled: false` or `consumerConfig` is absent, no generated consumer
+Praxis `ConfigMap` is applied. The routing overlay remains active, and the
+embedded gateway's serving config is controlled separately by
+`GatewayRef.providerHopEndpoints`.
 
 ## GridSite
 

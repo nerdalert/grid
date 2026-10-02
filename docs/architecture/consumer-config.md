@@ -143,8 +143,12 @@ injection table still require the consumer owner to roll/reload Praxis after
 the generated `praxis.yaml` changes. That rollout is separate from route-only
 overlay reloads. If credentials are present, a restored provider whose
 credential reference changed requires this config rollout before its request
-can succeed; `credential_inject` fails closed when the configured reference
-does not match the overlay.
+can succeed when using a static credential table; `credential_inject` fails
+closed when the configured reference does not match the overlay. In
+projected-credential mode, a changed reference needs no config rollout when
+the credential filter is already running and the matching Secret is mounted
+under `{credentialMountBase}/{namespace}/{name}`. If that Secret projection
+is not mounted, the request fails closed until the consumer installs it.
 
 See [`docs/architecture/crds.md`](crds.md#gatewayrefconsumerconfig) for the full
 field reference.
@@ -158,7 +162,7 @@ an empty list in arbitrary startup YAML:
 |---|---|---|---|
 | Praxis `intelligent_route` with `overlay_file` | Grid's versioned `routing-overlay.json` ConfigMap | A valid versioned envelope whose `overlay.candidates` is `[]` | Praxis validates and atomically serves the new snapshot; malformed replacements retain last-known-good. Grid distributes an empty revision only after `GatewayRef.supportsEmptyOverlay: true`. |
 | Generated `GatewayRef.consumerConfig` | The same scoped versioned overlay; generated `praxis.yaml` supplies filter and endpoint plumbing | The same empty envelope | Candidate-only updates hot reload. Credential-bearing revisions are held until `enableProjectedCredentials` has been rolled out and `supportsProjectedCredentials: true` attests the filter and Secret mounts are active. Listener, endpoint/TLS, and filter-pipeline changes still require the consumer owner to reload or roll out its Praxis configuration. |
-| Embedded `grid-gateway` `grid_site_route` filter | The operator-published `grid-serving-<network>-<gateway>` ConfigMap | A valid serving config with `candidates: []` | The running gateway watches the projected serving file and atomically replaces its candidate snapshot and provider-hop allowlist. Malformed updates retain the previous snapshot. |
+| Embedded `grid-gateway` `grid_site_route` filter | The operator-published `grid-serving-<network>-<gateway>` ConfigMap | A valid serving config with `candidates: []` | The running gateway watches the projected serving file and atomically replaces its candidate snapshot and provider-hop allowlist. Malformed updates retain the previous snapshot. Provider-hop trust is declared separately with `GatewayRef.providerHopEndpoints`. |
 
 `GatewayRef.supportsEmptyOverlay` defaults to `false`. Set it to `true` only
 after every data-plane consumer of that gateway's overlay has been upgraded and
@@ -169,10 +173,12 @@ compatibility boundary, not a successful withdrawal.
 The embedded gateway's filter chain and upstream cluster definitions remain in
 its startup Praxis configuration, but its changing candidate list is not a
 startup-only inline list: it comes from the watched Grid serving ConfigMap.
-Provider-hop context is emitted only for clusters explicitly configured as
-`mutual_tls`; the embedded gateway carries the Grid overlay's stable candidate
-ID and generates a fresh hop request ID. Caller-supplied routing-context
-headers are removed before forwarding. The provider gateway still authenticates
+Its provider-hop allowlist comes from the separate
+`GatewayRef.providerHopEndpoints` field, not from `consumerConfig`; each entry
+must declare `mutual_tls` and a nonblank SNI matching the embedded gateway's
+verified upstream configuration. The embedded gateway carries the Grid
+overlay's stable candidate ID and generates a fresh hop request ID.
+Caller-supplied routing-context headers are removed before forwarding. The provider gateway still authenticates
 the peer with mTLS before consuming that context.
 
 Static, manually configured `intelligent_route.candidates` remain a distinct
