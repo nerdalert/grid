@@ -815,9 +815,9 @@ fn render_provider_hop_clusters(cluster_endpoints: &[ClusterEndpointConfig]) -> 
     Ok(format!("        provider_hop_clusters: [{values}]\n"))
 }
 
-/// The explicit mTLS endpoint names allowed to receive provider-hop context.
-/// Validate the endpoint identities here because this allowlist is also used by
-/// the embedded Grid gateway, independently of generated Praxis config.
+/// The explicit mTLS endpoint names allowed to receive provider-hop context in
+/// generated consumer Praxis config. The embedded Grid gateway uses its
+/// independent `GatewayRef.providerHopEndpoints` contract.
 #[expect(
     clippy::too_many_lines,
     reason = "this validation keeps the mTLS provider-hop boundary explicit"

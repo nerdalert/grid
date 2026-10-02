@@ -2949,15 +2949,28 @@ fn patch_grid_network_for_serving(
 
 /// Build the run-owned `GatewayRef` with the explicit mTLS provider-hop inventory.
 fn embedded_serving_gateway_ref(endpoints: &[serde_json::Value]) -> serde_json::Value {
+    let provider_hop_endpoints: Vec<_> = endpoints
+        .iter()
+        .map(|endpoint| {
+            serde_json::json!({
+                "cluster": endpoint.get("cluster"),
+                "transport": endpoint.get("transport")
+            })
+        })
+        .collect();
     serde_json::json!({
         "name": GRID_SERVING_GATEWAY,
         "namespace": GRID_SYSTEM_NS,
         "localSiteName": CONSUMER_SITE,
         "supportsEmptyOverlay": true,
+        "providerHopEndpoints": provider_hop_endpoints,
         "consumerConfig": {
             "enabled": false,
             "tlsCertMountPath": "/etc/praxis/tls",
-            "clusterEndpoints": endpoints
+            "clusterEndpoints": [
+                { "cluster": "", "address": "", "transport": null },
+                { "cluster": "", "address": "", "transport": null }
+            ]
         }
     })
 }
@@ -5562,7 +5575,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_gateway_reference_declares_mtls_provider_hops() {
+    fn embedded_gateway_declares_mtls_provider_hops_separately_from_disabled_consumer_config() {
         let endpoints = PROVIDER_RESOURCES
             .iter()
             .map(|(site, resource)| {
@@ -5581,7 +5594,7 @@ mod tests {
             Some(false)
         );
         let rendered_endpoints = gateway
-            .pointer("/consumerConfig/clusterEndpoints")
+            .pointer("/providerHopEndpoints")
             .and_then(serde_json::Value::as_array)
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(rendered_endpoints.len(), PROVIDER_RESOURCES.len());
@@ -5592,6 +5605,12 @@ mod tests {
                     .and_then(serde_json::Value::as_str)
                     .is_some()
         }));
+        assert_eq!(
+            gateway
+                .pointer("/consumerConfig/clusterEndpoints/0/cluster")
+                .and_then(serde_json::Value::as_str),
+            Some("")
+        );
     }
 
     #[test]

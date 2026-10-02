@@ -2484,12 +2484,7 @@ fn render_serving_text(
         .map_or(crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH, |cc| {
             cc.tls_cert_mount_path.as_str()
         });
-    let provider_hop_clusters = gw_ref
-        .consumer_config
-        .as_ref()
-        .map(|config| consumer_config::provider_hop_clusters(&config.cluster_endpoints))
-        .transpose()?
-        .unwrap_or_default();
+    let provider_hop_clusters = serving_provider_hop_clusters(gw_ref)?;
     let inputs = ServingInputs {
         tls_mount,
         local_signals_addr: source.settings.local_signals_addr.as_deref(),
@@ -2498,6 +2493,43 @@ fn render_serving_text(
     };
     let members = source.members.iter().map(|(site, endpoint)| (*site, endpoint.as_str()));
     serving_config::to_text(&serving_config::render(overlay, members, &inputs)).map_err(OperatorError::Json)
+}
+
+/// Resolve embedded-gateway provider hops from their dedicated GatewayRef
+/// contract, not from the optional generated consumer Praxis config.
+fn serving_provider_hop_clusters(gw_ref: &GatewayRef) -> Result<BTreeSet<String>, OperatorError> {
+    let mut clusters = BTreeSet::new();
+    for endpoint in &gw_ref.provider_hop_endpoints {
+        if endpoint.cluster.trim().is_empty() {
+            return Err(OperatorError::InvalidResource(
+                "providerHopEndpoints cluster must not be blank".to_owned(),
+            ));
+        }
+        if !clusters.insert(endpoint.cluster.clone()) {
+            return Err(OperatorError::InvalidResource(format!(
+                "providerHopEndpoints contains duplicate cluster {:?}",
+                endpoint.cluster
+            )));
+        }
+        if endpoint.transport.mode != TransportMode::MutualTls {
+            return Err(OperatorError::InvalidResource(format!(
+                "providerHopEndpoints cluster {:?} must use mutual_tls",
+                endpoint.cluster
+            )));
+        }
+        if endpoint
+            .transport
+            .sni
+            .as_deref()
+            .is_none_or(|sni| sni.trim().is_empty())
+        {
+            return Err(OperatorError::InvalidResource(format!(
+                "providerHopEndpoints cluster {:?} requires a nonblank SNI",
+                endpoint.cluster
+            )));
+        }
+    }
+    Ok(clusters)
 }
 
 /// Apply the serving config `ConfigMap` when changed, returning when to retry a deferred write.
@@ -5991,6 +6023,7 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crd::grid_network::{ClusterEndpointConfig, EndpointTransport, ProviderHopEndpointConfig};
 
     #[test]
     fn a_provider_not_ready_publishes_ready_zero_without_a_fresh_scrape() {
@@ -8746,6 +8779,7 @@ mod tests {
             namespace: ns.to_owned(),
             local_site_name: None,
             supports_empty_overlay: false,
+            provider_hop_endpoints: Vec::new(),
             consumer_config: None,
         }
     }
