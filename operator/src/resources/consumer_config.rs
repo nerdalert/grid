@@ -32,6 +32,9 @@ use crate::{
     resources::routing_overlay::{RoutingCandidate, RoutingOverlay},
 };
 
+/// Path at which a consumer gateway must mount the operator-published overlay.
+pub(crate) const CONSUMER_OVERLAY_FILE: &str = "/etc/praxis/routing/routing-overlay.json";
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -342,6 +345,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
 
     let candidates_yaml = render_candidates(&inference_candidates, &overlay.local_site);
     let selection_policy_yaml = render_selection_policy(overlay.selection_policy.as_ref());
+    let provider_hop_clusters_yaml = render_provider_hop_clusters(cluster_endpoints)?;
     let local_site = yaml_scalar(&overlay.local_site)?;
     let trace_context_filter = if telemetry.is_some() {
         "     - filter: trace_context\n"
@@ -370,14 +374,13 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
          \x20     - filter: intelligent_route\n\
          \x20       local_site: {local_site}\n\
          \x20       model_header: \"X-Model\"\n\
+         {provider_hop_clusters_yaml}\
          {selection_policy_yaml}\
          \x20       candidates:\n\
          {candidates_yaml}"
     );
 
-    if let Some(inject) = credential_inject_section {
-        config.push_str(&inject);
-    }
+    config.push_str(&credential_inject_section);
 
     config.push_str(&load_balancer_section);
 
@@ -792,6 +795,73 @@ fn render_selection_policy(policy: Option<&crate::crd::grid_network::SelectionPo
     format!("        selection_policy:\n          mode: {mode}\n")
 }
 
+/// Render provider-hop context-header configuration for mTLS endpoints.
+///
+/// `clusterEndpoints` describes consumer-to-provider-gateway endpoints. An
+/// explicit mTLS transport identifies the authenticated provider-gateway hop;
+/// those cluster names need the routing-context headers consumed by the
+/// provider's `provider_route` filter. Plaintext endpoints remain direct/local
+/// backends and do not receive provider-hop headers.
+fn render_provider_hop_clusters(cluster_endpoints: &[ClusterEndpointConfig]) -> Result<String, ConsumerConfigError> {
+    let clusters = provider_hop_clusters(cluster_endpoints)?;
+    if clusters.is_empty() {
+        return Ok(String::new());
+    }
+    let values = clusters
+        .into_iter()
+        .map(|cluster| yaml_scalar(&cluster).unwrap_or_else(|_| "\"\"".to_owned()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!("        provider_hop_clusters: [{values}]\n"))
+}
+
+/// The explicit mTLS endpoint names allowed to receive provider-hop context.
+/// Validate the endpoint identities here because this allowlist is also used by
+/// the embedded Grid gateway, independently of generated Praxis config.
+#[expect(
+    clippy::too_many_lines,
+    reason = "this validation keeps the mTLS provider-hop boundary explicit"
+)]
+pub(crate) fn provider_hop_clusters(
+    cluster_endpoints: &[ClusterEndpointConfig],
+) -> Result<BTreeSet<String>, ConsumerConfigError> {
+    let mut seen = BTreeSet::new();
+    let mut hops = BTreeSet::new();
+    for endpoint in cluster_endpoints {
+        if endpoint.cluster.trim().is_empty() {
+            return Err(ConsumerConfigError::BlankCluster {
+                kind: "cluster_endpoint".to_owned(),
+                name: endpoint.cluster.clone(),
+            });
+        }
+        if !seen.insert(endpoint.cluster.as_str()) {
+            return Err(ConsumerConfigError::DuplicateClusterEndpoint {
+                cluster: endpoint.cluster.clone(),
+            });
+        }
+        match endpoint.transport.as_ref() {
+            Some(transport) if transport.mode == TransportMode::MutualTls => {
+                if transport.sni.as_deref().is_none_or(|sni| sni.trim().is_empty()) {
+                    return Err(ConsumerConfigError::MissingSni {
+                        cluster: endpoint.cluster.clone(),
+                    });
+                }
+                hops.insert(endpoint.cluster.clone());
+            },
+            Some(transport)
+                if transport.mode == TransportMode::Plaintext
+                    && transport.sni.as_deref().is_some_and(|sni| !sni.trim().is_empty()) =>
+            {
+                return Err(ConsumerConfigError::PlaintextWithSni {
+                    cluster: endpoint.cluster.clone(),
+                });
+            },
+            Some(_) | None => {},
+        }
+    }
+    Ok(hops)
+}
+
 /// Render one `intelligent_route` candidate.
 #[expect(
     clippy::too_many_lines,
@@ -859,11 +929,10 @@ fn render_credential_reference(cred: &crate::resources::routing_overlay::Project
     ]
 }
 
-/// Render the `credential_inject` filter section.
-///
-/// Returns `None` when no credential-bearing candidates exist.
-/// Each unique `(strategy, name, namespace, key)` tuple produces one entry.
-/// Entries use `file:` sources; no `value:` is ever emitted.
+/// Render `credential_inject` for current credential-bearing candidates, or
+/// unconditionally in explicit projected-credential mode. The latter keeps a
+/// filter present at empty-overlay startup so a later credential-bearing
+/// revision cannot bypass injection. Missing projected files fail closed.
 #[expect(
     clippy::too_many_lines,
     reason = "BTreeMap collection + format strings for each credential field"
@@ -910,17 +979,31 @@ fn render_credential_inject(
         entries.insert(map_key, entry);
     }
 
-    if entries.is_empty() {
-        return None;
+    if entries.is_empty() && !enable_projected_credentials {
+        return String::new();
     }
-
-    Some(format!(
+    let credentials = if entries.is_empty() {
+        "        credentials: []\n".to_owned()
+    } else {
+        format!(
+            "        credentials:\n{}\n",
+            entries.into_values().collect::<Vec<_>>().join("\n")
+        )
+    };
+    let projected_base = if enable_projected_credentials {
+        format!(
+            "        projected_credential_mount_base: {}\n",
+            yaml_scalar(credential_mount_base).unwrap_or_else(|_| "\"\"".to_owned())
+        )
+    } else {
+        String::new()
+    };
+    format!(
         "\n\
          \x20     - filter: credential_inject\n\
-         \x20       credentials:\n\
-         {}",
-        entries.into_values().collect::<Vec<_>>().join("\n")
-    ))
+         {credentials}\
+         {projected_base}"
+    )
 }
 
 /// Render the `load_balancer` filter section.
@@ -1554,6 +1637,215 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts the generated filter chain and complete restoration endpoint inventory"
+    )]
+    fn production_consumer_config_uses_scoped_reloadable_overlay_and_complete_endpoint_inventory() {
+        let overlay = simple_overlay(vec![credential_candidate(
+            "inference_model",
+            "model-a",
+            "site-a",
+            "provider-a",
+            "provider-a-secret",
+            "grid-system",
+            "token",
+        )]);
+        let mut endpoints = endpoint_coverage(&overlay);
+        endpoints[0].transport = Some(EndpointTransport {
+            mode: TransportMode::MutualTls,
+            sni: Some("provider-a.grid.internal".to_owned()),
+        });
+        endpoints.push(ClusterEndpointConfig {
+            cluster: "provider-b".to_owned(),
+            address: "127.0.0.1:30002".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: None,
+            }),
+        });
+
+        let yaml = generate_consumer_praxis_config_for_gateway(
+            &overlay,
+            MOUNT_BASE,
+            &endpoints,
+            "/etc/praxis/tls",
+            8080,
+            "consumer-gateway",
+            "consumer-ns",
+            false,
+        )
+        .expect("dynamic consumer config renders");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let filters = config["filter_chains"][0]["filters"].as_sequence().expect("filters");
+        let route = filters
+            .iter()
+            .find(|filter| filter["filter"] == "intelligent_route")
+            .expect("route filter");
+        assert_eq!(route["overlay_file"], CONSUMER_OVERLAY_FILE);
+        assert_eq!(route["expected_overlay_scope"]["network"], "test-net");
+        assert_eq!(route["expected_overlay_scope"]["gateway"], "consumer-gateway");
+        assert_eq!(route["expected_overlay_scope"]["namespace"], "consumer-ns");
+        assert_eq!(route["expected_overlay_scope"]["local_site"], "site-a");
+        assert_eq!(route["reload"]["enabled"], true);
+        assert_eq!(route["provider_hop_clusters"][0], "provider-a");
+        assert!(route.get("candidates").is_none(), "candidate state is overlay-owned");
+        assert!(
+            route.get("selection_policy").is_none(),
+            "selection mode is overlay-owned"
+        );
+
+        let load_balancer = filters
+            .iter()
+            .find(|filter| filter["filter"] == "load_balancer")
+            .expect("load balancer");
+        let clusters = load_balancer["clusters"].as_sequence().expect("clusters");
+        assert_eq!(clusters.len(), 2, "inactive endpoint remains available for restoration");
+        assert!(clusters.iter().any(|cluster| cluster["name"] == "provider-b"));
+        assert!(
+            filters.iter().any(|filter| filter["filter"] == "credential_inject"),
+            "the active overlay credential remains configured"
+        );
+        assert!(!yaml.contains(SENTINEL_TOKEN));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks the cold-start empty overlay contract with a configured endpoint"
+    )]
+    fn empty_uncredentialed_consumer_config_does_not_require_new_praxis_filter() {
+        let overlay = simple_overlay(Vec::new());
+        let endpoints = [ClusterEndpointConfig {
+            cluster: "provider-a".to_owned(),
+            address: "127.0.0.1:30001".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: None,
+            }),
+        }];
+        let yaml = generate_consumer_praxis_config_for_gateway(
+            &overlay,
+            MOUNT_BASE,
+            &endpoints,
+            "/etc/praxis/tls",
+            8080,
+            "consumer-gateway",
+            "consumer-ns",
+            false,
+        )
+        .expect("valid empty overlay config");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let filters = config["filter_chains"][0]["filters"].as_sequence().expect("filters");
+        let route = filters
+            .iter()
+            .find(|filter| filter["filter"] == "intelligent_route")
+            .expect("route filter");
+        assert!(route.get("candidates").is_none());
+        assert_eq!(route["overlay_file"], CONSUMER_OVERLAY_FILE);
+        assert!(
+            filters.iter().all(|filter| filter["filter"] != "credential_inject"),
+            "old consumer images remain compatible when projected credentials are not opted in"
+        );
+        assert_eq!(
+            filters
+                .iter()
+                .filter(|filter| filter["filter"] == "load_balancer")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn projected_credential_opt_in_keeps_inject_filter_for_empty_startup_overlay() {
+        let overlay = simple_overlay(Vec::new());
+        let endpoints = [ClusterEndpointConfig {
+            cluster: "provider-a".to_owned(),
+            address: "127.0.0.1:30001".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: None,
+            }),
+        }];
+        let yaml = generate_consumer_praxis_config_for_gateway(
+            &overlay,
+            MOUNT_BASE,
+            &endpoints,
+            "/etc/praxis/tls",
+            8080,
+            "consumer-gateway",
+            "consumer-ns",
+            true,
+        )
+        .expect("compatible consumer config renders");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let filters = config["filter_chains"][0]["filters"].as_sequence().expect("filters");
+        let inject = filters
+            .iter()
+            .find(|filter| filter["filter"] == "credential_inject")
+            .expect("projected credential capability installs filter at cold start");
+        assert_eq!(inject["credentials"], serde_yaml::Value::Sequence(Vec::new()));
+        assert_eq!(inject["projected_credential_mount_base"], MOUNT_BASE);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks that projected credential references stay dynamic in rendered YAML"
+    )]
+    fn projected_credential_mode_keeps_reference_dynamic_for_credential_route() {
+        let overlay = simple_overlay(vec![credential_candidate(
+            "inference_model",
+            "model-with-secret",
+            "site-a",
+            "provider-a",
+            "provider-secret",
+            "consumer-ns",
+            "token",
+        )]);
+        let yaml = generate_consumer_praxis_config_for_gateway(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+            "consumer-gateway",
+            "consumer-ns",
+            true,
+        )
+        .expect("projected consumer config renders");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let filters = config["filter_chains"][0]["filters"].as_sequence().expect("filters");
+        let inject = filters
+            .iter()
+            .find(|filter| filter["filter"] == "credential_inject")
+            .expect("dynamic filter is present");
+        assert_eq!(inject["credentials"], serde_yaml::Value::Sequence(Vec::new()));
+        assert_eq!(inject["projected_credential_mount_base"], MOUNT_BASE);
+        assert!(
+            !yaml.contains("provider-secret"),
+            "reference identity remains only in the dynamic overlay"
+        );
+    }
+
+    #[test]
+    fn dynamic_consumer_config_requires_endpoint_inventory() {
+        let overlay = simple_overlay(Vec::new());
+        let error = generate_consumer_praxis_config_for_gateway(
+            &overlay,
+            MOUNT_BASE,
+            &[],
+            "/etc/praxis/tls",
+            8080,
+            "consumer-gateway",
+            "consumer-ns",
+            false,
+        )
+        .expect_err("restoration needs at least one configured endpoint");
+        assert!(matches!(error, ConsumerConfigError::NoClusterEndpoints));
+    }
+
     fn selection_policy_mode(config: &str) -> Option<String> {
         let parsed: serde_yaml::Value = serde_yaml::from_str(config).ok()?;
         parsed
@@ -1901,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn no_credential_candidates_produces_no_credential_inject() {
+    fn uncredentialed_static_config_does_not_emit_unneeded_inject_filter() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
             "model-x",
@@ -1917,10 +2209,11 @@ mod tests {
             8080,
         )
         .unwrap();
-        assert!(
-            !yaml.contains("credential_inject"),
-            "no credential candidates must produce no credential_inject"
-        );
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated Praxis YAML parses");
+        let filters = config["filter_chains"][0]["filters"]
+            .as_sequence()
+            .expect("filter chain");
+        assert!(filters.iter().all(|filter| filter["filter"] != "credential_inject"));
     }
 
     #[test]
@@ -2538,6 +2831,64 @@ mod tests {
             "key path must appear"
         );
         assert!(yaml.contains("verify: true"), "verify flag must appear");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let route = config["filter_chains"][0]["filters"]
+            .as_sequence()
+            .expect("filters")
+            .iter()
+            .find(|filter| filter["filter"] == "intelligent_route")
+            .expect("intelligent route");
+        assert_eq!(route["provider_hop_clusters"][0], "site-a");
+    }
+
+    #[test]
+    fn provider_hop_clusters_include_only_explicit_mtls_endpoints() {
+        let overlay = simple_overlay(vec![
+            plain_candidate("inference_model", "model-a", "site-a", "remote-a", true),
+            plain_candidate("inference_model", "model-b", "site-b", "local-b", true),
+        ]);
+        let endpoints = [
+            mtls_ep("remote-a", "provider-a.example:8443", "provider-a.example"),
+            plain_ep("local-b", "local-backend.default.svc:8080"),
+        ];
+        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+            .expect("mixed-transport consumer config renders");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let route = config["filter_chains"][0]["filters"]
+            .as_sequence()
+            .expect("filters")
+            .iter()
+            .find(|filter| filter["filter"] == "intelligent_route")
+            .expect("intelligent route");
+        assert_eq!(route["provider_hop_clusters"].as_sequence().expect("hop list").len(), 1);
+        assert_eq!(route["provider_hop_clusters"][0], "remote-a");
+    }
+
+    #[test]
+    fn plaintext_only_consumer_has_no_provider_hop_cluster_list() {
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "model-a",
+            "site-a",
+            "local-a",
+            true,
+        )]);
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &[plain_ep("local-a", "backend.default.svc:8080")],
+            "/etc/praxis/tls",
+            8080,
+        )
+        .expect("plaintext consumer config renders");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let route = config["filter_chains"][0]["filters"]
+            .as_sequence()
+            .expect("filters")
+            .iter()
+            .find(|filter| filter["filter"] == "intelligent_route")
+            .expect("intelligent route");
+        assert!(route.get("provider_hop_clusters").is_none());
     }
 
     #[test]

@@ -170,7 +170,9 @@ spec:
                           entry per unique inference cluster. Other capability kinds remain in the
                           routing overlay for dedicated data-plane pipelines.
 
-                          The generated `ConfigMap` contains no token bytes.
+                          The generated `ConfigMap` contains no token bytes. Credential-bearing
+                          overlays are withheld until the consumer has explicitly declared that its
+                          compatible filter config is already running.
                         nullable: true
                         properties:
                           clusterEndpoints:
@@ -282,11 +284,23 @@ spec:
                             description: |-
                               Base directory for mounted credential Secret files inside the consumer pod.
 
-                              Each credential Secret is expected to be mounted at
-                              `{credentialMountBase}/{secret-name}/{secret-key}`.
+                              In projected-credential mode, mount each Secret at
+                              `{credentialMountBase}/{secret-namespace}/{secret-name}` with its data
+                              keys as files. Static `file:` entries continue to use their explicit
+                              paths and are not constrained by this directory layout.
 
                               Default: `/run/secrets/grid-credentials`.
                             type: string
+                          enableProjectedCredentials:
+                            default: false
+                            description: |-
+                              Generate the dynamic `credential_inject` filter and projected mount
+                              root, including when the current overlay has no credentials. Enable this
+                              first, then roll out the generated config before asserting readiness
+                              with `supportsProjectedCredentials`.
+
+                              Default: `false`.
+                            type: boolean
                           enabled:
                             default: false
                             description: |-
@@ -427,6 +441,15 @@ spec:
                       namespace:
                         description: Gateway namespace.
                         type: string
+                      supportsEmptyOverlay:
+                        default: false
+                        description: |-
+                          Explicitly attest that every consumer of this gateway's routing overlay
+                          accepts a valid versioned snapshot with `candidates: []` as a no-route
+                          decision. Defaults to `false` for compatibility with released Praxis
+                          images that reject empty candidate lists. The operator retains the last
+                          distributed revision until this is enabled.
+                        type: boolean
                     required:
                       - name
                       - namespace

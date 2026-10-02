@@ -92,6 +92,23 @@ impl RouteSnapshot {
         local_site: Arc<str>,
         inputs: &mut Inputs<'_, S>,
     ) -> Self {
+        Self::from_store_with_provider_hops(candidates, local_site, store, now_ms, window_ms, BTreeSet::new())
+    }
+
+    /// Order candidates by load and keep the provider-hop allowlist in the same
+    /// immutable snapshot so route and trust decisions change atomically.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the immutable snapshot constructor takes all independent routing inputs explicitly"
+    )]
+    pub fn from_store_with_provider_hops(
+        candidates: Vec<RouteCandidate>,
+        local_site: Arc<str>,
+        store: &LoadStore,
+        now_ms: i64,
+        window_ms: i64,
+        provider_hop_clusters: BTreeSet<String>,
+    ) -> Self {
         // Score each candidate once, then sort the pairs: load_of allocates a
         // store key and scans a window, too costly to repeat inside sort_by.
         let ranked = candidates
@@ -509,6 +526,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: name.to_owned(),
             site: site.to_owned(),
+            stable_id: None,
         }
     }
 

@@ -40,7 +40,7 @@ use crate::{
             OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteIdentityStatus, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
-        inference_provider::InferenceProvider,
+        inference_provider::{InferenceProvider, InferenceProviderStatus},
     },
     error::OperatorError,
     readiness,
@@ -2354,9 +2354,6 @@ async fn reconcile_routing_overlay_inner(
             }
         }
 
-        // Opt-in: generate and apply the consumer Praxis config when enabled.
-        // Render/apply errors are recorded as per-gateway status and do NOT
-        // abort the reconcile loop — other gateways continue to be processed.
         // Gateways with consumerConfig.enabled=false get a Disabled entry.
         // Gateways without a consumerConfig block are omitted from status.
         if !delegated_mount_reconciled && let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
@@ -2487,6 +2484,12 @@ fn render_serving_text(
         .map_or(crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH, |cc| {
             cc.tls_cert_mount_path.as_str()
         });
+    let provider_hop_clusters = gw_ref
+        .consumer_config
+        .as_ref()
+        .map(|config| consumer_config::provider_hop_clusters(&config.cluster_endpoints))
+        .transpose()?
+        .unwrap_or_default();
     let inputs = ServingInputs {
         tls_mount,
         local_signals_addr: source.settings.local_signals_addr.as_deref(),
@@ -2517,7 +2520,12 @@ async fn apply_serving_config(
         .map(String::as_str);
     let key = format!("{}/{name}", gw_ref.namespace);
     let now = Instant::now();
-    match serving_config::decide_write(stored, &text, source.gate.last(&key), now) {
+    let decision = if overlay.candidates.is_empty() {
+        serving_config::decide_empty_withdrawal(stored, &text)
+    } else {
+        serving_config::decide_write(stored, &text, source.gate.last(&key), now)
+    };
+    match decision {
         WriteDecision::Unchanged => return Ok(None),
         WriteDecision::Deferred(wait) => return Ok(Some(wait)),
         WriteDecision::Write => {},
@@ -4298,11 +4306,19 @@ fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&Mem
 /// All variants are preserved so remote sites know about unavailable providers
 /// and can avoid routing to them.  Absent status (not yet reconciled) maps to
 /// `Pending`.
-fn crdt_phase_from_provider(
-    status_phase: Option<&crate::crd::inference_provider::ProviderPhase>,
-) -> crdt::ProviderPhase {
+fn crdt_phase_from_provider(status: Option<&InferenceProviderStatus>, generation: i64) -> crdt::ProviderPhase {
     use crate::crd::inference_provider::ProviderPhase as Op;
-    match status_phase {
+    if status.is_some_and(|status| {
+        status.phase == Op::Pending
+            && status.reason.as_deref() == Some("NoMatchingSites")
+            && status.observed_generation == generation
+    }) {
+        // The provider controller has observed this generation and confirmed
+        // that its selector matches no known site. Preserve that withdrawal in
+        // the CRDT instead of publishing Pending as routable capacity.
+        return crdt::ProviderPhase::Unavailable;
+    }
+    match status.map(|status| &status.phase) {
         Some(Op::Available) => crdt::ProviderPhase::Available,
         Some(Op::Degraded) => crdt::ProviderPhase::Degraded,
         Some(Op::Unavailable) => crdt::ProviderPhase::Unavailable,
@@ -4375,6 +4391,10 @@ fn log_capacity_changes(logged: &ChangeLog, network: &str, providers: &[Inferenc
 /// advances on spec and status writes, and falls back to `metadata.generation`
 /// when no parseable resource version is present.  Equal revisions break ties
 /// via `writer_id`, which is the advertising SWIM site identity.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the provider-to-CRDT mapping keeps every advertised field derived from one source object"
+)]
 fn provider_state_from_kube(
     provider: &InferenceProvider,
     network_id: &str,
@@ -6867,28 +6887,60 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "this table proves current and stale withdrawal behavior for every provider phase"
+    )]
     fn crdt_phase_from_provider_maps_all_variants() {
-        use crate::crd::inference_provider::ProviderPhase as Op;
-
         assert_eq!(
-            crdt_phase_from_provider(None),
+            crdt_phase_from_provider(None, 1),
             crdt::ProviderPhase::Pending,
             "absent status → Pending"
         );
+        let pending: InferenceProviderStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Pending", "observedGeneration": 3
+        }))
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            crdt_phase_from_provider(Some(&Op::Pending)),
+            crdt_phase_from_provider(Some(&pending), 3),
             crdt::ProviderPhase::Pending
         );
+        let withdrawn: InferenceProviderStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Pending", "reason": "NoMatchingSites", "matchingSites": [], "observedGeneration": 3
+        }))
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            crdt_phase_from_provider(Some(&Op::Available)),
+            crdt_phase_from_provider(Some(&withdrawn), 3),
+            crdt::ProviderPhase::Unavailable,
+            "current-generation selector withdrawal must not be advertised as routable capacity"
+        );
+        assert_eq!(
+            crdt_phase_from_provider(Some(&withdrawn), 4),
+            crdt::ProviderPhase::Pending,
+            "stale withdrawal status must not withdraw a newer provider generation"
+        );
+        let available: InferenceProviderStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Available", "observedGeneration": 3
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            crdt_phase_from_provider(Some(&available), 3),
             crdt::ProviderPhase::Available
         );
+        let degraded: InferenceProviderStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Degraded", "observedGeneration": 3
+        }))
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            crdt_phase_from_provider(Some(&Op::Degraded)),
+            crdt_phase_from_provider(Some(&degraded), 3),
             crdt::ProviderPhase::Degraded
         );
+        let unavailable: InferenceProviderStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Unavailable", "observedGeneration": 3
+        }))
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            crdt_phase_from_provider(Some(&Op::Unavailable)),
+            crdt_phase_from_provider(Some(&unavailable), 3),
             crdt::ProviderPhase::Unavailable
         );
     }
@@ -8693,6 +8745,7 @@ mod tests {
             name: name.to_owned(),
             namespace: ns.to_owned(),
             local_site_name: None,
+            supports_empty_overlay: false,
             consumer_config: None,
         }
     }
@@ -8819,7 +8872,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_overlay_status_preserves_last_distributed_revision() {
+    fn failed_overlay_status_preserves_last_distributed_revision() {
         let gw = make_gw_ref("gw", "grid-system");
         let prior = rendered_overlay_status(&gw);
         let mut network = base_network();
@@ -8828,7 +8881,7 @@ mod tests {
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 5, None, "EmptyCandidates", "no candidates available");
+        let status = retained_overlay_status(&network, &gw, 5, None, "OverlayApplyFailed", "overlay apply failed");
 
         assert_eq!(status.phase, OverlayPhase::Retained);
         assert_eq!(status.rendered_revision, prior.rendered_revision);
@@ -8837,7 +8890,7 @@ mod tests {
         assert_eq!(status.config_map_resource_version, prior.config_map_resource_version);
         assert_eq!(status.candidate_count, prior.candidate_count);
         assert_eq!(status.rendered_at, prior.rendered_at);
-        assert_eq!(status.reason, "EmptyCandidates");
+        assert_eq!(status.reason, "OverlayApplyFailed");
         assert!(status.message.contains("previous valid overlay retained"));
         assert_eq!(status.observed_generation, 5);
     }
@@ -8890,12 +8943,12 @@ mod tests {
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 2, None, "EmptyCandidates", "no candidates available");
+        let status = retained_overlay_status(&network, &gw, 2, None, "OverlayRenderFailed", "overlay render failed");
 
         assert_eq!(status.phase, OverlayPhase::Error);
         assert!(status.rendered_revision.is_empty());
         assert!(status.distributed_revision.is_empty());
-        assert_eq!(status.reason, "EmptyCandidates");
+        assert_eq!(status.reason, "OverlayRenderFailed");
     }
 
     // -----------------------------------------------------------------------
@@ -8941,41 +8994,6 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_empty_candidates_overlay_writes_no_status() {
-        let gw = make_gw_ref("gw", "grid-system");
-        let mut network = network_with_overlay(rendered_overlay_status(&gw));
-        let first_render = make_render_result(&"c".repeat(64), 0);
-        let first = retained_overlay_status(&network, &gw, 4, Some(&first_render), EMPTY_CANDIDATES, "no candidates");
-        let first = desired_with_overlay(&network, first);
-        network.status = Some(first.clone());
-        let mut next_render = make_render_result(&"c".repeat(64), 0);
-        FRESH.clone_into(&mut next_render.rendered_at);
-
-        let next = retained_overlay_status(&network, &gw, 4, Some(&next_render), EMPTY_CANDIDATES, "no candidates");
-        let desired = desired_with_overlay(&network, next);
-
-        assert_eq!(only_overlay(&desired).rendered_at, only_overlay(&first).rendered_at);
-        assert!(!grid_network_status_needs_update(network.status.as_ref(), &desired));
-    }
-
-    #[test]
-    fn unchanged_overlay_without_prior_distribution_writes_no_status() {
-        let gw = make_gw_ref("gw", "grid-system");
-        let mut network = base_network();
-        let first_render = make_render_result(&"c".repeat(64), 0);
-        let first = retained_overlay_status(&network, &gw, 1, Some(&first_render), EMPTY_CANDIDATES, "no candidates");
-        network.status = Some(desired_with_overlay(&network, first));
-        let mut next_render = make_render_result(&"c".repeat(64), 0);
-        FRESH.clone_into(&mut next_render.rendered_at);
-
-        let next = retained_overlay_status(&network, &gw, 1, Some(&next_render), EMPTY_CANDIDATES, "no candidates");
-        let desired = desired_with_overlay(&network, next);
-
-        assert_eq!(only_overlay(&desired).phase, OverlayPhase::Error);
-        assert!(!grid_network_status_needs_update(network.status.as_ref(), &desired));
-    }
-
-    #[test]
     fn content_change_advances_rendered_at() {
         let gw = make_gw_ref("gw", "grid-system");
         let prior = rendered_overlay_status(&gw);
@@ -8993,9 +9011,9 @@ mod tests {
             ..prior.clone()
         };
         let new_reason = OverlayRevisionStatus {
-            phase: OverlayPhase::Retained,
-            reason: EMPTY_CANDIDATES.to_owned(),
-            message: "no candidates".to_owned(),
+            phase: OverlayPhase::Error,
+            reason: "OverlayApplyFailed".to_owned(),
+            message: "apply failed".to_owned(),
             rendered_at: FRESH.to_owned(),
             ..prior
         };
@@ -9134,25 +9152,6 @@ mod tests {
         assert!(status.distributed_revision.is_empty(), "no prior distribution exists");
         assert!(status.config_map_resource_version.is_empty());
         assert_eq!(status.phase, OverlayPhase::Error);
-    }
-
-    #[test]
-    fn retained_status_empty_candidates_retains_prior_distribution() {
-        let gw = make_gw_ref("gw", "grid-system");
-        let prior = rendered_overlay_status(&gw);
-        let mut network = base_network();
-        network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior.clone()],
-            ..GridNetworkStatus::default()
-        });
-        let render = make_render_result(&"c".repeat(64), 0);
-
-        let status = retained_overlay_status(&network, &gw, 6, Some(&render), "EmptyCandidates", "no candidates");
-
-        assert_eq!(status.rendered_revision, "c".repeat(64));
-        assert_eq!(status.distributed_revision, prior.distributed_revision);
-        assert_eq!(status.candidate_count, 0);
-        assert_eq!(status.phase, OverlayPhase::Retained);
     }
 
     #[test]
@@ -9793,6 +9792,16 @@ mod tests {
             status.message.contains("site-c"),
             "missing sni message must identify the cluster"
         );
+    }
+
+    #[test]
+    fn consumer_config_status_projected_credentials_reason_is_specific() {
+        let gw = make_gw_ref("gw", "ns");
+        let cc = make_consumer_config("cm");
+        let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported);
+        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        assert_eq!(status.reason, "ProjectedCredentialsUnsupported");
+        assert!(status.message.contains("supportsProjectedCredentials=true"));
     }
 
     #[test]

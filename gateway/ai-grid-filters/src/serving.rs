@@ -60,6 +60,10 @@ pub struct GridServingConfig {
     /// The candidate topology: which sites serve which capabilities.
     pub candidates: Vec<CandidateConfig>,
 
+    /// Clusters allowed to carry authenticated provider-gateway hops.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_hop_clusters: Vec<String>,
+
     /// Peers to poll for live load.
     pub peers: Vec<PeerServingConfig>,
 }

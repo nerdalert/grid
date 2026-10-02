@@ -1,7 +1,7 @@
 //! Applies a grid serving config: the candidate topology and the peer pollers.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock, PoisonError, Weak,
@@ -93,6 +93,9 @@ pub(crate) struct Topology {
 
     /// Freshness window the order reads, milliseconds.
     load_window_ms: i64,
+
+    /// Explicitly authenticated provider-gateway hop clusters.
+    provider_hop_clusters: BTreeSet<String>,
 }
 
 impl Topology {
@@ -104,6 +107,7 @@ impl Topology {
             base: Arc::from(base),
             local_site: Arc::from(config.local_site.as_str()),
             load_window_ms: config.load_window_ms,
+            provider_hop_clusters: validate_provider_hop_clusters(config.provider_hop_clusters.clone())?,
         })
     }
 
@@ -464,6 +468,15 @@ fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> 
     validate_local_site(&config.local_site)?;
     validate_candidates(config.candidates.clone())?;
     let topology = Topology::from_config(config)?;
+    for candidate in &config.candidates {
+        if topology.provider_hop_clusters.contains(&candidate.cluster) && candidate.stable_id.is_none() {
+            return Err(format!(
+                "grid: candidate '{}' on provider-hop cluster '{}' is missing stable_id",
+                candidate.name, candidate.cluster
+            )
+            .into());
+        }
+    }
     let mut sites = std::collections::HashSet::with_capacity(config.peers.len());
     for peer in &config.peers {
         validate_peer(peer)?;
@@ -815,6 +828,7 @@ mod tests {
             window_secs: 60,
             load_window_ms: 30_000,
             candidates: sites.iter().map(|site| candidate(site)).collect(),
+            provider_hop_clusters: Vec::new(),
             peers: sites.iter().map(|site| peer(site)).collect(),
         }
     }

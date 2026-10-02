@@ -42,6 +42,13 @@ use crate::{
     snapshot::RouteSnapshot,
 };
 
+/// Internal request header carrying the selected candidate's stable ID.
+const SELECTED_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
+/// Internal request header carrying the provider-hop request correlation ID.
+const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
+/// Internal request header carrying the serving overlay revision.
+const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
+
 /// Default request header carrying the model name.
 fn default_model_header() -> String {
     "X-Model".to_owned()
@@ -1111,6 +1118,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: model.to_owned(),
             site: site.to_owned(),
+            stable_id: None,
         }])
         .unwrap();
         candidates[0].admission_state = admission;

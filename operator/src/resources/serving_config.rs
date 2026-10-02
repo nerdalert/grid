@@ -73,6 +73,9 @@ pub(crate) struct ServingConfig {
     pub(crate) load_window_ms: i64,
     /// Local site first, then by site, name, cluster.
     pub(crate) candidates: Vec<ServingCandidate>,
+    /// Explicit mTLS provider gateways authorized to receive hop context.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) provider_hop_clusters: Vec<String>,
     /// Sorted by site.
     pub(crate) peers: Vec<ServingPeer>,
 }
@@ -161,7 +164,6 @@ where
     let sites: BTreeSet<&str> = candidates.iter().map(|candidate| candidate.site.as_str()).collect();
     let mut addrs = remote_addrs(members, &sites, &overlay.local_site);
     if let Some(addr) = inputs.local_signals_addr
-        && sites.contains(overlay.local_site.as_str())
         && certs::validate_site_name(&overlay.local_site).is_ok()
     {
         addrs.insert(overlay.local_site.clone(), addr.to_owned());
@@ -178,6 +180,7 @@ where
         window_secs: WINDOW_SECS,
         load_window_ms: load_window_ms(inputs.scrape_interval),
         candidates,
+        provider_hop_clusters: inputs.provider_hop_clusters.iter().cloned().collect(),
         peers,
     }
 }
@@ -418,6 +421,15 @@ pub(crate) fn decide_write(
     }
 }
 
+/// Withdrawals are safety-critical: do not let the ordinary write interval
+/// leave an older serving route active after Grid has computed no candidates.
+pub(crate) fn decide_empty_withdrawal(existing: Option<&str>, desired: &str) -> WriteDecision {
+    match existing {
+        Some(stored) if stored == desired => WriteDecision::Unchanged,
+        _ => WriteDecision::Write,
+    }
+}
+
 /// Last write time per `namespace/name`, for [`decide_write`].
 #[derive(Debug, Default)]
 pub(crate) struct WriteGate {
@@ -452,6 +464,8 @@ mod tests {
 
     /// No pins, as under SPIFFE trust.
     static NO_PINS: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    /// No authenticated provider gateway in this fixture.
+    static NO_PROVIDER_HOPS: BTreeSet<String> = BTreeSet::new();
 
     const INPUTS: ServingInputs<'static> = ServingInputs {
         tls_mount: "/etc/praxis/tls",
@@ -662,6 +676,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "table-driven test covers both irrelevant and unsafe peer addresses"
+    )]
     fn unsafe_or_irrelevant_peers_are_refused() {
         let cases = [
             ("loopback", "127.0.0.1:9091"),
@@ -718,6 +736,41 @@ mod tests {
                 ("site-f", "[fd00::5]:9091"),
             ],
         );
+    }
+
+    #[test]
+    fn empty_candidate_revision_keeps_peer_pollers_for_restoration() {
+        let inputs = ServingInputs {
+            local_signals_addr: Some("grid-operator-signals.grid.svc:9091"),
+            ..INPUTS
+        };
+        let empty = render(&overlay(Vec::new()), [("site-b", "203.0.113.7:9091")], &inputs);
+        assert!(empty.candidates.is_empty());
+        assert_eq!(
+            peer_sites(&empty),
+            [
+                ("site-a", "grid-operator-signals.grid.svc:9091"),
+                ("site-b", "203.0.113.7:9091"),
+            ],
+            "no-route config retains metrics connections for route restoration"
+        );
+    }
+
+    #[test]
+    fn authenticated_gateway_candidates_carry_overlay_id_and_mtls_allowlist() {
+        let mut candidate = cand("llama", "site-b", "provider-b", None);
+        candidate.stable_id = Some("257a9450".to_owned());
+        let hops = BTreeSet::from(["provider-b".to_owned()]);
+        let inputs = ServingInputs {
+            provider_hop_clusters: &hops,
+            ..INPUTS
+        };
+        let config = render(&overlay(vec![candidate]), [], &inputs);
+        assert_eq!(config.provider_hop_clusters, ["provider-b"]);
+        assert_eq!(config.candidates[0].stable_id.as_deref(), Some("257a9450"));
+        let json = to_text(&config).expect("JSON");
+        assert!(json.contains("\"provider_hop_clusters\": [\n    \"provider-b\""));
+        assert!(json.contains("\"stable_id\": \"257a9450\""));
     }
 
     #[test]
@@ -896,6 +949,19 @@ mod tests {
         for (label, existing, last, want) in cases {
             assert_eq!(decide_write(existing, "a", last, now), want, "{label}");
         }
+    }
+
+    #[test]
+    fn empty_withdrawal_bypasses_write_spacing_but_not_content_equality() {
+        assert_eq!(
+            decide_empty_withdrawal(Some("empty"), "empty"),
+            WriteDecision::Unchanged
+        );
+        assert_eq!(
+            decide_empty_withdrawal(Some("old-route"), "empty"),
+            WriteDecision::Write
+        );
+        assert_eq!(decide_empty_withdrawal(None, "empty"), WriteDecision::Write);
     }
 
     #[test]

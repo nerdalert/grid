@@ -746,6 +746,14 @@ pub struct GatewayRef {
     #[serde(default)]
     pub local_site_name: Option<String>,
 
+    /// Explicitly attest that every consumer of this gateway's routing overlay
+    /// accepts a valid versioned snapshot with `candidates: []` as a no-route
+    /// decision. Defaults to `false` for compatibility with released Praxis
+    /// images that reject empty candidate lists. The operator retains the last
+    /// distributed revision until this is enabled.
+    #[serde(default)]
+    pub supports_empty_overlay: bool,
+
     /// Opt-in configuration for operator-managed consumer Praxis config generation.
     ///
     /// When absent or `enabled: false`, this gateway behaves exactly as before —
@@ -757,7 +765,9 @@ pub struct GatewayRef {
     /// entry per unique inference cluster. Other capability kinds remain in the
     /// routing overlay for dedicated data-plane pipelines.
     ///
-    /// The generated `ConfigMap` contains no token bytes.
+    /// The generated `ConfigMap` contains no token bytes. Credential-bearing
+    /// overlays are withheld until the consumer has explicitly declared that its
+    /// compatible filter config is already running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumer_config: Option<ConsumerConfig>,
 }
@@ -790,10 +800,32 @@ pub struct ConsumerConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Generate the dynamic `credential_inject` filter and projected mount
+    /// root, including when the current overlay has no credentials. Enable this
+    /// first, then roll out the generated config before asserting readiness
+    /// with `supportsProjectedCredentials`.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub enable_projected_credentials: bool,
+
+    /// Declare that the running consumer has the dynamic `credential_inject`
+    /// filter configured with the projected Secret mount root. This is a
+    /// fail-closed capability gate for credential-bearing overlay revisions.
+    /// Set it only after the consumer has loaded a config containing that
+    /// filter; the Grid operator does not own or roll out the consumer
+    /// Deployment.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub supports_projected_credentials: bool,
+
     /// Base directory for mounted credential Secret files inside the consumer pod.
     ///
-    /// Each credential Secret is expected to be mounted at
-    /// `{credentialMountBase}/{secret-name}/{secret-key}`.
+    /// In projected-credential mode, mount each Secret at
+    /// `{credentialMountBase}/{secret-namespace}/{secret-name}` with its data
+    /// keys as files. Static `file:` entries continue to use their explicit
+    /// paths and are not constrained by this directory layout.
     ///
     /// Default: `/run/secrets/grid-credentials`.
     #[serde(default = "default_credential_mount_base")]
@@ -987,6 +1019,8 @@ impl Default for ConsumerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            enable_projected_credentials: false,
+            supports_projected_credentials: false,
             credential_mount_base: default_credential_mount_base(),
             config_map_name: default_consumer_config_map_name(),
             cluster_endpoints: Vec::new(),
@@ -1729,6 +1763,31 @@ mod tests {
             gateway_ref_properties.contains_key("localSiteName"),
             "CRD schema must include localSiteName field on GatewayRef"
         );
+        assert!(
+            gateway_ref_properties.contains_key("supportsEmptyOverlay"),
+            "CRD schema must include the empty-overlay capability gate"
+        );
+    }
+
+    #[test]
+    fn gateway_ref_empty_overlay_capability_defaults_closed_and_round_trips() {
+        let mut gw: GatewayRef = serde_json::from_value(serde_json::json!({
+            "name": "gw",
+            "namespace": "ns"
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            !gw.supports_empty_overlay,
+            "old GatewayRef documents default to unsupported"
+        );
+        gw.supports_empty_overlay = true;
+        let serialized = serde_json::to_value(gw).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            serialized
+                .get("supportsEmptyOverlay")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1753,6 +1812,8 @@ mod tests {
             "namespace": "ns",
             "consumerConfig": {
                 "enabled": true,
+                "enableProjectedCredentials": true,
+                "supportsProjectedCredentials": true,
                 "credentialMountBase": "/run/secrets/grid",
                 "configMapName": "my-consumer-config",
                 "tlsCertMountPath": "/etc/custom-tls",
@@ -1774,6 +1835,14 @@ mod tests {
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
         assert!(cc.enabled, "enabled must round-trip");
+        assert!(
+            cc.enable_projected_credentials,
+            "projected filter opt-in must round-trip"
+        );
+        assert!(
+            cc.supports_projected_credentials,
+            "projected credential readiness must round-trip"
+        );
         assert_eq!(
             cc.credential_mount_base, "/run/secrets/grid",
             "credentialMountBase must round-trip"
@@ -1842,6 +1911,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts every ConsumerConfig default as one contract"
+    )]
     fn consumer_config_defaults_when_subfields_absent() {
         let json = serde_json::json!({
             "name": "gw",
@@ -1851,6 +1924,14 @@ mod tests {
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
         assert!(!cc.enabled, "enabled must default to false");
+        assert!(
+            !cc.enable_projected_credentials,
+            "projected filter opt-in must default off"
+        );
+        assert!(
+            !cc.supports_projected_credentials,
+            "projected credentials must default closed"
+        );
         assert_eq!(
             cc.credential_mount_base, "/run/secrets/grid-credentials",
             "credentialMountBase must use default"
@@ -1985,6 +2066,7 @@ mod tests {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
             local_site_name: None,
+            supports_empty_overlay: false,
             consumer_config: None,
         };
         let json = serde_json::to_value(&gw).unwrap_or_else(|_| std::process::abort());

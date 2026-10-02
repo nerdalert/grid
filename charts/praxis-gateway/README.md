@@ -397,6 +397,22 @@ balancing and includes Basic Auth. It does not include the optional
 qualification. That qualification is not supported by this default image; AGN
 does not publish a replacement AI rollup.
 
+The default image also predates empty versioned routing snapshots. Keep
+`GridNetwork.spec.gatewayRefs[].supportsEmptyOverlay` unset/false when using this
+default; Grid will retain the last distributed overlay rather than sending a
+snapshot this image rejects. Upgrade and roll every consumer to an image with
+empty-snapshot support before explicitly enabling that GridNetwork capability.
+
+Generated consumer credentials use a separate two-step opt-in: set
+`consumerConfig.enableProjectedCredentials: true`, let Grid render the filter,
+and roll out the consumer with the read-only Secret mounts. In this mode, mount
+each Secret at `{credentialMountBase}/{secret-namespace}/{secret-name}`, with
+its data keys as files (for example,
+`/run/secrets/grid-credentials/grid-system/provider-key/token`). Static `file:`
+entries continue to use their explicitly configured paths. Only then set
+`consumerConfig.supportsProjectedCredentials: true`; Grid retains credential-
+bearing overlays until that readiness attestation is present.
+
 ### Edge and provider gateways in AGN
 
 AGN runs this chart in two roles with different values:
