@@ -270,6 +270,7 @@ struct BackendClientCert {
 #[expect(clippy::too_many_lines, reason = "keeps the backend transport checks together")]
 fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, String>, praxis_filter::FilterError> {
     let mut backends = BTreeMap::new();
+    let mut unverified = BTreeSet::new();
     for chain in &config.filter_chains {
         if !chain.filters.iter().any(|filter| filter.filter_type == "grid_site_route") {
             continue;
@@ -280,18 +281,24 @@ fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, String>, pr
                     format!("grid: parsing load_balancer backends: {error}").into()
                 })?;
             for backend in parsed.clusters {
-                let Some(tls) = backend.tls else { continue };
-                if !tls.verify
-                    || tls.sni.trim().is_empty()
-                    || tls.ca.as_ref().is_none_or(|ca| ca.ca_path.trim().is_empty())
-                    || tls.client_cert.as_ref().is_none_or(|cert| {
-                        cert.cert_path.trim().is_empty() || cert.key_path.trim().is_empty()
-                    })
-                {
-                    continue;
-                }
-                if backends.insert(backend.name.clone(), tls.sni).is_some() {
-                    return Err(format!("grid: duplicate verified backend {:?}", backend.name).into());
+                let verified_sni = backend.tls.filter(|tls| {
+                    tls.verify
+                        && !tls.sni.trim().is_empty()
+                        && tls.ca.as_ref().is_some_and(|ca| !ca.ca_path.trim().is_empty())
+                        && tls
+                            .client_cert
+                            .as_ref()
+                            .is_some_and(|cert| !cert.cert_path.trim().is_empty() && !cert.key_path.trim().is_empty())
+                });
+                if let Some(tls) = verified_sni {
+                    if unverified.contains(&backend.name) || backends.insert(backend.name.clone(), tls.sni).is_some() {
+                        return Err(format!("grid: ambiguous provider-hop backend {:?}", backend.name).into());
+                    }
+                } else {
+                    if backends.contains_key(&backend.name) {
+                        return Err(format!("grid: ambiguous provider-hop backend {:?}", backend.name).into());
+                    }
+                    unverified.insert(backend.name);
                 }
             }
         }
@@ -330,6 +337,23 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::{USAGE, config_arg, otlp_headers_present, validate_otlp_endpoint_transport_values};
+
+    #[test]
+    fn provider_hop_backends_reject_verified_plaintext_name_collision() {
+        let verified = "        tls:\n          sni: provider-a.grid.internal\n          verify: true\n          ca: { ca_path: /tls/ca.crt }\n          client_cert: { cert_path: /tls/tls.crt, key_path: /tls/tls.key }\n";
+        let plaintext = "        endpoints: [provider-a:80]\n";
+        for (first, second) in [(verified, plaintext), (plaintext, verified)] {
+            let mut config = config_with_backend(first);
+            let mut other = config_with_backend(second).filter_chains.remove(0);
+            other.name = "other-grid".to_owned();
+            config.filter_chains.push(other);
+            assert!(
+                provider_hop_backends(&config)
+                    .err()
+                    .is_some_and(|error| error.to_string().contains("ambiguous provider-hop backend"))
+            );
+        }
+    }
 
     fn parse(args: &[&str]) -> Result<Option<String>, String> {
         config_arg(args.iter().map(|arg| (*arg).to_owned()))
