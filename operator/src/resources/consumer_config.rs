@@ -244,7 +244,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     reason = "serializes every optional telemetry value in a stable YAML order"
 )]
 fn render_telemetry(telemetry: &GatewayTelemetryConfig) -> Result<String, ConsumerConfigError> {
-    if telemetry.otlp_endpoint.is_none()
+    if telemetry.otlp_endpoint.as_deref().is_none_or(str::is_empty)
         && telemetry.sampling_rate.is_none()
         && telemetry.service_name.is_none()
         && telemetry.service_version.is_none()
@@ -255,7 +255,11 @@ fn render_telemetry(telemetry: &GatewayTelemetryConfig) -> Result<String, Consum
         return Ok("\ntelemetry: {}\n".to_owned());
     }
     let mut output = String::from("\ntelemetry:\n");
-    if let Some(endpoint) = telemetry.otlp_endpoint.as_deref() {
+    if let Some(endpoint) = telemetry
+        .otlp_endpoint
+        .as_deref()
+        .filter(|endpoint| !endpoint.is_empty())
+    {
         output.push_str("  otlp_endpoint: ");
         output.push_str(&yaml_scalar(endpoint)?);
         output.push('\n');
@@ -848,6 +852,26 @@ mod tests {
             env_config.contains("telemetry: {}"),
             "an environment-only exporter must render as an empty mapping, not null"
         );
+
+        let empty_endpoint = GatewayTelemetryConfig {
+            otlp_endpoint: Some(String::new()),
+            ..env_only
+        };
+        assert!(
+            empty_endpoint.validate().is_ok(),
+            "an empty endpoint must use the deployment environment fallback"
+        );
+        let empty_config = generate_consumer_praxis_config_with_telemetry(
+            &overlay,
+            MOUNT_BASE,
+            &[],
+            "/etc/praxis/tls",
+            8080,
+            Some(&empty_endpoint),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(empty_config.contains("telemetry: {}"));
+        assert!(!empty_config.contains("otlp_endpoint:"));
 
         for rate in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
             let telemetry = GatewayTelemetryConfig {

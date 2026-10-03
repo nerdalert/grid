@@ -77,59 +77,38 @@ provider and flushes queued spans.
 
 ## Build and spans
 
-The `grid-gateway` binary built by `deploy/gateway/Containerfile` includes the
-Praxis 0.7.1 `otel` feature and the pinned Praxis AI v0.4.1
-`opentelemetry` feature. Use an image built from that target, published as
-`ghcr.io/praxis-proxy/grid-gateway`, for this configuration. The chart's default
-`ghcr.io/praxis-proxy/ai:0.4.0` image does not include the Grid build features.
+The `grid-gateway` binary built by `deploy/gateway/Containerfile` enables the
+Praxis `otel` feature and the Praxis AI v0.4.1 `opentelemetry` feature. The
+tracked gateway lockfile currently resolves Praxis 0.7.1. Use an image built
+from this Grid target, published as `ghcr.io/praxis-proxy/grid-gateway`, for
+this configuration. The chart's default `ghcr.io/praxis-proxy/ai:0.4.0` image
+does not include the Grid build features.
 
 With the AI feature enabled, these short semantic spans are supported when the
 corresponding filters run:
 
-- `http_request` server spans and `upstream_exchange` internal spans from
-  Praxis 0.7.1's HTTP proxy protocol.
+- HTTP server spans and `upstream_exchange` internal spans from Praxis 0.7.1.
 - `routing.select` from `intelligent_route`, including the serving overlay
   semantic revision when that revision is available to the filter.
 - `provider.route` from `provider_route`, including a validated edge overlay
   revision when present.
 
-The pinned AI implementation projects bounded routing fields into those spans;
+The AI implementation projects bounded routing fields into those spans;
 it does not add prompt or body contents, credential values, authorization
 headers, cookies, session keys, or raw request IDs. These spans describe route
 selection and resolution; `provider.route` does not prove the model backend
 served the request.
 
-## Trace linkage status in Praxis 0.7.1
+## Cross-gateway trace linkage
 
-Praxis 0.7.1 exports each gateway's HTTP server span and an internal
-`upstream_exchange` span. The AI `routing.select` and `provider.route` spans
-also appear as children of their local gateway's server span. The proxy's
-upstream span is named `upstream_exchange` with `INTERNAL` kind; Praxis 0.7.1
-does not export it as an HTTP client span.
+Praxis 0.7.1 forwards W3C trace headers but does not connect them to the
+exported HTTP server span or emit an exported HTTP client span for the upstream
+attempt. Edge and provider gateways therefore export separate local traces,
+even when the backend receives a forwarded `traceparent`. The routing spans
+remain local children of their gateway's HTTP server span.
 
-The `trace_context` filter separately validates inbound W3C `traceparent`,
-stores that value in a Praxis request extension, and forwards its trace ID and
-flags with a newly generated hop span ID. The filter's own source documentation
-states that this hop ID does not name an exported span. Praxis 0.7.1 also does
-not extract that extension into the OpenTelemetry context used by the HTTP
-server span. This leaves two parallel contexts: exported spans use the local
-OpenTelemetry request context, while forwarded headers use the filter's W3C
-context.
-
-A collector-backed test used an incoming trace ID of
-`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`. The edge exported a `POST` server span in
-trace `89e767a01d701b4f04d1b7b12c022c8a`, and the provider exported a `POST`
-server span in trace `abea135120a177a97b76273f37477f99`; both have no parent ID.
-The edge `routing.select` span is a child of the edge server span, and the
-provider `provider.route` span is a child of the provider server span. The
-test backend received `traceparent` with the original `aaaa...` trace ID and a
-fresh hop ID. The collector received spans only after normal SIGTERM shutdown,
-confirming provider flush. Full request details and collector output are kept
-outside the source tree in the PR evidence directory.
-
-This proves header propagation and local span export. It also proves that the
-exact pinned Praxis version does not create exported cross-gateway parent/child
-relationships. Issue #260 remains incomplete until Praxis provides a shared
-W3C/OpenTelemetry context for inbound server spans and outbound client spans,
-then a collector test confirms the resulting parent IDs across both gateways.
-See the accompanying Praxis issue draft for the proposed dependency change.
+Cross-gateway exported parentage requires a Praxis framework release containing
+the inbound context and upstream-attempt span changes. Once Grid updates its
+gateway dependency to that release, rebuild the tracked image and verify the
+collector's parent IDs across both gateways before claiming linked traces.
+The Praxis AI routing-span feature alone does not supply that linkage.
