@@ -67,6 +67,9 @@ pub(crate) struct ServingConfig {
     /// Explicit mTLS provider gateways authorized to receive hop context.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) provider_hop_clusters: Vec<String>,
+    /// Expected verified TLS SNI for each provider-hop cluster.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) provider_hop_sni: BTreeMap<String, String>,
     /// Sorted by site.
     pub(crate) peers: Vec<ServingPeer>,
 }
@@ -130,6 +133,8 @@ pub(crate) struct ServingInputs<'input> {
     pub(crate) pins: &'input BTreeMap<String, Vec<String>>,
     /// mTLS endpoints explicitly configured for this gateway.
     pub(crate) provider_hop_clusters: &'input BTreeSet<String>,
+    /// Declared TLS identity for runtime comparison with Praxis backends.
+    pub(crate) provider_hop_sni: &'input BTreeMap<String, String>,
 }
 
 /// Render from `(site, signals endpoint)` members, including an authoritative
@@ -166,6 +171,7 @@ where
         load_window_ms: LOAD_WINDOW_MS,
         candidates,
         provider_hop_clusters: inputs.provider_hop_clusters.iter().cloned().collect(),
+        provider_hop_sni: inputs.provider_hop_sni.clone(),
         peers,
     }
 }
@@ -415,12 +421,15 @@ mod tests {
     static NO_PINS: BTreeMap<String, Vec<String>> = BTreeMap::new();
     /// No authenticated provider gateway in this fixture.
     static NO_PROVIDER_HOPS: BTreeSet<String> = BTreeSet::new();
+    /// No declared provider-hop identities in the default fixture.
+    static NO_PROVIDER_HOP_SNI: BTreeMap<String, String> = BTreeMap::new();
 
     const INPUTS: ServingInputs<'static> = ServingInputs {
         tls_mount: "/etc/praxis/tls",
         local_signals_addr: None,
         pins: &NO_PINS,
         provider_hop_clusters: &NO_PROVIDER_HOPS,
+        provider_hop_sni: &NO_PROVIDER_HOP_SNI,
     };
 
     fn cand(name: &str, site: &str, cluster: &str, admission: Option<&str>) -> RoutingCandidate {
@@ -604,12 +613,15 @@ mod tests {
         let mut candidate = cand("llama", "site-b", "provider-b", None);
         candidate.stable_id = Some("257a9450".to_owned());
         let hops = BTreeSet::from(["provider-b".to_owned()]);
+        let hop_sni = BTreeMap::from([("provider-b".to_owned(), "provider-b.example".to_owned())]);
         let inputs = ServingInputs {
             provider_hop_clusters: &hops,
+            provider_hop_sni: &hop_sni,
             ..INPUTS
         };
         let config = render(&overlay(vec![candidate]), [], &inputs);
         assert_eq!(config.provider_hop_clusters, ["provider-b"]);
+        assert_eq!(config.provider_hop_sni, hop_sni);
         assert_eq!(config.candidates[0].stable_id.as_deref(), Some("257a9450"));
         let json = to_text(&config).expect("JSON");
         assert!(json.contains("\"provider_hop_clusters\": [\n    \"provider-b\""));

@@ -13,7 +13,9 @@ use std::{
 
 use serde::Serialize;
 
-use super::{DemoMode, GlbDemoOptions, certs, glb, kubectl, operator, safe_truncate_str};
+use super::{
+    DemoMode, GlbDemoOptions, certs, glb, kubectl, operator, provider_traffic_qualification, safe_truncate_str,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -3738,94 +3740,16 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     }
 }
 
-/// Collect actual image evidence from the deployed clusters.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Evidence collection queries the bounded set of deployed component images."
-)]
+/// Collect requested references and runtime image IDs from every required pod.
 fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let mut image_evidence = BTreeMap::new();
-
     for cluster in CLUSTERS {
         let context = cluster_context(cluster);
-
-        // Get grid operator image
-        let operator_output = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/grid-operator",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if operator_output.status.success() {
-            let operator_image = String::from_utf8_lossy(&operator_output.stdout).trim().to_owned();
-            image_evidence.insert(format!("{cluster}_operator"), operator_image);
-        }
-
-        // Get consumer gateway image
-        let consumer_output = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/consumer-gateway",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if consumer_output.status.success() {
-            let consumer_image = String::from_utf8_lossy(&consumer_output.stdout).trim().to_owned();
-            image_evidence.insert(format!("{cluster}_consumer_gateway"), consumer_image);
-        }
-
-        // Get provider gateway image
-        let provider_output = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/provider-gateway",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if provider_output.status.success() {
-            let provider_image = String::from_utf8_lossy(&provider_output.stdout).trim().to_owned();
-            image_evidence.insert(format!("{cluster}_provider_gateway"), provider_image);
-        }
-
-        // Get VCR inference image
-        let vcr_output = Command::new("kubectl")
-            .args([
-                "get",
-                &format!("deployment/vcr-inference-{cluster}"),
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if vcr_output.status.success() {
-            let mock_image = String::from_utf8_lossy(&vcr_output.stdout).trim().to_owned();
-            image_evidence.insert(format!("{cluster}_vcr_inference"), mock_image);
+        for (component, deployment) in provider_traffic_qualification::image_evidence_deployments(cluster) {
+            let evidence = provider_traffic_qualification::deployment_runtime_image_evidence(&context, &deployment)?;
+            image_evidence.insert(format!("{cluster}_{component}"), evidence);
         }
     }
-
     Ok(image_evidence)
 }
 

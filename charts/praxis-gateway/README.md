@@ -400,9 +400,25 @@ each model to the least-loaded admitted site. The chosen candidate's cluster mus
 name a `gatewayConfig.backends` cluster, so give each backend the operator's
 candidate cluster (the provider's `routingClusterRef`, else its name).
 
-The gateway reads the file only at start. When the ConfigMap's
-`grid.praxis-proxy.io/serving-digest` annotation changes, restart the gateway
-(`kubectl rollout restart`).
+The gateway watches the projected serving file and applies valid candidate,
+provider-hop, and peer revisions without a restart. A valid empty candidate
+revision becomes an active no-route snapshot. Malformed updates retain the
+last working revision. Static Praxis configuration changes and serving
+settings that require a new runtime, such as `window_secs`, still require a
+gateway restart.
+
+Place `grid_site_route` before any other cluster-selecting filter for models
+managed by this serving config. A valid empty snapshot rejects model-bearing
+requests even if an earlier filter preselected a cluster. With a non-empty
+snapshot, an earlier selection retains normal pipeline precedence; ordering
+Grid routing first ensures later candidate withdrawals cannot be bypassed.
+
+For authenticated provider hops, `GatewayRef.providerHopEndpoints` and the
+corresponding `gatewayConfig.backends` entry must name the same cluster and
+TLS SNI. The embedded gateway verifies that the loaded backend has CA
+verification and a client certificate before enabling provider-hop context;
+a mismatch fails startup or rejects the serving revision. The Praxis backend
+configuration is fixed for the life of a `gridServing` gateway process.
 
 Known limits:
 

@@ -1448,6 +1448,29 @@ async fn reconcile_routing_overlay_inner(
             continue;
         }
 
+        // Withdrawal cannot depend on regenerating static consumer plumbing:
+        // a failed render must not leave the previous permissive overlay serving.
+        let empty_resource_version = if overlay.candidates.is_empty() {
+            match distribute_overlay_configmap(&overlay, &render, network_name, gw_ref, client).await {
+                Ok(resource_version) => Some(resource_version),
+                Err(error) => {
+                    tracing::warn!(network = network_name, gateway = %gw_ref.name, %error,
+                        "empty routing overlay distribution failed; retaining previous revision");
+                    overlay_statuses.push(retained_overlay_status(
+                        network,
+                        gw_ref,
+                        observed_generation,
+                        Some(&render),
+                        "OverlayApplyFailed",
+                        "empty overlay ConfigMap apply failed",
+                    ));
+                    continue;
+                },
+            }
+        } else {
+            None
+        };
+
         if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
             if !projected_credentials_ready(
                 overlay
@@ -1490,39 +1513,44 @@ async fn reconcile_routing_overlay_inner(
                         "consumer Praxis config apply failed; retaining corresponding overlay revision"
                     );
                     consumer_statuses.push(consumer_config_status_error(gw_ref, cc, &error, observed_generation));
+                    if empty_resource_version.is_none() {
+                        overlay_statuses.push(retained_overlay_status(
+                            network,
+                            gw_ref,
+                            observed_generation,
+                            Some(&render),
+                            "ConsumerConfigApplyFailed",
+                            "consumer Praxis config was not applied; retaining corresponding overlay revision",
+                        ));
+                        continue;
+                    }
+                },
+            }
+        }
+
+        let resource_version = if let Some(resource_version) = empty_resource_version {
+            resource_version
+        } else {
+            match distribute_overlay_configmap(&overlay, &render, network_name, gw_ref, client).await {
+                Ok(rv) => rv,
+                Err(error) => {
+                    tracing::warn!(
+                        network = network_name,
+                        gateway = %gw_ref.name,
+                        error = %error,
+                        "routing overlay distribution failed; retaining any previously distributed revision"
+                    );
                     overlay_statuses.push(retained_overlay_status(
                         network,
                         gw_ref,
                         observed_generation,
                         Some(&render),
-                        "ConsumerConfigApplyFailed",
-                        "consumer Praxis config was not applied; retaining corresponding overlay revision",
+                        "OverlayApplyFailed",
+                        "overlay ConfigMap apply failed",
                     ));
                     continue;
                 },
             }
-        }
-
-        let resource_version = match distribute_overlay_configmap(&overlay, &render, network_name, gw_ref, client).await
-        {
-            Ok(rv) => rv,
-            Err(error) => {
-                tracing::warn!(
-                    network = network_name,
-                    gateway = %gw_ref.name,
-                    error = %error,
-                    "routing overlay distribution failed; retaining any previously distributed revision"
-                );
-                overlay_statuses.push(retained_overlay_status(
-                    network,
-                    gw_ref,
-                    observed_generation,
-                    Some(&render),
-                    "OverlayApplyFailed",
-                    "overlay ConfigMap apply failed",
-                ));
-                continue;
-            },
         };
         overlay_statuses.push(OverlayRevisionStatus {
             gateway_name: gw_ref.name.clone(),
@@ -1541,7 +1569,7 @@ async fn reconcile_routing_overlay_inner(
             observed_generation,
         });
 
-        // The gateway reads it only at start, so a failure never blocks the overlay.
+        // The embedded gateway watches valid serving revisions independently.
         if let Some(source) = serving {
             match apply_serving_config(&overlay, source, network_name, gw_ref, client).await {
                 Ok(retry) => serving_retry = serving_retry.into_iter().chain(retry).min(),
@@ -1647,19 +1675,51 @@ fn render_serving_text(
         .map_or(crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH, |cc| {
             cc.tls_cert_mount_path.as_str()
         });
-    let provider_hop_clusters = serving_provider_hop_clusters(gw_ref)?;
+    let provider_hop_sni = serving_provider_hop_sni_for_overlay(overlay, gw_ref)?;
+    let provider_hop_clusters = provider_hop_sni.keys().cloned().collect();
     let inputs = ServingInputs {
         tls_mount,
         local_signals_addr: source.settings.local_signals_addr.as_deref(),
         pins: &source.pins,
         provider_hop_clusters: &provider_hop_clusters,
+        provider_hop_sni: &provider_hop_sni,
     };
     let members = source.members.iter().map(|(site, endpoint)| (*site, endpoint.as_str()));
     serving_config::to_text(&serving_config::render(overlay, members, &inputs)).map_err(OperatorError::Json)
 }
 
-/// Resolve embedded-gateway provider hops from their dedicated GatewayRef
+/// No candidate can receive hop context after an authoritative withdrawal.
+fn serving_provider_hop_sni_for_overlay(
+    overlay: &routing_overlay::RoutingOverlay,
+    gw_ref: &GatewayRef,
+) -> Result<std::collections::BTreeMap<String, String>, OperatorError> {
+    if overlay.candidates.is_empty() {
+        if let Err(error) = serving_provider_hop_clusters(gw_ref) {
+            tracing::warn!(gateway = %gw_ref.name, %error,
+                "invalid provider-hop declaration ignored for empty serving revision");
+        }
+        Ok(std::collections::BTreeMap::new())
+    } else {
+        serving_provider_hop_clusters(gw_ref)?;
+        Ok(gw_ref
+            .provider_hop_endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.cluster.clone(),
+                    endpoint.transport.sni.clone().unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+}
+
+/// Resolve embedded-gateway provider hops from their dedicated `GatewayRef`
 /// contract, not from the optional generated consumer Praxis config.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each provider-hop declaration is checked before routing"
+)]
 fn serving_provider_hop_clusters(gw_ref: &GatewayRef) -> Result<BTreeSet<String>, OperatorError> {
     let mut clusters = BTreeSet::new();
     for endpoint in &gw_ref.provider_hop_endpoints {
@@ -3257,8 +3317,10 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::grid_network::{ClusterEndpointConfig, EndpointTransport, ProviderHopEndpointConfig};
-    use crate::swim_endpoint::EndpointResolutionFailure;
+    use crate::{
+        crd::grid_network::{ClusterEndpointConfig, EndpointTransport, ProviderHopEndpointConfig},
+        swim_endpoint::EndpointResolutionFailure,
+    };
 
     fn seed_addr(value: &str) -> SocketAddr {
         value.parse().unwrap_or_else(|_| std::process::abort())
@@ -5404,13 +5466,22 @@ mod tests {
         }];
 
         let expected = BTreeSet::from(["provider-a".to_owned()]);
-        assert_eq!(serving_provider_hop_clusters(&gw).unwrap(), expected);
-        let config = gw.consumer_config.as_mut().unwrap();
-        config.enabled = true;
-        assert_eq!(serving_provider_hop_clusters(&gw).unwrap(), expected);
+        assert_eq!(
+            serving_provider_hop_clusters(&gw).unwrap_or_else(|_| std::process::abort()),
+            expected
+        );
+        gw.consumer_config
+            .as_mut()
+            .unwrap_or_else(|| std::process::abort())
+            .enabled = true;
+        assert_eq!(
+            serving_provider_hop_clusters(&gw).unwrap_or_else(|_| std::process::abort()),
+            expected
+        );
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "covers each invalid provider-hop declaration")]
     fn embedded_provider_hop_endpoints_fail_closed_on_invalid_or_duplicate_entries() {
         let mut gw = make_gw_ref("gw", "grid-system");
         gw.provider_hop_endpoints = vec![ProviderHopEndpointConfig {
@@ -5449,6 +5520,34 @@ mod tests {
             serving_provider_hop_clusters(&gw),
             Err(OperatorError::InvalidResource(message)) if message.contains("must use mutual_tls")
         ));
+    }
+
+    #[test]
+    fn empty_serving_revision_ignores_invalid_provider_hop_declaration() {
+        let mut gw = make_gw_ref("gw", "grid-system");
+        gw.provider_hop_endpoints = vec![ProviderHopEndpointConfig {
+            cluster: "provider-a".to_owned(),
+            transport: EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: None,
+            },
+        }];
+        let overlay = routing_overlay::RoutingOverlay {
+            network: "net".to_owned(),
+            local_site: "site".to_owned(),
+            candidates: Vec::new(),
+            selection_policy: None,
+            generated_at: None,
+        };
+        assert!(matches!(
+            serving_provider_hop_clusters(&gw),
+            Err(OperatorError::InvalidResource(_))
+        ));
+        assert_eq!(
+            serving_provider_hop_sni_for_overlay(&overlay, &gw).unwrap_or_else(|_| std::process::abort()),
+            std::collections::BTreeMap::new(),
+            "invalid optional hop metadata cannot block an authoritative no-route revision"
+        );
     }
 
     #[test]

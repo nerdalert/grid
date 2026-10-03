@@ -1478,7 +1478,9 @@ dependencies = [
  "praxis-proxy",
  "praxis-proxy-core",
  "praxis-proxy-filter",
+ "serde",
  "tracing",
+ "yaml_serde",
 ]
 
 [[package]]

@@ -8,7 +8,7 @@
 //! the poller and the refresh loop live here, not in the filter.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     sync::{
         Arc, Mutex, PoisonError,
@@ -70,6 +70,10 @@ pub struct GridServingConfig {
     /// Explicit mTLS clusters that authenticate provider-hop context.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_hop_clusters: Vec<String>,
+
+    /// TLS SNI that the operator declares for each authenticated provider hop.
+    #[serde(default)]
+    pub provider_hop_sni: BTreeMap<String, String>,
 
     /// Peers to poll for live load.
     pub peers: Vec<PeerServingConfig>,
@@ -168,6 +172,8 @@ struct RuntimeShared {
     /// Without this gate, a refresh that captured the previous candidate set
     /// could publish after a withdrawal and resurrect its routes.
     refresh_gate: Mutex<()>,
+    /// TLS identities from the Praxis load balancer loaded at startup.
+    backend_tls: BTreeMap<String, String>,
 }
 
 impl GridRuntime {
@@ -274,6 +280,27 @@ pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError>
     serde_yaml::from_str(&text).map_err(|error| -> FilterError { format!("grid: parsing {path}: {error}").into() })
 }
 
+/// An operator-declared hop is trusted only when the loaded upstream uses the
+/// same verified TLS identity. Empty snapshots have no authorized hops.
+fn validate_provider_hop_binding(
+    config: &GridServingConfig,
+    backend_tls: &BTreeMap<String, String>,
+) -> Result<(), FilterError> {
+    let declared: BTreeSet<&str> = config.provider_hop_clusters.iter().map(String::as_str).collect();
+    let identities: BTreeSet<&str> = config.provider_hop_sni.keys().map(String::as_str).collect();
+    if declared != identities {
+        return Err("grid: provider-hop clusters and TLS identities differ".into());
+    }
+    for (cluster, expected_sni) in &config.provider_hop_sni {
+        if expected_sni.trim().is_empty() || backend_tls.get(cluster) != Some(expected_sni) {
+            return Err(
+                format!("grid: provider-hop cluster {cluster:?} does not match a verified mTLS backend").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Build the control plane from `config`: the store, the cold-start snapshot, and
 /// one poller per peer whose refresh closure re-orders and swaps the snapshot.
 ///
@@ -286,7 +313,10 @@ pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError>
     clippy::too_many_lines,
     reason = "validates the initial config and publishes its initial immutable routing snapshot"
 )]
-pub fn spawn_grid_routing(config: &GridServingConfig) -> Result<GridRuntime, FilterError> {
+pub fn spawn_grid_routing(
+    config: &GridServingConfig,
+    backend_tls: BTreeMap<String, String>,
+) -> Result<GridRuntime, FilterError> {
     validate_local_site(&config.local_site)?;
     let validated = if config.candidates.is_empty() {
         validate_serving_candidates(config.candidates.clone())?
@@ -294,6 +324,7 @@ pub fn spawn_grid_routing(config: &GridServingConfig) -> Result<GridRuntime, Fil
         validate_candidates(config.candidates.clone())?
     };
     let provider_hop_clusters = validate_provider_hop_clusters(config.provider_hop_clusters.clone())?;
+    validate_provider_hop_binding(config, &backend_tls)?;
     validate_hop_candidate_ids(&config.candidates, &provider_hop_clusters)?;
     let candidates: Arc<[RouteCandidate]> = Arc::from(validated);
     let local_site: Arc<str> = Arc::from(config.local_site.as_str());
@@ -316,6 +347,7 @@ pub fn spawn_grid_routing(config: &GridServingConfig) -> Result<GridRuntime, Fil
         store,
         pollers: Mutex::new(Vec::new()),
         refresh_gate: Mutex::new(()),
+        backend_tls,
     });
     let pollers = spawn_pollers(config, &shared)?;
     shared
@@ -406,6 +438,7 @@ fn apply_serving_revision(
     validate_local_site(&next.local_site)?;
     let candidates = validate_serving_candidates(next.candidates.clone())?;
     let provider_hop_clusters = validate_provider_hop_clusters(next.provider_hop_clusters.clone())?;
+    validate_provider_hop_binding(&next, &shared.backend_tls)?;
     validate_hop_candidate_ids(&next.candidates, &provider_hop_clusters)?;
     if next.window_secs != current.window_secs {
         return Err("grid: changing window_secs requires a gateway restart".into());
@@ -561,6 +594,7 @@ mod tests {
             store: Arc::new(LoadStore::new(Duration::from_secs(600))),
             pollers: Mutex::new(Vec::new()),
             refresh_gate: Mutex::new(()),
+            backend_tls: BTreeMap::new(),
         });
         let clock = Arc::new(AtomicI64::new(1_000));
         let refresh = {
@@ -678,8 +712,33 @@ peers:
     #[test]
     fn empty_serving_config_is_a_valid_cold_start() {
         let config: GridServingConfig = serde_yaml::from_str(&serving_yaml(" []")).expect("empty config parses");
-        let runtime = spawn_grid_routing(&config).expect("valid no-route cold start");
+        let runtime = spawn_grid_routing(&config, BTreeMap::new()).expect("valid no-route cold start");
         assert!(runtime.snapshot().load().candidates.is_empty());
+    }
+
+    #[test]
+    fn provider_hop_binding_rejects_plaintext_or_wrong_identity() {
+        let mut config: GridServingConfig = serde_yaml::from_str(&serving_yaml(" []")).expect("serving config");
+        config.provider_hop_clusters = vec!["provider-a".to_owned()];
+        config
+            .provider_hop_sni
+            .insert("provider-a".to_owned(), "provider-a.grid.internal".to_owned());
+        assert!(
+            validate_provider_hop_binding(&config, &BTreeMap::new()).is_err(),
+            "plaintext backend"
+        );
+        let wrong = BTreeMap::from([("provider-a".to_owned(), "other.grid.internal".to_owned())]);
+        assert!(
+            validate_provider_hop_binding(&config, &wrong).is_err(),
+            "wrong TLS identity"
+        );
+        let matching = BTreeMap::from([("provider-a".to_owned(), "provider-a.grid.internal".to_owned())]);
+        validate_provider_hop_binding(&config, &matching).expect("matching mTLS identity is accepted");
+        config.provider_hop_clusters.clear();
+        assert!(
+            validate_provider_hop_binding(&config, &matching).is_err(),
+            "undeclared hop identity"
+        );
     }
 
     #[test]
@@ -690,7 +749,7 @@ peers:
         );
         fs::write(&path, &active).expect("write active config");
         let config = load_serving_config(path.to_str().expect("utf-8 path")).expect("active config");
-        let mut runtime = spawn_grid_routing(&config).expect("active runtime");
+        let mut runtime = spawn_grid_routing(&config, BTreeMap::new()).expect("active runtime");
         runtime
             .watch_config(path.to_str().expect("utf-8 path"))
             .expect("watch config");
@@ -728,7 +787,7 @@ peers:
         // The gateway binary loads the config and seeds its snapshot before it
         // starts the watcher. A projected-volume update can land in between.
         let startup = load_serving_config(path.to_str().expect("utf-8 path")).expect("startup config");
-        let mut runtime = spawn_grid_routing(&startup).expect("active runtime");
+        let mut runtime = spawn_grid_routing(&startup, BTreeMap::new()).expect("active runtime");
         assert_eq!(runtime.snapshot().load().candidates.len(), 1);
 
         fs::write(&path, serving_yaml(" []")).expect("withdraw all candidates");

@@ -754,8 +754,10 @@ pub struct GatewayRef {
     /// serving config. This allowlist is independent of `consumerConfig`, so a
     /// missing or disabled generated Praxis config cannot alter embedded
     /// serving behavior. Every entry must declare `mutual_tls` and a nonblank
-    /// SNI; the embedded gateway's upstream configuration must use that
-    /// verified TLS identity.
+    /// SNI. The embedded gateway compares each declaration against the
+    /// loaded Praxis load-balancer's verified mTLS backend before it sends
+    /// provider-hop context. Changing Praxis backend transport requires a
+    /// gateway restart while `gridServing` is enabled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_hop_endpoints: Vec<ProviderHopEndpointConfig>,
 
@@ -950,7 +952,8 @@ pub struct EndpointTransport {
 
 /// Explicit verified-mTLS endpoint identity trusted for embedded provider-hop
 /// context. This does not configure the gateway's upstream TLS connection; the
-/// embedded gateway must separately use verified TLS with this SNI.
+/// embedded gateway must separately use verified TLS with this SNI; the
+/// gateway checks the two configurations before serving hop traffic.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderHopEndpointConfig {
