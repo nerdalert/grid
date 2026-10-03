@@ -216,9 +216,12 @@ impl GridRuntime {
             thread::Builder::new()
                 .name("grid-serving-config-watch".to_owned())
                 .spawn(move || {
-                    let mut observed = initial;
+                    let mut applied = initial;
+                    let mut parse_rejected: Option<String> = None;
+                    let mut apply_failed: Option<String> = None;
+                    let mut retry_delay = Duration::from_millis(CONFIG_POLL_INTERVAL_MS);
                     while !stop.load(Ordering::Acquire) {
-                        thread::park_timeout(Duration::from_millis(CONFIG_POLL_INTERVAL_MS));
+                        thread::park_timeout(retry_delay);
                         if stop.load(Ordering::Acquire) {
                             break;
                         }
@@ -229,23 +232,37 @@ impl GridRuntime {
                                 continue;
                             },
                         };
-                        if observed_text == observed {
+                        if observed_text == applied || parse_rejected.as_deref() == Some(observed_text.as_str()) {
+                            retry_delay = Duration::from_millis(CONFIG_POLL_INTERVAL_MS);
                             continue;
                         }
-                        observed.clone_from(&observed_text);
                         let parsed = match serde_yaml::from_str::<GridServingConfig>(&observed_text) {
                             Ok(config) => config,
                             Err(error) => {
                                 tracing::warn!(path = %thread_path, %error, "grid_serving_config_rejected: retaining last-known-good");
+                                parse_rejected = Some(observed_text);
+                                retry_delay = Duration::from_millis(CONFIG_POLL_INTERVAL_MS);
                                 continue;
                             },
                         };
-                        if let Err(error) = apply_serving_revision(&shared, &mut current, parsed, &observed_text) {
-                            tracing::warn!(
-                                path = %thread_path,
-                                %error,
-                                "grid_serving_config_rejected: retaining last-known-good"
-                            );
+                        match apply_serving_revision(&shared, &mut current, parsed, &observed_text) {
+                            Ok(()) => {
+                                applied = observed_text;
+                                parse_rejected = None;
+                                apply_failed = None;
+                                retry_delay = Duration::from_millis(CONFIG_POLL_INTERVAL_MS);
+                            },
+                            Err(error) => {
+                                if apply_failed.as_deref() != Some(observed_text.as_str()) {
+                                    tracing::warn!(
+                                        path = %thread_path,
+                                        %error,
+                                        "grid_serving_config_rejected: retaining last-known-good"
+                                    );
+                                }
+                                apply_failed = Some(observed_text);
+                                retry_delay = Duration::from_secs(1);
+                            },
                         }
                     }
                 })
@@ -772,6 +789,43 @@ peers:
         fs::write(&path, &active).expect("restore active config");
         wait_for_candidate_count(&runtime, 1);
         assert_eq!(&*runtime.snapshot().load().candidates[0].cluster, "pool-a");
+        drop(runtime);
+        fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[test]
+    fn serving_watcher_retries_withdrawal_after_peer_tls_recovers() {
+        let (directory, path) = temporary_config_path();
+        let active = serving_yaml(
+            "\n  - kind: inference_model\n    name: llama\n    site: east\n    cluster: pool-a\n    fresh: true",
+        );
+        fs::write(&path, &active).expect("write active config");
+        let config = load_serving_config(path.to_str().expect("utf-8 path")).expect("active config");
+        let mut runtime = spawn_grid_routing(&config, BTreeMap::new()).expect("active runtime");
+        runtime
+            .watch_config(path.to_str().expect("utf-8 path"))
+            .expect("watch config");
+
+        let ca = certs::generate_ca("grid-ca").expect("test CA");
+        let client = certs::generate_site_cert(&ca, "local").expect("test client certificate");
+        let ca_path = directory.join("ca.pem");
+        let cert_path = directory.join("client.crt");
+        let key_path = directory.join("client.key");
+        fs::write(&cert_path, client.cert_pem).expect("write client certificate");
+        fs::write(&key_path, client.key_pem).expect("write client key");
+        let withdrawn = format!(
+            "local_site: local\nwindow_secs: 60\nload_window_ms: 30000\ncandidates: []\npeers:\n  - site: east\n    addr: 127.0.0.1:1\n    server_name: east.grid.internal\n    authority: east.grid.internal\n    grid_ca_path: {}\n    client_cert_path: {}\n    client_key_path: {}\n",
+            ca_path.display(),
+            cert_path.display(),
+            key_path.display()
+        );
+        fs::write(&path, &withdrawn).expect("publish withdrawal with unavailable peer CA");
+        thread::park_timeout(Duration::from_secs(2));
+        assert_eq!(runtime.snapshot().load().candidates.len(), 1, "failed apply retains the prior route");
+
+        fs::write(&ca_path, ca.cert_pem).expect("repair peer CA without rewriting serving config");
+        wait_for_candidate_count(&runtime, 0);
+        assert_eq!(fs::read_to_string(&path).expect("read serving config"), withdrawn);
         drop(runtime);
         fs::remove_dir_all(directory).expect("remove temporary directory");
     }
