@@ -821,7 +821,11 @@ peers:
         );
         fs::write(&path, &withdrawn).expect("publish withdrawal with unavailable peer CA");
         thread::park_timeout(Duration::from_secs(2));
-        assert_eq!(runtime.snapshot().load().candidates.len(), 1, "failed apply retains the prior route");
+        assert_eq!(
+            runtime.snapshot().load().candidates.len(),
+            1,
+            "failed apply retains the prior route"
+        );
 
         fs::write(&ca_path, ca.cert_pem).expect("repair peer CA without rewriting serving config");
         wait_for_candidate_count(&runtime, 0);
