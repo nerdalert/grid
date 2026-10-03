@@ -320,7 +320,7 @@ spec:
                                   OTLP collector endpoint, for example `http://otel-collector:4317`.
 
                                   If omitted, Praxis can read `OTEL_EXPORTER_OTLP_ENDPOINT` from the
-                                  gateway Deployment.
+                                  gateway Deployment. An empty string has the same meaning as omission.
                                 nullable: true
                                 pattern: ^(|https?://[^/?#@\s]+(:[0-9]+)?(/[^\s?#]*)?)$
                                 type: string
