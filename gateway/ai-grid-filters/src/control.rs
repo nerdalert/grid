@@ -1,7 +1,7 @@
 //! Applies a grid serving config: the candidate topology and the peer pollers.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock, PoisonError, Weak,
@@ -229,6 +229,16 @@ pub(crate) struct Control {
 impl Control {
     /// Build the control plane for `config` without starting any poller.
     pub(crate) fn new(config: &GridServingConfig, start: StartPeer) -> Result<Self, FilterError> {
+        Self::new_with_backend_tls(config, start, BTreeMap::new())
+    }
+
+    /// Build with the verified backend identities that serving reloads must preserve.
+    pub(crate) fn new_with_backend_tls(
+        config: &GridServingConfig,
+        start: StartPeer,
+        backend_tls: BTreeMap<String, String>,
+    ) -> Result<Self, FilterError> {
+        validate_provider_hop_binding(config, &backend_tls)?;
         let topology = Topology::from_config(config)?;
         // Cold start: config order until the first poll re-orders it by live load.
         let mut gauged = Gauged::new();
@@ -829,6 +839,7 @@ mod tests {
             load_window_ms: 30_000,
             candidates: sites.iter().map(|site| candidate(site)).collect(),
             provider_hop_clusters: Vec::new(),
+            provider_hop_sni: BTreeMap::new(),
             peers: sites.iter().map(|site| peer(site)).collect(),
         }
     }

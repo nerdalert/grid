@@ -15,6 +15,7 @@
 use std::{ffi::OsStr, process::ExitCode};
 
 use praxis_core::config::{Config, ConfigFile, DEFAULT_CONFIG};
+use serde::Deserialize;
 use tracing::info;
 
 mod metrics_listener;
@@ -110,7 +111,7 @@ fn main() -> ExitCode {
     // bound until the server returns.
     let grid_runtime = match std::env::var("GRID_SERVING_CONFIG")
         .ok()
-        .map(|path| start_grid_routing(&path, &mut registry))
+        .map(|path| start_grid_routing(&path, &config, &mut registry))
     {
         Some(Err(err)) => return praxis::report_fatal(&err, log_output),
         Some(Ok(runtime)) => Some(runtime),
@@ -212,6 +213,7 @@ fn start_metrics_listener(config: &Config) -> Result<(), String> {
 /// registering the filters.
 fn start_grid_routing(
     path: &str,
+    praxis_config: &Config,
     registry: &mut praxis_filter::FilterRegistry,
 ) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
     let config = ai_grid_filters::load_serving_config(path)?;
@@ -232,6 +234,70 @@ fn start_grid_routing(
 
 /// How often the grid serving config file is re-read.
 const SERVING_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Minimal view of a load-balancer cluster for provider-hop trust validation.
+#[derive(Deserialize)]
+struct LoadBalancerBackends {
+    clusters: Vec<BackendCluster>,
+}
+
+#[derive(Deserialize)]
+struct BackendCluster {
+    name: String,
+    tls: Option<BackendTls>,
+}
+
+#[derive(Deserialize)]
+struct BackendTls {
+    sni: String,
+    verify: bool,
+    ca: Option<BackendCa>,
+    client_cert: Option<BackendClientCert>,
+}
+
+#[derive(Deserialize)]
+struct BackendCa {
+    ca_path: String,
+}
+
+#[derive(Deserialize)]
+struct BackendClientCert {
+    cert_path: String,
+    key_path: String,
+}
+
+/// Only verified mutual-TLS backends in Grid-enabled chains can carry hop context.
+#[expect(clippy::too_many_lines, reason = "keeps the backend transport checks together")]
+fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, String>, praxis_filter::FilterError> {
+    let mut backends = BTreeMap::new();
+    for chain in &config.filter_chains {
+        if !chain.filters.iter().any(|filter| filter.filter_type == "grid_site_route") {
+            continue;
+        }
+        for filter in chain.filters.iter().filter(|filter| filter.filter_type == "load_balancer") {
+            let parsed: LoadBalancerBackends = serde_yaml::from_value(filter.config.clone())
+                .map_err(|error| -> praxis_filter::FilterError {
+                    format!("grid: parsing load_balancer backends: {error}").into()
+                })?;
+            for backend in parsed.clusters {
+                let Some(tls) = backend.tls else { continue };
+                if !tls.verify
+                    || tls.sni.trim().is_empty()
+                    || tls.ca.as_ref().is_none_or(|ca| ca.ca_path.trim().is_empty())
+                    || tls.client_cert.as_ref().is_none_or(|cert| {
+                        cert.cert_path.trim().is_empty() || cert.key_path.trim().is_empty()
+                    })
+                {
+                    continue;
+                }
+                if backends.insert(backend.name.clone(), tls.sni).is_some() {
+                    return Err(format!("grid: duplicate verified backend {:?}", backend.name).into());
+                }
+            }
+        }
+    }
+    Ok(backends)
+}
 
 /// Usage line for a malformed command line.
 const USAGE: &str = "usage: grid-gateway [--config <path> | -c <path> | <path>]";

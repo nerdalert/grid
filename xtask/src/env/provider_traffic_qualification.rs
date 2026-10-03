@@ -482,13 +482,80 @@ fn curl_pod_overrides(pod_name: &str, curl_args: &[&str]) -> String {
     .to_string()
 }
 
-/// Run an ephemeral curl pod with restricted `PodSecurity` context.
-fn run_curl_probe(context: &str, pod_name: &str, curl_args: &[&str]) -> Result<std::process::Output, std::io::Error> {
+/// `kubectl run`'s attached stream can lose output from a short-lived curl
+/// container. Read logs only after Kubernetes reports a terminated container.
+struct ProbeExitStatus {
+    code: i32,
+}
+
+impl ProbeExitStatus {
+    fn success(&self) -> bool {
+        self.code == 0
+    }
+}
+
+struct CurlProbeOutput {
+    status: ProbeExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Delete exactly the temporary probe Pod created by `run_curl_probe`.
+struct ProbePodCleanup<'a> {
+    context: &'a str,
+    name: &'a str,
+}
+
+impl Drop for ProbePodCleanup<'_> {
+    fn drop(&mut self) {
+        drop(
+            Command::new("kubectl")
+                .args([
+                    "--context",
+                    self.context,
+                    "-n",
+                    GRID_SYSTEM_NS,
+                    "delete",
+                    "pod",
+                    self.name,
+                    "--ignore-not-found=true",
+                    "--wait=false",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        );
+    }
+}
+
+/// Return the terminal curl-container exit code, if Kubernetes has observed it.
+fn probe_pod_exit_code(pod: &serde_json::Value) -> Option<i32> {
+    pod.pointer("/status/containerStatuses")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|statuses| statuses.first())
+        .and_then(|status| status.pointer("/state/terminated/exitCode"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok())
+        .or_else(
+            || match pod.pointer("/status/phase").and_then(serde_json::Value::as_str) {
+                Some("Succeeded") => Some(0),
+                Some("Failed") => Some(1),
+                _ => None,
+            },
+        )
+}
+
+/// Run a restricted curl Pod, collect its completed logs, and then remove it.
+fn run_curl_probe(
+    context: &str,
+    pod_name: &str,
+    curl_args: &[&str],
+) -> Result<CurlProbeOutput, Box<dyn std::error::Error>> {
     let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let prefix = pod_name.get(..pod_name.len().min(40)).unwrap_or(pod_name);
     let unique_pod_name = format!("{prefix}-{sequence}");
     let overrides = curl_pod_overrides(&unique_pod_name, curl_args);
-    Command::new("kubectl")
+    let created = Command::new("kubectl")
         .args([
             "run",
             &unique_pod_name,
@@ -497,13 +564,96 @@ fn run_curl_probe(context: &str, pod_name: &str, curl_args: &[&str]) -> Result<s
             context,
             "-n",
             GRID_SYSTEM_NS,
-            "--rm",
-            "-i",
             "--restart=Never",
             "--overrides",
             &overrides,
         ])
-        .output()
+        .output()?;
+    if !created.status.success() {
+        return Err(format!(
+            "could not create curl probe Pod {unique_pod_name}: {}",
+            safe_truncate_str(String::from_utf8_lossy(&created.stderr).trim(), 500)
+        )
+        .into());
+    }
+    let _cleanup = ProbePodCleanup {
+        context,
+        name: &unique_pod_name,
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let observed = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                "pod",
+                &unique_pod_name,
+                "-o",
+                "json",
+            ])
+            .output()?;
+        if observed.status.success() {
+            let pod: serde_json::Value = serde_json::from_slice(&observed.stdout)?;
+            if let Some(code) = probe_pod_exit_code(&pod) {
+                let logs = Command::new("kubectl")
+                    .args(["--context", context, "-n", GRID_SYSTEM_NS, "logs", &unique_pod_name])
+                    .output()?;
+                if !logs.status.success() {
+                    return Err(format!(
+                        "could not collect completed curl probe Pod logs: {}",
+                        safe_truncate_str(String::from_utf8_lossy(&logs.stderr).trim(), 500)
+                    )
+                    .into());
+                }
+                // Container logs combine stdout/stderr. Retain response bytes only
+                // in memory; callers persist status and allowlisted headers only.
+                let stderr = if code == 0 {
+                    Vec::new()
+                } else {
+                    let diagnostics = String::from_utf8_lossy(&logs.stdout)
+                        .lines()
+                        .filter(|line| line.starts_with("curl: ("))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if diagnostics.is_empty() {
+                        format!("curl container exited with status {code}")
+                    } else {
+                        diagnostics
+                    }
+                    .into_bytes()
+                };
+                return Ok(CurlProbeOutput {
+                    status: ProbeExitStatus { code },
+                    stdout: logs.stdout,
+                    stderr,
+                });
+            }
+            if pod.pointer("/status/phase").and_then(serde_json::Value::as_str) == Some("Failed") {
+                let reason = pod
+                    .pointer("/status/reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("PodFailed");
+                let message = pod
+                    .pointer("/status/message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("curl probe Pod failed before the container reported an exit code");
+                return Err(format!("curl probe Pod failed: {reason}: {}", safe_truncate_str(message, 500)).into());
+            }
+        } else if !String::from_utf8_lossy(&observed.stderr).contains("NotFound") {
+            return Err(format!(
+                "could not observe curl probe Pod {unique_pod_name}: {}",
+                safe_truncate_str(String::from_utf8_lossy(&observed.stderr).trim(), 500)
+            )
+            .into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for curl probe Pod {unique_pod_name} to finish").into());
+        }
+        std::thread::park_timeout(Duration::from_millis(200));
+    }
 }
 
 /// Run an ephemeral curl pod with additional kubectl flags (e.g. `--labels`).
@@ -513,6 +663,35 @@ fn response_header(output: &[u8], name: &str) -> Option<String> {
         let (header, value) = line.split_once(':')?;
         header.eq_ignore_ascii_case(&expected).then(|| value.trim().to_owned())
     })
+}
+
+/// Extract the final HTTP status line without retaining a response body.
+fn response_status_line(output: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("HTTP/"))
+        .map(|line| safe_truncate_str(line.trim(), 120))
+}
+
+/// Return response header names only, for sanitized probe diagnostics.
+fn response_header_names(output: &[u8]) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    let mut in_headers = false;
+    for line in String::from_utf8_lossy(output).lines() {
+        if line.starts_with("HTTP/") {
+            in_headers = true;
+            continue;
+        }
+        if line.is_empty() {
+            in_headers = false;
+            continue;
+        }
+        if in_headers && let Some((name, _)) = line.split_once(':') {
+            names.insert(name.trim().to_ascii_lowercase());
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// Parse curl's explicit HTTP status marker, rejecting transport failures (`000`).
@@ -1032,8 +1211,8 @@ fn assert_overlay_acceptance() -> AssertionResult {
                 .parse::<u32>()
                 .is_ok_and(|n| n > 0);
 
-        // Step 4: A valid request proves that the accepted overlay is serving.
-        // Praxis health endpoints are exposed only on the pod-local admin listener.
+        // Step 4: A request proves routing works; the exact revision gate below
+        // distinguishes the current overlay from an older last-known-good one.
         let routing_output = run_curl_probe(
             &context,
             &format!("overlay-routing-{cluster}"),
@@ -1056,7 +1235,10 @@ fn assert_overlay_acceptance() -> AssertionResult {
 
         let routing_ok = routing_output.status.success();
 
-        let overlay_accepted = overlay_exists && has_data && gateway_ready && routing_ok;
+        let current_overlay = read_cluster_overlay(cluster)?;
+        let revision_accepted = current_overlay.semantic_revision != "unknown"
+            && wait_for_consumer_gateway_revision(&current_overlay.semantic_revision).is_ok();
+        let overlay_accepted = overlay_exists && has_data && gateway_ready && routing_ok && revision_accepted;
         if !overlay_accepted {
             all_accepted = false;
         }
@@ -1075,6 +1257,14 @@ fn assert_overlay_acceptance() -> AssertionResult {
             serde_json::Value::Bool(routing_ok),
         );
         observed_facts.insert(
+            format!("{cluster}_accepted_serving_revision_matches"),
+            serde_json::Value::Bool(revision_accepted),
+        );
+        observed_facts.insert(
+            format!("{cluster}_overlay_revision"),
+            serde_json::Value::String(current_overlay.semantic_revision),
+        );
+        observed_facts.insert(
             format!("{cluster}_resource_version"),
             serde_json::Value::String(resource_version),
         );
@@ -1087,7 +1277,7 @@ fn assert_overlay_acceptance() -> AssertionResult {
 
     if all_accepted {
         Ok(proof_success(
-            "Consumer entrypoint overlay ConfigMap exists with data, gateway ready, and routing passes",
+            "Consumer entrypoint accepted and serves the current overlay revision, with a ready gateway and successful routing",
             observed_facts,
             start.elapsed(),
         ))
@@ -2638,6 +2828,81 @@ fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// Change only the run-owned Provider A consumer endpoint transport and return its previous mode.
+fn set_generated_consumer_provider_a_transport_mode(mode: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let context = cluster_context("provider-a");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "gridnetwork",
+            GRID_NETWORK_NAME,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err("could not read provider-a GridNetwork before changing consumerConfig".into());
+    }
+    let network: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let gateways = network
+        .pointer("/spec/gatewayRefs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("provider-a GridNetwork has no gatewayRefs array")?;
+    let gateway_index = gateways
+        .iter()
+        .position(|gateway| {
+            gateway.get("name").and_then(serde_json::Value::as_str) == Some("consumer-gateway")
+                && gateway.get("namespace").and_then(serde_json::Value::as_str) == Some(GRID_SYSTEM_NS)
+        })
+        .ok_or("provider-a GridNetwork does not declare its run-owned consumer-gateway")?;
+    let endpoints = gateways
+        .get(gateway_index)
+        .and_then(|gateway| gateway.pointer("/consumerConfig/clusterEndpoints"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or("run-owned consumerConfig has no clusterEndpoints array")?;
+    let endpoint_index = endpoints
+        .iter()
+        .position(|endpoint| {
+            endpoint.get("cluster").and_then(serde_json::Value::as_str) == Some("vcr-provider-a-provider")
+        })
+        .ok_or("run-owned consumerConfig has no Provider A endpoint")?;
+    let previous_mode = endpoints
+        .get(endpoint_index)
+        .and_then(|endpoint| endpoint.pointer("/transport/mode"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Provider A consumer endpoint has no transport mode")?
+        .to_owned();
+    let path =
+        format!("/spec/gatewayRefs/{gateway_index}/consumerConfig/clusterEndpoints/{endpoint_index}/transport/mode");
+    let patch = serde_json::json!([{"op":"replace","path":path,"value":mode}]);
+    let patched = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "patch",
+            "gridnetwork",
+            GRID_NETWORK_NAME,
+            "--type=json",
+            "--patch",
+            &patch.to_string(),
+        ])
+        .output()?;
+    if !patched.status.success() {
+        return Err(format!(
+            "could not set run-owned Provider A consumer endpoint transport: {}",
+            safe_truncate_str(String::from_utf8_lossy(&patched.stderr).trim(), 800)
+        )
+        .into());
+    }
+    Ok(previous_mode)
+}
+
 /// Wait for a generation-current Rendered status and validate its live config.
 #[expect(
     clippy::too_many_lines,
@@ -2712,6 +2977,66 @@ fn wait_for_generated_consumer_config() -> Result<serde_json::Value, Box<dyn std
         }
         if Instant::now() >= deadline {
             return Err(format!("timed out waiting for operator-generated consumer config: {last_state}").into());
+        }
+        std::thread::park_timeout(Duration::from_secs(2));
+    }
+}
+
+/// Wait for a generation-current consumer-config render error on the run-owned GatewayRef.
+fn wait_for_generated_consumer_config_error(
+    expected_reason: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    const TIMEOUT: Duration = Duration::from_secs(180);
+    let context = cluster_context("provider-a");
+    let deadline = Instant::now() + TIMEOUT;
+    let mut last_state = String::from("not observed");
+    loop {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                &context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                "gridnetwork",
+                GRID_NETWORK_NAME,
+                "-o",
+                "json",
+            ])
+            .output()?;
+        if output.status.success() {
+            let network: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            let generation = network
+                .pointer("/metadata/generation")
+                .and_then(serde_json::Value::as_i64);
+            let statuses = network
+                .pointer("/status/consumerConfigStatus")
+                .and_then(serde_json::Value::as_array);
+            let current = statuses.and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("gatewayName").and_then(serde_json::Value::as_str) == Some("consumer-gateway")
+                        && item.get("namespace").and_then(serde_json::Value::as_str) == Some(GRID_SYSTEM_NS)
+                })
+            });
+            if let Some(current) = current {
+                let observed = current.get("observedGeneration").and_then(serde_json::Value::as_i64);
+                let phase = current
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let reason = current
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                last_state =
+                    format!("phase={phase}, reason={reason}, observed={observed:?}, generation={generation:?}");
+                if phase == "Error" && reason == expected_reason && observed == generation {
+                    return Ok(current.clone());
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for generation-current consumer config error: {last_state}").into());
         }
         std::thread::park_timeout(Duration::from_secs(2));
     }
@@ -2947,6 +3272,78 @@ fn patch_grid_network_for_serving(
     Ok(())
 }
 
+/// Replace only the run-owned embedded gateway's provider-hop declaration and
+/// return its exact prior value for unconditional restoration.
+fn patch_embedded_provider_hop_endpoints(
+    endpoints: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let context = cluster_context(CONSUMER_SITE);
+    let network = kubectl_get_json(&context, &format!("gridnetwork/{GRID_NETWORK_NAME}"))?;
+    let mut gateway_refs = network
+        .pointer("/spec/gatewayRefs")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or("GridNetwork has no gatewayRefs array")?;
+    let index = gateway_refs
+        .iter()
+        .position(|gateway| gateway.get("name").and_then(serde_json::Value::as_str) == Some(GRID_SERVING_GATEWAY))
+        .ok_or("GridNetwork has no run-owned embedded gateway reference")?;
+    let gateway = gateway_refs
+        .get_mut(index)
+        .ok_or("embedded gateway reference index is out of range")?;
+    let previous = gateway
+        .get("providerHopEndpoints")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(endpoints) = endpoints {
+        gateway["providerHopEndpoints"] = endpoints.clone();
+    } else if let Some(object) = gateway.as_object_mut() {
+        object.remove("providerHopEndpoints");
+    }
+    kubectl_patch_merge(
+        &context,
+        &format!("gridnetwork/{GRID_NETWORK_NAME}"),
+        &serde_json::json!({"spec": {"gatewayRefs": gateway_refs}}),
+    )?;
+    Ok(previous)
+}
+
+/// Wait for the controller's warning that invalid optional hop metadata was
+/// ignored while publishing an empty serving revision.
+fn wait_for_empty_overlay_invalid_hop_warning(timeout: Duration) -> Result<String, Box<dyn std::error::Error>> {
+    let context = cluster_context(CONSUMER_SITE);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                &context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "logs",
+                "deployment/grid-operator",
+                "--all-containers=true",
+                "--since=5m",
+            ])
+            .output()?;
+        if output.status.success() {
+            let logs = String::from_utf8_lossy(&output.stdout);
+            if let Some(line) = logs
+                .lines()
+                .find(|line| line.contains("invalid provider-hop declaration ignored for empty serving revision"))
+            {
+                return Ok(safe_truncate_str(line, 1_000));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "operator did not log that invalid provider-hop metadata was ignored for the empty revision".into(),
+            );
+        }
+        std::thread::park_timeout(Duration::from_secs(2));
+    }
+}
+
 /// Build the run-owned `GatewayRef` with the explicit mTLS provider-hop inventory.
 fn embedded_serving_gateway_ref(endpoints: &[serde_json::Value]) -> serde_json::Value {
     let provider_hop_endpoints: Vec<_> = endpoints
@@ -2997,6 +3394,26 @@ fn require_serving_provider_hops(snapshot: &serde_json::Value) -> Result<(), Box
         return Err(
             format!("embedded serving provider-hop allowlist mismatch: expected {expected:?}, got {actual:?}").into(),
         );
+    }
+    Ok(())
+}
+
+/// An authoritative empty serving revision must not carry provider-hop trust.
+fn require_empty_serving_provider_hops(snapshot: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    let serving = snapshot
+        .get("serving_config")
+        .ok_or("embedded serving snapshot has no serving_config")?;
+    if serving
+        .get("provider_hop_clusters")
+        .is_some_and(|value| !value.as_array().is_some_and(Vec::is_empty))
+    {
+        return Err("empty embedded serving snapshot retained or malformed provider_hop_clusters".into());
+    }
+    if serving
+        .get("provider_hop_sni")
+        .is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty))
+    {
+        return Err("empty embedded serving snapshot retained or malformed provider_hop_sni".into());
     }
     Ok(())
 }
@@ -3895,6 +4312,7 @@ fn assert_provider_gateway_round_robin() -> AssertionResult {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut sequence = Vec::new();
     let mut failures = Vec::new();
+    let mut response_diagnostics = Vec::new();
     let mut overlay_changes = Vec::new();
 
     let readiness = match wait_for_round_robin_readiness() {
@@ -3917,6 +4335,10 @@ fn assert_provider_gateway_round_robin() -> AssertionResult {
             ));
         },
     };
+    let gateway_posts_before: BTreeMap<String, u64> = PROVIDER_RESOURCES
+        .iter()
+        .map(|(site, _)| Ok(((*site).to_owned(), read_provider_gateway_post_count_cold(site)?)))
+        .collect::<Result<_, Box<dyn std::error::Error>>>()?;
 
     for request_number in 1..=60 {
         if let Ok(current_overlay) = read_cluster_overlay("provider-a")
@@ -3939,6 +4361,8 @@ fn assert_provider_gateway_round_robin() -> AssertionResult {
                 "--include",
                 "--silent",
                 "--show-error",
+                "--write-out",
+                &format!("\n{CURL_HTTP_STATUS_MARKER}%{{http_code}}\n"),
                 "--header",
                 "Content-Type: application/json",
                 "--header",
@@ -3959,12 +4383,30 @@ fn assert_provider_gateway_round_robin() -> AssertionResult {
                     sequence.push(provider);
                 } else {
                     failures.push(format!("{request_label}: provider attribution header missing"));
+                    response_diagnostics.push(serde_json::json!({
+                        "request": request_label,
+                        "curl_exit_code": output.status.code,
+                        "http_status": curl_http_status(&output.stdout).ok(),
+                        "http_status_line": response_status_line(&output.stdout),
+                        "response_header_names": response_header_names(&output.stdout),
+                        "response_bytes": output.stdout.len(),
+                    }));
                 }
             },
-            Ok(output) => failures.push(format!(
-                "{request_label}: HTTP probe failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )),
+            Ok(output) => {
+                failures.push(format!(
+                    "{request_label}: HTTP probe failed: {}",
+                    safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 300)
+                ));
+                response_diagnostics.push(serde_json::json!({
+                    "request": request_label,
+                    "curl_exit_code": output.status.code,
+                    "http_status": curl_http_status(&output.stdout).ok(),
+                    "http_status_line": response_status_line(&output.stdout),
+                    "response_header_names": response_header_names(&output.stdout),
+                    "response_bytes": output.stdout.len(),
+                }));
+            },
             Err(error) => failures.push(format!("{request_label}: probe execution failed: {error}")),
         }
     }
@@ -3985,8 +4427,20 @@ fn assert_provider_gateway_round_robin() -> AssertionResult {
             })
         });
     let balanced = exact_counts && repeating_cycle && failures.is_empty();
+    let gateway_posts_after: BTreeMap<String, u64> = PROVIDER_RESOURCES
+        .iter()
+        .map(|(site, _)| Ok(((*site).to_owned(), read_provider_gateway_post_count(site)?)))
+        .collect::<Result<_, Box<dyn std::error::Error>>>()?;
 
     let mut facts = BTreeMap::new();
+    facts.insert(
+        "provider_gateway_posts_before".to_owned(),
+        serde_json::json!(gateway_posts_before),
+    );
+    facts.insert(
+        "provider_gateway_posts_after".to_owned(),
+        serde_json::json!(gateway_posts_after),
+    );
     facts.insert("request_count".to_owned(), serde_json::json!(sequence.len()));
     facts.insert("provider_counts".to_owned(), serde_json::json!(counts));
     facts.insert("ordered_provider_sequence".to_owned(), serde_json::json!(sequence));
@@ -3997,6 +4451,10 @@ fn assert_provider_gateway_round_robin() -> AssertionResult {
         serde_json::json!(repeating_cycle),
     );
     facts.insert("failures".to_owned(), serde_json::json!(failures));
+    facts.insert(
+        "response_diagnostics".to_owned(),
+        serde_json::json!(response_diagnostics),
+    );
     facts.insert("selection_policy".to_owned(), serde_json::json!("roundRobin"));
     facts.insert("scoring_strategy".to_owned(), serde_json::json!("noMetrics"));
     facts.insert("readiness".to_owned(), serde_json::json!(readiness));
@@ -4222,16 +4680,15 @@ fn send_lifecycle_request(session_id: Option<&str>) -> Result<LifecycleRequest, 
     Ok(LifecycleRequest { status, provider })
 }
 
-/// Read the deterministic backend's successful inference count.
+/// Read a workload's pod-local metrics through a scoped port-forward.
 #[expect(
     clippy::too_many_lines,
-    reason = "the scoped port-forward lifecycle, bounded HTTP read, and metric parsing form one observation contract"
+    reason = "the scoped port-forward lifecycle and bounded HTTP read form one observation contract"
 )]
-fn read_backend_success_count(site: &str) -> Result<u64, Box<dyn std::error::Error>> {
+fn read_workload_metrics(site: &str, resource: &str, remote_port: u16) -> Result<String, Box<dyn std::error::Error>> {
     let context = cluster_context(site);
-    let service = format!("service/vcr-inference-{site}");
     let local_port = find_local_tcp_port()?;
-    let mapping = format!("{local_port}:8000");
+    let mapping = format!("{local_port}:{remote_port}");
     let child = Command::new("kubectl")
         .args([
             "--context",
@@ -4239,7 +4696,7 @@ fn read_backend_success_count(site: &str) -> Result<u64, Box<dyn std::error::Err
             "-n",
             GRID_SYSTEM_NS,
             "port-forward",
-            &service,
+            resource,
             &mapping,
             "--address",
             "127.0.0.1",
@@ -4249,7 +4706,7 @@ fn read_backend_success_count(site: &str) -> Result<u64, Box<dyn std::error::Err
         .spawn()?;
     let _port_forward = BackendMetricsPortForward { child: Some(child) };
     if !wait_for_local_tcp_port(local_port, Duration::from_secs(10)) {
-        return Err(format!("{site}: simulator metrics port-forward did not become ready").into());
+        return Err(format!("{site}: {resource} metrics port-forward did not become ready").into());
     }
 
     let url = format!("http://127.0.0.1:{local_port}/metrics");
@@ -4267,12 +4724,17 @@ fn read_backend_success_count(site: &str) -> Result<u64, Box<dyn std::error::Err
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "{site}: simulator /metrics probe through the run-scoped port-forward failed: {}",
+            "{site}: {resource} /metrics probe through the run-scoped port-forward failed: {}",
             safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 300)
         )
         .into());
     }
-    let metrics = String::from_utf8_lossy(&output.stdout);
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Read the deterministic backend's successful inference count.
+fn read_backend_success_count(site: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let metrics = read_workload_metrics(site, &format!("service/vcr-inference-{site}"), 8000)?;
     let mut found = false;
     let mut total = 0_u64;
     for line in metrics
@@ -4291,6 +4753,43 @@ fn read_backend_success_count(site: &str) -> Result<u64, Box<dyn std::error::Err
         return Err(format!("{site}: simulator did not expose vllm:request_success_total").into());
     }
     Ok(total)
+}
+
+/// Count completed POSTs at the provider gateway, including failed inference.
+fn read_provider_gateway_post_count(site: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let metrics = read_workload_metrics(site, "deployment/provider-gateway", 9901)?;
+    parse_provider_gateway_post_count(&metrics)?
+        .ok_or_else(|| format!("{site}: provider gateway did not expose a POST request counter").into())
+}
+
+/// Before the first request, Prometheus may not have a POST label series yet.
+fn read_provider_gateway_post_count_cold(site: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let metrics = read_workload_metrics(site, "deployment/provider-gateway", 9901)?;
+    Ok(parse_provider_gateway_post_count(&metrics)?.unwrap_or(0))
+}
+
+/// Sum provider-gateway POST ingress; `None` means no POST series has been created.
+fn parse_provider_gateway_post_count(metrics: &str) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    if metrics.trim().is_empty() {
+        return Err("provider gateway returned an empty metrics response".into());
+    }
+    let mut found = false;
+    let mut total = 0_u64;
+    for line in metrics
+        .lines()
+        .filter(|line| line.starts_with("praxis_http_requests_total{") && line.contains("method=\"POST\""))
+    {
+        let value = line
+            .split_whitespace()
+            .last()
+            .ok_or("malformed provider gateway POST counter")?
+            .parse::<u64>()?;
+        total = total
+            .checked_add(value)
+            .ok_or("provider gateway POST counter overflow")?;
+        found = true;
+    }
+    Ok(found.then_some(total))
 }
 
 /// Reserve and release an ephemeral loopback port for one metrics observation.
@@ -4342,6 +4841,8 @@ fn assert_provider_withdrawal_lifecycle(
     let start = Instant::now();
     let mut facts = BTreeMap::new();
     let mut original_selectors = Vec::new();
+    let mut original_consumer_endpoint_mode = None;
+    let mut original_provider_hop_endpoints = None;
     let mut embedded_restore_prior_log_observations = 0;
     let body = (|| -> Result<(), Box<dyn std::error::Error>> {
         for (site, resource) in PROVIDER_RESOURCES {
@@ -4504,12 +5005,56 @@ fn assert_provider_withdrawal_lifecycle(
         }
         facts.insert("withdrawn_provider_b_c_selectors".to_owned(), serde_json::json!(true));
         write_lifecycle_evidence(context, &facts)?;
+
+        let previous_mode = set_generated_consumer_provider_a_transport_mode("plaintext")?;
+        original_consumer_endpoint_mode = Some(previous_mode.clone());
+        if previous_mode != "mutual_tls" {
+            return Err(format!(
+                "negative consumer-config probe expected Provider A mutual_tls before injection, got {previous_mode:?}"
+            )
+            .into());
+        }
+        facts.insert(
+            "consumer_config_failure_injected".to_owned(),
+            serde_json::json!({
+                "provider_cluster": "vcr-provider-a-provider",
+                "transport_mode": "plaintext",
+                "sni_remains_configured": true
+            }),
+        );
+        write_lifecycle_evidence(context, &facts)?;
+        let consumer_config_failure = wait_for_generated_consumer_config_error("PlaintextWithSni")?;
+        facts.insert("consumer_config_failure_status".to_owned(), consumer_config_failure);
+        write_lifecycle_evidence(context, &facts)?;
+
+        let invalid_hops = serde_json::json!([{
+            "cluster": "vcr-provider-a-provider",
+            "transport": {
+                "mode": "plaintext",
+                "sni": "provider-a.grid.internal"
+            }
+        }]);
+        original_provider_hop_endpoints = Some(patch_embedded_provider_hop_endpoints(Some(&invalid_hops))?);
+        facts.insert(
+            "invalid_provider_hop_metadata_injected".to_owned(),
+            serde_json::json!({
+                "cluster": "vcr-provider-a-provider",
+                "transport_mode": "plaintext",
+                "sni": "provider-a.grid.internal"
+            }),
+        );
+        write_lifecycle_evidence(context, &facts)?;
+
         let empty = wait_for_overlay_clusters(&BTreeSet::new(), Some(&fallback.semantic_revision))?;
         wait_for_consumer_gateway_revision(&empty.semantic_revision)?;
         facts.insert("empty_revision".to_owned(), serde_json::json!(empty.semantic_revision));
         facts.insert(
             "empty_candidate_count".to_owned(),
             serde_json::json!(empty.candidates.len()),
+        );
+        facts.insert(
+            "empty_overlay_published_during_consumer_config_failure".to_owned(),
+            serde_json::json!(true),
         );
         facts.insert(
             "praxis_empty_serving_revision".to_owned(),
@@ -4521,11 +5066,16 @@ fn assert_provider_withdrawal_lifecycle(
                 embedded_serving_digest.as_deref(),
                 Duration::from_secs(180),
             )?;
-            require_serving_provider_hops(&serving)?;
+            require_empty_serving_provider_hops(&serving)?;
             let log =
                 wait_for_embedded_serving_log(&serving, &cluster_context(CONSUMER_SITE), 0, Duration::from_secs(90))?;
+            let warning = wait_for_empty_overlay_invalid_hop_warning(Duration::from_secs(45))?;
             facts.insert("embedded_empty_serving_config".to_owned(), serving);
             facts.insert("embedded_empty_serving_log".to_owned(), serde_json::json!(log));
+            facts.insert(
+                "invalid_provider_hop_metadata_ignored".to_owned(),
+                serde_json::json!(warning),
+            );
             embedded_serving_digest = Some(
                 read_grid_serving_snapshot(&cluster_context(CONSUMER_SITE))?
                     .get("digest")
@@ -4534,6 +5084,46 @@ fn assert_provider_withdrawal_lifecycle(
                     .to_owned(),
             );
         }
+        if let Some(previous) = original_provider_hop_endpoints.take() {
+            let prior = if previous.is_null() { None } else { Some(&previous) };
+            let injected = patch_embedded_provider_hop_endpoints(prior)?;
+            if injected
+                != serde_json::json!([{
+                    "cluster": "vcr-provider-a-provider",
+                    "transport": {
+                        "mode": "plaintext",
+                        "sni": "provider-a.grid.internal"
+                    }
+                }])
+            {
+                return Err("embedded provider-hop declaration changed unexpectedly before restoration".into());
+            }
+            facts.insert(
+                "provider_hop_metadata_restored_before_provider_restore".to_owned(),
+                serde_json::json!(true),
+            );
+        }
+        write_lifecycle_evidence(context, &facts)?;
+
+        let previous_mode = set_generated_consumer_provider_a_transport_mode(
+            original_consumer_endpoint_mode
+                .as_deref()
+                .ok_or("negative consumer-config probe lost its original transport mode")?,
+        )?;
+        if previous_mode != "plaintext" {
+            return Err(
+                format!("consumer-config probe expected plaintext before restore, got {previous_mode:?}").into(),
+            );
+        }
+        original_consumer_endpoint_mode = None;
+        let restored_consumer_config = wait_for_generated_consumer_config()?;
+        facts.insert(
+            "consumer_config_restored_after_negative_probe".to_owned(),
+            serde_json::json!({
+                "phase": restored_consumer_config.pointer("/status/phase"),
+                "observed_generation": restored_consumer_config.pointer("/status/observedGeneration")
+            }),
+        );
         write_lifecycle_evidence(context, &facts)?;
 
         for (site, _) in PROVIDER_RESOURCES {
@@ -4544,9 +5134,17 @@ fn assert_provider_withdrawal_lifecycle(
             .iter()
             .map(|(site, _)| Ok(((*site).to_owned(), read_backend_success_count(site)?)))
             .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+        let gateway_posts_before: BTreeMap<String, u64> = PROVIDER_RESOURCES
+            .iter()
+            .map(|(site, _)| Ok(((*site).to_owned(), read_provider_gateway_post_count(site)?)))
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
         facts.insert(
             "backend_success_total_before_no_route".to_owned(),
             serde_json::json!(metrics_before),
+        );
+        facts.insert(
+            "provider_gateway_posts_before_no_route".to_owned(),
+            serde_json::json!(gateway_posts_before),
         );
         write_lifecycle_evidence(context, &facts)?;
 
@@ -4598,12 +5196,26 @@ fn assert_provider_withdrawal_lifecycle(
             .iter()
             .map(|(site, _)| Ok(((*site).to_owned(), read_backend_success_count(site)?)))
             .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+        let gateway_posts_after: BTreeMap<String, u64> = PROVIDER_RESOURCES
+            .iter()
+            .map(|(site, _)| Ok(((*site).to_owned(), read_provider_gateway_post_count(site)?)))
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+        if gateway_posts_before != gateway_posts_after {
+            return Err(format!(
+                "provider gateway POST counters changed while no route was serving: before={gateway_posts_before:?}, after={gateway_posts_after:?}"
+            )
+            .into());
+        }
         if metrics_before != metrics_after {
             return Err(format!("backend request counters changed while no route was serving: before={metrics_before:?}, after={metrics_after:?}").into());
         }
         facts.insert(
             "backend_success_total_after_no_route".to_owned(),
             serde_json::json!(metrics_after),
+        );
+        facts.insert(
+            "provider_gateway_posts_after_no_route".to_owned(),
+            serde_json::json!(gateway_posts_after),
         );
         facts.insert("backend_non_contact_proven".to_owned(), serde_json::json!(true));
         if embedded_gateway_enabled {
@@ -4665,12 +5277,26 @@ fn assert_provider_withdrawal_lifecycle(
         Ok(())
     })();
 
-    let mut restoration_error = None;
+    let mut consumer_config_restoration_error = None;
+    if let Some(mode) = original_consumer_endpoint_mode.take() {
+        if let Err(error) = set_generated_consumer_provider_a_transport_mode(&mode)
+            .and_then(|_| wait_for_generated_consumer_config().map(|_| ()))
+        {
+            consumer_config_restoration_error = Some(error.to_string());
+        }
+    }
+    let mut restoration_error = consumer_config_restoration_error.clone();
+    if let Some(previous) = original_provider_hop_endpoints.take() {
+        let prior = if previous.is_null() { None } else { Some(&previous) };
+        if let Err(error) = patch_embedded_provider_hop_endpoints(prior) {
+            restoration_error.get_or_insert_with(|| format!("provider-hop declaration: {error}"));
+        }
+    }
     if !original_selectors.is_empty() {
         let before_restore = read_cluster_overlay("provider-a").ok();
         for state in &original_selectors {
             if let Err(error) = patch_provider_selector(state, &state.selector_value) {
-                restoration_error = Some(format!("{}: {error}", state.site));
+                restoration_error.get_or_insert_with(|| format!("{}: {error}", state.site));
             }
         }
         if restoration_error.is_none() {
@@ -4698,6 +5324,10 @@ fn assert_provider_withdrawal_lifecycle(
     facts.insert(
         "selector_restoration_error".to_owned(),
         serde_json::json!(restoration_error),
+    );
+    facts.insert(
+        "consumer_config_restoration_error".to_owned(),
+        serde_json::json!(consumer_config_restoration_error),
     );
     facts.insert(
         "lifecycle_error".to_owned(),
@@ -5147,6 +5777,38 @@ fn collect_embedded_gateway_image_evidence() -> Result<Option<String>, Box<dyn s
     Ok(None)
 }
 
+/// Read the platform image's config digest, which Kind reports as the pod imageID.
+fn local_image_config_digest(image: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut docker = Command::new("docker")
+        .args(["image", "save", "--platform", "linux/amd64", image])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let archive = docker.stdout.take().ok_or("docker image save did not provide stdout")?;
+    let manifest = Command::new("tar")
+        .args(["-xOf", "-", "manifest.json"])
+        .stdin(Stdio::from(archive))
+        .output()?;
+    let docker_status = docker.wait()?;
+    if !manifest.status.success() || !docker_status.success() {
+        return Err(format!("could not inspect the local linux/amd64 image config for {image}").into());
+    }
+    image_config_digest_from_manifest(&manifest.stdout)
+}
+
+/// Docker's OCI archive names the config blob separately from its index digest.
+fn image_config_digest_from_manifest(manifest: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    let entries: serde_json::Value = serde_json::from_slice(manifest)?;
+    let config = entries
+        .as_array()
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.get("Config"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|path| path.strip_prefix("blobs/sha256/"))
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("image archive has no valid OCI config digest")?;
+    Ok(format!("sha256:{config}"))
+}
+
 /// Check whether a deployment exists without treating a missing optional workload as an error.
 fn deployment_exists(context: &str, deployment: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
@@ -5177,7 +5839,7 @@ fn deployment_exists(context: &str, deployment: &str) -> Result<bool, Box<dyn st
 }
 
 /// Return deployments that belong to one provider-traffic cluster.
-fn image_evidence_deployments(cluster: &str) -> Vec<(&'static str, String)> {
+pub(super) fn image_evidence_deployments(cluster: &str) -> Vec<(&'static str, String)> {
     let mut deployments = vec![
         ("operator", "grid-operator".to_owned()),
         ("provider_gateway", "provider-gateway".to_owned()),
@@ -5194,7 +5856,10 @@ fn image_evidence_deployments(cluster: &str) -> Vec<(&'static str, String)> {
     clippy::too_many_lines,
     reason = "deployment identity, requested images, and every ready runtime image ID are captured together"
 )]
-fn deployment_runtime_image_evidence(context: &str, deployment: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(super) fn deployment_runtime_image_evidence(
+    context: &str,
+    deployment: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let deployment_output = Command::new("kubectl")
         .args([
             "get",
@@ -5227,6 +5892,13 @@ fn deployment_runtime_image_evidence(context: &str, deployment: &str) -> Result<
         .iter()
         .filter_map(|container| Some((container.get("name")?.as_str()?, container.get("image")?.as_str()?)))
         .collect();
+    let verify_local = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned()) == "Never";
+    let mut expected_by_image = BTreeMap::new();
+    if verify_local {
+        for image in requested_by_name.values() {
+            expected_by_image.insert(*image, local_image_config_digest(image)?);
+        }
+    }
     let selector_arg = selector
         .iter()
         .filter_map(|(key, value)| Some(format!("{key}={}", value.as_str()?)))
@@ -5295,10 +5967,23 @@ fn deployment_runtime_image_evidence(context: &str, deployment: &str) -> Result<
                     .and_then(serde_json::Value::as_str)
                     .filter(|image_id| !image_id.is_empty())
                     .ok_or_else(|| format!("pod {pod_name} container {name} has no runtime imageID"))?;
+                let requested = requested_by_name
+                    .get(name)
+                    .ok_or_else(|| format!("pod {pod_name} container {name} is absent from the Deployment template"))?;
+                let expected = expected_by_image.get(requested);
+                if let Some(expected) = expected
+                    && image_id != expected
+                {
+                    return Err(format!(
+                        "pod {pod_name} container {name} runs {image_id}, but local image {requested} has config digest {expected}"
+                    ));
+                }
                 Ok(serde_json::json!({
                     "name": name,
-                    "requested": requested_by_name.get(name),
+                    "requested": requested,
                     "imageID": image_id,
+                    "expectedLocalConfigDigest": expected,
+                    "sourceMatched": expected.is_some(),
                 }))
             })
             .collect::<Result<_, String>>()?;
@@ -5328,6 +6013,33 @@ mod tests {
             let deployments = image_evidence_deployments(site);
             assert!(!deployments.iter().any(|(key, _)| *key == "consumer_gateway"));
         }
+    }
+
+    #[test]
+    fn provider_gateway_post_counter_counts_failed_and_successful_statuses() {
+        let metrics = concat!(
+            "praxis_http_requests_total{method=\"GET\",status_class=\"2xx\"} 8\n",
+            "praxis_http_requests_total{method=\"POST\",status_class=\"2xx\"} 3\n",
+            "praxis_http_requests_total{method=\"POST\",status_class=\"5xx\"} 2\n",
+        );
+        assert_eq!(parse_provider_gateway_post_count(metrics).unwrap(), Some(5));
+        assert_eq!(
+            parse_provider_gateway_post_count("praxis_http_requests_total{method=\"GET\"} 8").unwrap(),
+            None,
+            "a cold gateway has no POST series until it handles a POST"
+        );
+        assert!(parse_provider_gateway_post_count("").is_err());
+    }
+
+    #[test]
+    fn image_manifest_config_digest_is_distinct_from_index_digest() {
+        let config = "a".repeat(64);
+        let manifest = format!(r#"[{{"Config":"blobs/sha256/{config}"}}]"#);
+        assert_eq!(
+            image_config_digest_from_manifest(manifest.as_bytes()).unwrap(),
+            format!("sha256:{config}")
+        );
+        assert!(image_config_digest_from_manifest(br#"[{"Config":"../escape"}]"#).is_err());
     }
 
     #[test]
@@ -5575,6 +6287,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the declaration and disabled consumer config assertions together"
+    )]
     fn embedded_gateway_declares_mtls_provider_hops_separately_from_disabled_consumer_config() {
         let endpoints = PROVIDER_RESOURCES
             .iter()
@@ -5627,6 +6343,62 @@ mod tests {
             }
         });
         assert!(require_serving_provider_hops(&extra).is_err());
+    }
+
+    #[test]
+    fn empty_embedded_serving_snapshot_omits_provider_hop_trust() {
+        let omitted = serde_json::json!({"serving_config": {"candidates": []}});
+        assert!(require_empty_serving_provider_hops(&omitted).is_ok());
+
+        let explicit_empty = serde_json::json!({
+            "serving_config": {
+                "candidates": [],
+                "provider_hop_clusters": [],
+                "provider_hop_sni": {}
+            }
+        });
+        assert!(require_empty_serving_provider_hops(&explicit_empty).is_ok());
+
+        let stale_trust = serde_json::json!({
+            "serving_config": {
+                "candidates": [],
+                "provider_hop_clusters": ["provider-a"],
+                "provider_hop_sni": {"provider-a": "provider-a.example"}
+            }
+        });
+        assert!(require_empty_serving_provider_hops(&stale_trust).is_err());
+
+        let malformed = serde_json::json!({
+            "serving_config": {"candidates": [], "provider_hop_clusters": {}}
+        });
+        assert!(require_empty_serving_provider_hops(&malformed).is_err());
+    }
+
+    #[test]
+    fn curl_probe_waits_for_a_terminal_container_status() {
+        let running = serde_json::json!({"status": {"phase": "Running"}});
+        assert_eq!(probe_pod_exit_code(&running), None);
+
+        let succeeded = serde_json::json!({"status": {"phase": "Succeeded"}});
+        assert_eq!(probe_pod_exit_code(&succeeded), Some(0));
+
+        let failed = serde_json::json!({
+            "status": {
+                "phase": "Failed",
+                "containerStatuses": [{"state": {"terminated": {"exitCode": 22}}}]
+            }
+        });
+        assert_eq!(probe_pod_exit_code(&failed), Some(22));
+    }
+
+    #[test]
+    fn response_diagnostics_retain_status_and_header_names_not_values() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Grid-Provider-Gateway: provider-a\r\n\r\n{\"private\":\"body\"}\nGRID258_HTTP_STATUS:200\n";
+        assert_eq!(response_status_line(response).as_deref(), Some("HTTP/1.1 200 OK"));
+        assert_eq!(
+            response_header_names(response),
+            vec!["content-type".to_owned(), "x-grid-provider-gateway".to_owned()]
+        );
     }
 
     #[test]

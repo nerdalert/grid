@@ -1834,4 +1834,19 @@ mod tests {
         assert!((0..10_000).all(|turn| (0.0..1.0).contains(&unit(turn, SALTS.1))));
         assert_ne!(random_seed(), random_seed());
     }
+
+    #[test]
+    fn empty_snapshot_rejects_even_with_a_preselected_cluster() {
+        let empty = RouteSnapshot::from_static(Vec::new(), Arc::from("local"));
+        assert!(matches!(route_decision(&empty, "llama", true), RouteDecision::NoRoute));
+
+        let active = RouteSnapshot::from_static(
+            one("llama", "east", "pool-a", AdmissionState::NewAndExisting),
+            Arc::from("local"),
+        );
+        assert!(matches!(
+            route_decision(&active, "llama", true),
+            RouteDecision::KeepEarlier
+        ));
+    }
 }

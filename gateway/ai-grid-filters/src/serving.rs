@@ -7,6 +7,7 @@
 //! resolved order. A watch on the config file applies the operator's rewrites.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
     sync::{Arc, Mutex, PoisonError},
@@ -63,6 +64,10 @@ pub struct GridServingConfig {
     /// Clusters allowed to carry authenticated provider-gateway hops.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_hop_clusters: Vec<String>,
+
+    /// TLS SNI declared for each authenticated provider hop.
+    #[serde(default)]
+    pub provider_hop_sni: BTreeMap<String, String>,
 
     /// Peers to poll for live load.
     pub peers: Vec<PeerServingConfig>,
@@ -322,7 +327,7 @@ pub fn spawn_grid_routing(config: &GridServingConfig) -> Result<GridRuntime, Fil
         spawn_on_thread_held(store, poller, scraper, refresh)
             .map_err(|error| -> FilterError { format!("grid: spawning poller for {}: {error}", peer.site).into() })
     });
-    start_runtime(config, start)
+    start_runtime_with_backend_tls(config, start, backend_tls)
 }
 
 /// Build the runtime over `start`, the peer poller constructor.
@@ -330,7 +335,16 @@ pub(crate) fn start_runtime(
     config: &GridServingConfig,
     start: crate::control::StartPeer,
 ) -> Result<GridRuntime, FilterError> {
-    let mut control = Control::new(config, start)?;
+    start_runtime_with_backend_tls(config, start, BTreeMap::new())
+}
+
+/// Build the runtime with TLS identities from the loaded Praxis backends.
+fn start_runtime_with_backend_tls(
+    config: &GridServingConfig,
+    start: crate::control::StartPeer,
+    backend_tls: BTreeMap<String, String>,
+) -> Result<GridRuntime, FilterError> {
+    let mut control = Control::new_with_backend_tls(config, start, backend_tls)?;
     control.apply(config)?;
     let health_tick = tick_health(control.health(), control.refresh(), control.store())
         .map_err(|error| -> FilterError { format!("grid: spawning the health tick: {error}").into() })?;

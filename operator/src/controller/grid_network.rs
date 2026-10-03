@@ -2343,7 +2343,7 @@ async fn reconcile_routing_overlay_inner(
             observed_generation,
         });
 
-        // The gateway reads it only at start, so a failure never blocks the overlay.
+        // The embedded gateway watches valid serving revisions independently.
         if let Some(source) = serving {
             match apply_serving_config(&overlay, source, network_name, gw_ref, client).await {
                 Ok(retry) => serving_retry = serving_retry.into_iter().chain(retry).min(),
@@ -2484,7 +2484,8 @@ fn render_serving_text(
         .map_or(crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH, |cc| {
             cc.tls_cert_mount_path.as_str()
         });
-    let provider_hop_clusters = serving_provider_hop_clusters(gw_ref)?;
+    let provider_hop_sni = serving_provider_hop_sni_for_overlay(overlay, gw_ref)?;
+    let provider_hop_clusters = provider_hop_sni.keys().cloned().collect();
     let inputs = ServingInputs {
         tls_mount,
         local_signals_addr: source.settings.local_signals_addr.as_deref(),
@@ -2495,8 +2496,38 @@ fn render_serving_text(
     serving_config::to_text(&serving_config::render(overlay, members, &inputs)).map_err(OperatorError::Json)
 }
 
-/// Resolve embedded-gateway provider hops from their dedicated GatewayRef
+/// No candidate can receive hop context after an authoritative withdrawal.
+fn serving_provider_hop_sni_for_overlay(
+    overlay: &routing_overlay::RoutingOverlay,
+    gw_ref: &GatewayRef,
+) -> Result<std::collections::BTreeMap<String, String>, OperatorError> {
+    if overlay.candidates.is_empty() {
+        if let Err(error) = serving_provider_hop_clusters(gw_ref) {
+            tracing::warn!(gateway = %gw_ref.name, %error,
+                "invalid provider-hop declaration ignored for empty serving revision");
+        }
+        Ok(std::collections::BTreeMap::new())
+    } else {
+        serving_provider_hop_clusters(gw_ref)?;
+        Ok(gw_ref
+            .provider_hop_endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.cluster.clone(),
+                    endpoint.transport.sni.clone().unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+}
+
+/// Resolve embedded-gateway provider hops from their dedicated `GatewayRef`
 /// contract, not from the optional generated consumer Praxis config.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each provider-hop declaration is checked before routing"
+)]
 fn serving_provider_hop_clusters(gw_ref: &GatewayRef) -> Result<BTreeSet<String>, OperatorError> {
     let mut clusters = BTreeSet::new();
     for endpoint in &gw_ref.provider_hop_endpoints {
@@ -6023,7 +6054,10 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::grid_network::{ClusterEndpointConfig, EndpointTransport, ProviderHopEndpointConfig};
+    use crate::{
+        crd::grid_network::{ClusterEndpointConfig, EndpointTransport, ProviderHopEndpointConfig},
+        swim_endpoint::EndpointResolutionFailure,
+    };
 
     #[test]
     fn a_provider_not_ready_publishes_ready_zero_without_a_fresh_scrape() {
@@ -6189,7 +6223,6 @@ mod tests {
             "an install declaring nothing keeps today's defaults"
         );
     }
-    use crate::swim_endpoint::EndpointResolutionFailure;
 
     fn seed_addr(value: &str) -> SocketAddr {
         value.parse().unwrap_or_else(|_| std::process::abort())
