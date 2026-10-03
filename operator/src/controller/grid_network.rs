@@ -1429,25 +1429,6 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
-        if !should_distribute_overlay(overlay.candidates.len(), gw_ref.supports_empty_overlay) {
-            tracing::warn!(
-                network = network_name,
-                gateway = %gw_ref.name,
-                namespace = %gw_ref.namespace,
-                revision = %render.revision_hex,
-                "empty routing overlay retained because the gateway has not opted into empty-snapshot support"
-            );
-            overlay_statuses.push(retained_overlay_status(
-                network,
-                gw_ref,
-                observed_generation,
-                Some(&render),
-                "EmptyOverlayUnsupported",
-                "empty candidate snapshots are disabled for this gateway; upgrade every consumer and set supportsEmptyOverlay=true before enabling no-route publication",
-            ));
-            continue;
-        }
-
         // Withdrawal cannot depend on regenerating static consumer plumbing:
         // a failed render must not leave the previous permissive overlay serving.
         let empty_resource_version = if overlay.candidates.is_empty() {
@@ -1591,13 +1572,6 @@ async fn reconcile_routing_overlay_inner(
         overlay_statuses,
         serving_retry,
     })
-}
-
-/// Empty candidate snapshots are a data-plane capability, not a universal
-/// property of every released consumer image. Require an explicit `GatewayRef`
-/// opt-in while allowing all non-empty revisions through unchanged.
-fn should_distribute_overlay(candidate_count: usize, supports_empty_overlay: bool) -> bool {
-    candidate_count > 0 || supports_empty_overlay
 }
 
 /// A generated consumer's live filter chain must already support projected
@@ -5432,7 +5406,6 @@ mod tests {
             name: name.to_owned(),
             namespace: ns.to_owned(),
             local_site_name: None,
-            supports_empty_overlay: false,
             provider_hop_endpoints: Vec::new(),
             consumer_config: None,
         }
@@ -5547,16 +5520,6 @@ mod tests {
             serving_provider_hop_sni_for_overlay(&overlay, &gw).unwrap_or_else(|_| std::process::abort()),
             std::collections::BTreeMap::new(),
             "invalid optional hop metadata cannot block an authoritative no-route revision"
-        );
-    }
-
-    #[test]
-    fn empty_overlay_publication_requires_gateway_capability_opt_in() {
-        assert!(!should_distribute_overlay(0, false));
-        assert!(should_distribute_overlay(0, true));
-        assert!(
-            should_distribute_overlay(1, false),
-            "non-empty updates remain compatible"
         );
     }
 

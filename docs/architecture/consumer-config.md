@@ -160,15 +160,15 @@ an empty list in arbitrary startup YAML:
 
 | Consumer path | Route-state source | Valid no-route state | Runtime update behavior |
 |---|---|---|---|
-| Praxis `intelligent_route` with `overlay_file` | Grid's versioned `routing-overlay.json` ConfigMap | A valid versioned envelope whose `overlay.candidates` is `[]` | Praxis validates and atomically serves the new snapshot; malformed replacements retain last-known-good. Grid distributes an empty revision only after `GatewayRef.supportsEmptyOverlay: true`. |
+| Praxis `intelligent_route` with `overlay_file` | Grid's versioned `routing-overlay.json` ConfigMap | A valid versioned envelope whose `overlay.candidates` is `[]` | Praxis validates and atomically serves the new snapshot; malformed replacements retain last-known-good. |
 | Generated `GatewayRef.consumerConfig` | The same scoped versioned overlay; generated `praxis.yaml` supplies filter and endpoint plumbing | The same empty envelope | Candidate-only updates hot reload. Credential-bearing revisions are held until `enableProjectedCredentials` has been rolled out and `supportsProjectedCredentials: true` attests the filter and Secret mounts are active. Listener, endpoint/TLS, and filter-pipeline changes still require the consumer owner to reload or roll out its Praxis configuration. |
 | Embedded `grid-gateway` `grid_site_route` filter | The operator-published `grid-serving-<network>-<gateway>` ConfigMap | A valid serving config with `candidates: []` | The running gateway watches the projected serving file and atomically replaces its candidate snapshot and provider-hop allowlist. Malformed updates retain the previous snapshot. Provider-hop trust is declared separately with `GatewayRef.providerHopEndpoints`. |
 
-`GatewayRef.supportsEmptyOverlay` defaults to `false`. Set it to `true` only
-after every data-plane consumer of that gateway's overlay has been upgraded and
-rolled out with empty-snapshot support. Until then, Grid retains the last
-distributed revision and reports `EmptyOverlayUnsupported`; this is an explicit
-compatibility boundary, not a successful withdrawal.
+Grid publishes authoritative empty revisions without a capability flag. Every
+consumer of a gateway's overlay must therefore run an image with empty-snapshot
+support before this Grid version is deployed. The chart-default Praxis AI 0.4.0
+image is not compatible; the paired AI change and a compatible image release
+are prerequisites for the next Grid release.
 
 The embedded gateway's filter chain and upstream cluster definitions remain in
 its startup Praxis configuration, but its changing candidate list is not a

@@ -343,11 +343,11 @@ balancing and includes Basic Auth. It does not include the optional
 qualification. That qualification is not supported by this default image; AGN
 does not publish a replacement AI rollup.
 
-The default image also predates empty versioned routing snapshots. Keep
-`GridNetwork.spec.gatewayRefs[].supportsEmptyOverlay` unset/false when using this
-default; Grid will retain the last distributed overlay rather than sending a
-snapshot this image rejects. Upgrade and roll every consumer to an image with
-empty-snapshot support before explicitly enabling that GridNetwork capability.
+The default image predates empty versioned routing snapshots and is not
+compatible with Grid's authoritative no-route publication. The paired Praxis AI
+change must be released, and this chart's default image must be updated to that
+compatible release, before the next Grid release. Upgrade and roll every
+consumer of a Grid-managed overlay before deploying that Grid version.
 
 Generated consumer credentials use a separate two-step opt-in: set
 `consumerConfig.enableProjectedCredentials: true`, let Grid render the filter,
