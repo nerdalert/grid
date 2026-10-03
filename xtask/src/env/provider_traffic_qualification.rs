@@ -3283,11 +3283,14 @@ fn patch_grid_network_for_serving(
     Ok(())
 }
 
-/// Replace only the run-owned embedded gateway's provider-hop declaration and
-/// return its exact prior value for unconditional restoration.
-fn patch_embedded_provider_hop_endpoints(
-    endpoints: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+/// Server-side dry-run one provider-hop transport update without persisting it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "builds and submits one scoped API-server dry-run patch"
+)]
+fn dry_run_provider_hop_transport(
+    transport: &serde_json::Value,
+) -> Result<std::process::Output, Box<dyn std::error::Error>> {
     let context = cluster_context(CONSUMER_SITE);
     let network = kubectl_get_json(&context, &format!("gridnetwork/{GRID_NETWORK_NAME}"))?;
     let mut gateway_refs = network
@@ -3302,58 +3305,85 @@ fn patch_embedded_provider_hop_endpoints(
     let gateway = gateway_refs
         .get_mut(index)
         .ok_or("embedded gateway reference index is out of range")?;
-    let previous = gateway
-        .get("providerHopEndpoints")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    if let Some(endpoints) = endpoints {
-        gateway["providerHopEndpoints"] = endpoints.clone();
-    } else if let Some(object) = gateway.as_object_mut() {
-        object.remove("providerHopEndpoints");
-    }
-    kubectl_patch_merge(
-        &context,
-        &format!("gridnetwork/{GRID_NETWORK_NAME}"),
-        &serde_json::json!({"spec": {"gatewayRefs": gateway_refs}}),
-    )?;
-    Ok(previous)
+    let endpoints = gateway
+        .get_mut("providerHopEndpoints")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("embedded gateway has no providerHopEndpoints array")?;
+    let endpoint = endpoints.first_mut().ok_or("providerHopEndpoints is empty")?;
+    endpoint["transport"] = transport.clone();
+
+    let patch = serde_json::to_string(&serde_json::json!({"spec": {"gatewayRefs": gateway_refs}}))?;
+    Ok(Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "patch",
+            &format!("gridnetwork/{GRID_NETWORK_NAME}"),
+            "--type=merge",
+            "--dry-run=server",
+            "--patch",
+            &patch,
+            "--output=name",
+        ])
+        .output()?)
 }
 
-/// Wait for the controller's warning that invalid optional hop metadata was
-/// ignored while publishing an empty serving revision.
-#[expect(clippy::too_many_lines, reason = "polls controller logs for the scoped warning")]
-fn wait_for_empty_overlay_invalid_hop_warning(timeout: Duration) -> Result<String, Box<dyn std::error::Error>> {
-    let context = cluster_context(CONSUMER_SITE);
-    let deadline = Instant::now() + timeout;
-    loop {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                &context,
-                "-n",
-                GRID_SYSTEM_NS,
-                "logs",
-                "deployment/grid-operator",
-                "--all-containers=true",
-                "--since=5m",
-            ])
-            .output()?;
-        if output.status.success() {
-            let logs = String::from_utf8_lossy(&output.stdout);
-            if let Some(line) = logs
-                .lines()
-                .find(|line| line.contains("invalid provider-hop declaration ignored for empty serving revision"))
-            {
-                return Ok(safe_truncate_str(line, 1_000));
-            }
+/// Prove API admission accepts verified mTLS and rejects invalid provider-hop transports.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps all provider-hop admission cases and result checks together"
+)]
+fn assert_provider_hop_admission_contract() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let cases = [
+        (
+            "valid_mutual_tls",
+            serde_json::json!({"mode": "mutual_tls", "sni": "provider-a.grid.internal"}),
+            true,
+            None,
+        ),
+        (
+            "plaintext",
+            serde_json::json!({"mode": "plaintext", "sni": "provider-a.grid.internal"}),
+            false,
+            Some(".transport.mode"),
+        ),
+        (
+            "missing_sni",
+            serde_json::json!({"mode": "mutual_tls"}),
+            false,
+            Some(".transport.sni"),
+        ),
+        (
+            "blank_sni",
+            serde_json::json!({"mode": "mutual_tls", "sni": " \t"}),
+            false,
+            Some(".transport.sni"),
+        ),
+    ];
+    let mut results = serde_json::Map::new();
+    for (name, transport, expected_acceptance, expected_error) in cases {
+        let output = dry_run_provider_hop_transport(&transport)?;
+        let accepted = output.status.success();
+        let message = safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 800);
+        if accepted != expected_acceptance {
+            return Err(format!(
+                "server-side admission {name} case expected accepted={expected_acceptance}, got accepted={accepted}: {message}"
+            )
+            .into());
         }
-        if Instant::now() >= deadline {
-            return Err(
-                "operator did not log that invalid provider-hop metadata was ignored for the empty revision".into(),
-            );
+        if let Some(expected_error) = expected_error
+            && !message.contains(expected_error)
+        {
+            return Err(format!("server-side admission {name} case failed for an unexpected reason: {message}").into());
         }
-        std::thread::park_timeout(Duration::from_secs(2));
+        results.insert(
+            name.to_owned(),
+            serde_json::json!({"accepted": accepted, "message": message}),
+        );
     }
+    Ok(serde_json::Value::Object(results))
 }
 
 /// Build the run-owned `GatewayRef` with the explicit mTLS provider-hop inventory.
@@ -4853,7 +4883,6 @@ fn assert_provider_withdrawal_lifecycle(
     let mut facts = BTreeMap::new();
     let mut original_selectors = Vec::new();
     let mut original_consumer_endpoint_mode = None;
-    let mut original_provider_hop_endpoints = None;
     let mut embedded_restore_prior_log_observations = 0;
     let body = (|| -> Result<(), Box<dyn std::error::Error>> {
         for (site, resource) in PROVIDER_RESOURCES {
@@ -4913,6 +4942,10 @@ fn assert_provider_withdrawal_lifecycle(
             serde_json::json!(baseline.semantic_revision),
         );
         facts.insert("baseline_candidates".to_owned(), serde_json::json!(baseline.candidates));
+        write_lifecycle_evidence(context, &facts)?;
+
+        let admission = assert_provider_hop_admission_contract()?;
+        facts.insert("provider_hop_admission".to_owned(), admission);
         write_lifecycle_evidence(context, &facts)?;
 
         let mut bound_session = None;
@@ -5038,24 +5071,6 @@ fn assert_provider_withdrawal_lifecycle(
         facts.insert("consumer_config_failure_status".to_owned(), consumer_config_failure);
         write_lifecycle_evidence(context, &facts)?;
 
-        let invalid_hops = serde_json::json!([{
-            "cluster": "vcr-provider-a-provider",
-            "transport": {
-                "mode": "plaintext",
-                "sni": "provider-a.grid.internal"
-            }
-        }]);
-        original_provider_hop_endpoints = Some(patch_embedded_provider_hop_endpoints(Some(&invalid_hops))?);
-        facts.insert(
-            "invalid_provider_hop_metadata_injected".to_owned(),
-            serde_json::json!({
-                "cluster": "vcr-provider-a-provider",
-                "transport_mode": "plaintext",
-                "sni": "provider-a.grid.internal"
-            }),
-        );
-        write_lifecycle_evidence(context, &facts)?;
-
         let empty = wait_for_overlay_clusters(&BTreeSet::new(), Some(&fallback.semantic_revision))?;
         wait_for_consumer_gateway_revision(&empty.semantic_revision)?;
         facts.insert("empty_revision".to_owned(), serde_json::json!(empty.semantic_revision));
@@ -5080,38 +5095,14 @@ fn assert_provider_withdrawal_lifecycle(
             require_empty_serving_provider_hops(&serving)?;
             let log =
                 wait_for_embedded_serving_log(&serving, &cluster_context(CONSUMER_SITE), 0, Duration::from_secs(90))?;
-            let warning = wait_for_empty_overlay_invalid_hop_warning(Duration::from_secs(45))?;
             facts.insert("embedded_empty_serving_config".to_owned(), serving);
             facts.insert("embedded_empty_serving_log".to_owned(), serde_json::json!(log));
-            facts.insert(
-                "invalid_provider_hop_metadata_ignored".to_owned(),
-                serde_json::json!(warning),
-            );
             embedded_serving_digest = Some(
                 read_grid_serving_snapshot(&cluster_context(CONSUMER_SITE))?
                     .get("digest")
                     .and_then(serde_json::Value::as_str)
                     .ok_or("embedded empty snapshot has no serving digest")?
                     .to_owned(),
-            );
-        }
-        if let Some(previous) = original_provider_hop_endpoints.take() {
-            let prior = if previous.is_null() { None } else { Some(&previous) };
-            let injected = patch_embedded_provider_hop_endpoints(prior)?;
-            if injected
-                != serde_json::json!([{
-                    "cluster": "vcr-provider-a-provider",
-                    "transport": {
-                        "mode": "plaintext",
-                        "sni": "provider-a.grid.internal"
-                    }
-                }])
-            {
-                return Err("embedded provider-hop declaration changed unexpectedly before restoration".into());
-            }
-            facts.insert(
-                "provider_hop_metadata_restored_before_provider_restore".to_owned(),
-                serde_json::json!(true),
             );
         }
         write_lifecycle_evidence(context, &facts)?;
@@ -5296,12 +5287,6 @@ fn assert_provider_withdrawal_lifecycle(
         consumer_config_restoration_error = Some(error.to_string());
     }
     let mut restoration_error = consumer_config_restoration_error.clone();
-    if let Some(previous) = original_provider_hop_endpoints.take() {
-        let prior = if previous.is_null() { None } else { Some(&previous) };
-        if let Err(error) = patch_embedded_provider_hop_endpoints(prior) {
-            restoration_error.get_or_insert_with(|| format!("provider-hop declaration: {error}"));
-        }
-    }
     if !original_selectors.is_empty() {
         let before_restore = read_cluster_overlay("provider-a").ok();
         for state in &original_selectors {

@@ -371,19 +371,19 @@ spec:
                               description: TLS mode and SNI configured for that embedded gateway upstream.
                               properties:
                                 mode:
-                                  description: 'Transport mode: `mutual_tls` or `plaintext`.'
+                                  description: Only verified mutual TLS is admitted for provider hops.
                                   enum:
                                     - mutual_tls
-                                    - plaintext
                                   type: string
                                 sni:
-                                  description: |-
-                                    TLS Server Name Indication (required when mode is `mutual_tls`;
-                                    must not be set when mode is `plaintext`).
-                                  nullable: true
+                                  description: DNS server name for verified provider-hop TLS.
+                                  maxLength: 253
+                                  minLength: 1
+                                  pattern: \S
                                   type: string
                               required:
                                 - mode
+                                - sni
                               type: object
                           required:
                             - cluster

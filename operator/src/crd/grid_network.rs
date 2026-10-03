@@ -961,7 +961,33 @@ pub struct ProviderHopEndpointConfig {
     pub cluster: String,
 
     /// TLS mode and SNI configured for that embedded gateway upstream.
+    #[schemars(with = "ProviderHopTransportSchema")]
     pub transport: EndpointTransport,
+}
+
+/// Admission schema for provider-hop transport. The runtime retains the
+/// general `EndpointTransport` type so it can fail closed on legacy invalid
+/// objects while publishing an authoritative empty revision. This schema-only
+/// view narrows new provider-hop objects without changing consumer endpoints.
+#[derive(JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[expect(dead_code, reason = "schema-only view used by the provider-hop CRD")]
+struct ProviderHopTransportSchema {
+    /// Only verified mutual TLS is admitted for provider hops.
+    mode: ProviderHopTransportModeSchema,
+
+    /// DNS server name for verified provider-hop TLS.
+    #[schemars(length(min = 1, max = 253), regex(pattern = r"\S"))]
+    sni: String,
+}
+
+/// Provider-hop transport is always mutually authenticated TLS.
+#[derive(JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[expect(dead_code, reason = "schema-only enum used by the provider-hop CRD")]
+enum ProviderHopTransportModeSchema {
+    /// Mutual TLS with certificate verification.
+    MutualTls,
 }
 
 /// Endpoint configuration for one consumer `load_balancer` cluster.
@@ -1765,9 +1791,11 @@ mod tests {
             "CRD schema must include transport field on clusterEndpoints items"
         );
 
-        let transport_properties = endpoint_properties
+        let transport_schema = endpoint_properties
             .get("transport")
-            .and_then(|v| v.pointer("/properties"))
+            .unwrap_or_else(|| std::process::abort());
+        let transport_properties = transport_schema
+            .get("properties")
             .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| std::process::abort());
 
@@ -1800,6 +1828,64 @@ mod tests {
             mode_values.len(),
             2,
             "transport.mode enum must have exactly 2 values: {mode_values:?}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts provider-hop schema constraints and consumer-schema isolation together"
+    )]
+    fn provider_hop_transport_admission_is_scoped_to_mutual_tls_and_nonblank_sni() {
+        let crd = crd_json();
+        let transport_schema = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties\
+                 /gatewayRefs/items/properties/providerHopEndpoints/items/properties/transport",
+            )
+            .unwrap_or_else(|| std::process::abort());
+        let transport_properties = transport_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        let required = transport_schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(
+            required.iter().any(|field| field.as_str() == Some("sni")),
+            "provider-hop SNI must be required by admission: {required:?}"
+        );
+        let mode_values = transport_properties
+            .get("mode")
+            .and_then(|mode| mode.get("enum"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            mode_values.len() == 1 && mode_values.first().and_then(serde_json::Value::as_str) == Some("mutual_tls"),
+            "provider-hop admission must allow only mutual_tls: {mode_values:?}"
+        );
+        let sni = transport_properties.get("sni").unwrap_or_else(|| std::process::abort());
+        assert_eq!(sni.get("minLength").and_then(serde_json::Value::as_u64), Some(1));
+        assert_eq!(sni.get("maxLength").and_then(serde_json::Value::as_u64), Some(253));
+        assert_eq!(sni.get("pattern").and_then(serde_json::Value::as_str), Some(r"\S"));
+
+        let consumer_transport = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties\
+                 /gatewayRefs/items/properties/consumerConfig/properties/clusterEndpoints/items\
+                 /properties/transport",
+            )
+            .unwrap_or_else(|| std::process::abort());
+        let consumer_modes = consumer_transport
+            .pointer("/properties/mode/enum")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(consumer_modes.len(), 2, "consumer endpoints must retain plaintext mode");
+        assert!(
+            consumer_transport.get("x-kubernetes-validations").is_none(),
+            "consumer endpoints must not inherit provider-hop admission restrictions"
         );
     }
 

@@ -240,6 +240,10 @@ are not deleted by this mechanism.
 provider-hop trust allowlist used by the embedded `grid-gateway`. Each entry
 names a provider cluster and declares its verified mTLS mode and SNI. The
 embedded gateway's startup upstream configuration must use that TLS identity.
+Kubernetes admission requires `transport.mode: mutual_tls` and a present,
+nonblank `transport.sni`; this restriction applies only to
+`providerHopEndpoints`. `consumerConfig.clusterEndpoints` retains its separate
+explicit `plaintext` option for local/dev-only endpoints.
 This field is independent of `consumerConfig`; absent or disabled generated
 consumer Praxis config cannot make embedded serving fail validation or change
 its provider-hop allowlist.
