@@ -313,7 +313,7 @@ spec:
                               environment:
                                 description: Deployment environment resource attribute.
                                 nullable: true
-                                pattern: ^(|.*\S.*)$
+                                pattern: ^.*\S.*$
                                 type: string
                               otlpEndpoint:
                                 description: |-
@@ -334,12 +334,12 @@ spec:
                               serviceName:
                                 description: OpenTelemetry `service.name` resource attribute.
                                 nullable: true
-                                pattern: ^(|.*\S.*)$
+                                pattern: ^.*\S.*$
                                 type: string
                               serviceVersion:
                                 description: OpenTelemetry `service.version` resource attribute.
                                 nullable: true
-                                pattern: ^(|.*\S.*)$
+                                pattern: ^.*\S.*$
                                 type: string
                             type: object
                           tlsCertMountPath:

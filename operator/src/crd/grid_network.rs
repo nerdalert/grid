@@ -875,17 +875,17 @@ pub struct GatewayTelemetryConfig {
     pub sampling_rate: Option<f64>,
 
     /// OpenTelemetry `service.name` resource attribute.
-    #[schemars(regex(pattern = r"^(|.*\S.*)$"))]
+    #[schemars(regex(pattern = r"^.*\S.*$"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
 
     /// OpenTelemetry `service.version` resource attribute.
-    #[schemars(regex(pattern = r"^(|.*\S.*)$"))]
+    #[schemars(regex(pattern = r"^.*\S.*$"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_version: Option<String>,
 
     /// Deployment environment resource attribute.
-    #[schemars(regex(pattern = r"^(|.*\S.*)$"))]
+    #[schemars(regex(pattern = r"^.*\S.*$"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
 
@@ -1747,6 +1747,33 @@ mod tests {
             empty_endpoint.validate().is_ok(),
             "an empty endpoint must use the deployment environment fallback"
         );
+    }
+
+    #[test]
+    fn telemetry_resource_attributes_reject_blank_values_at_admission_and_runtime() {
+        let crd = crd_json();
+        let telemetry_properties = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties/consumerConfig/properties/telemetry/properties",
+            )
+            .unwrap_or_else(|| std::process::abort());
+        for field in ["serviceName", "serviceVersion", "environment"] {
+            let pattern = telemetry_properties
+                .get(field)
+                .and_then(|property| property.get("pattern"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(
+                pattern,
+                Some(r"^.*\S.*$"),
+                "{field} must reject blank values at admission"
+            );
+            let telemetry: GatewayTelemetryConfig =
+                serde_json::from_value(serde_json::json!({(field): ""})).unwrap_or_else(|_| std::process::abort());
+            assert!(
+                telemetry.validate().is_err(),
+                "{field} must reject blank values at runtime"
+            );
+        }
     }
 
     #[test]
