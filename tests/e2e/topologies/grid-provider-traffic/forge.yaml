@@ -230,7 +230,6 @@ spec:
                 - name: consumer-gateway
                   namespace: grid-system
                   localSiteName: provider-a
-                  supportsEmptyOverlay: true
             gridSite:
               name: provider-a
               region: provider-a
@@ -294,7 +293,6 @@ spec:
                 - name: consumer-gateway
                   namespace: grid-system
                   localSiteName: provider-b
-                  supportsEmptyOverlay: true
             gridSite:
               name: provider-b
               region: provider-b
@@ -358,7 +356,6 @@ spec:
                 - name: consumer-gateway
                   namespace: grid-system
                   localSiteName: provider-c
-                  supportsEmptyOverlay: true
             gridSite:
               name: provider-c
               region: provider-c

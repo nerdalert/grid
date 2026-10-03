@@ -492,15 +492,6 @@ spec:
                             - transport
                           type: object
                         type: array
-                      supportsEmptyOverlay:
-                        default: false
-                        description: |-
-                          Explicitly attest that every consumer of this gateway's routing overlay
-                          accepts a valid versioned snapshot with `candidates: []` as a no-route
-                          decision. Defaults to `false` for compatibility with released Praxis
-                          images that reject empty candidate lists. The operator retains the last
-                          distributed revision until this is enabled.
-                        type: boolean
                     required:
                       - name
                       - namespace

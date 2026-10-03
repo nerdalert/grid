@@ -8811,7 +8811,6 @@ mod tests {
             name: name.to_owned(),
             namespace: ns.to_owned(),
             local_site_name: None,
-            supports_empty_overlay: false,
             provider_hop_endpoints: Vec::new(),
             consumer_config: None,
         }

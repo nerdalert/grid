@@ -746,14 +746,6 @@ pub struct GatewayRef {
     #[serde(default)]
     pub local_site_name: Option<String>,
 
-    /// Explicitly attest that every consumer of this gateway's routing overlay
-    /// accepts a valid versioned snapshot with `candidates: []` as a no-route
-    /// decision. Defaults to `false` for compatibility with released Praxis
-    /// images that reject empty candidate lists. The operator retains the last
-    /// distributed revision until this is enabled.
-    #[serde(default)]
-    pub supports_empty_overlay: bool,
-
     /// Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
     /// serving config. This allowlist is independent of `consumerConfig`, so a
     /// missing or disabled generated Praxis config cannot alter embedded
@@ -1788,31 +1780,6 @@ mod tests {
             gateway_ref_properties.contains_key("localSiteName"),
             "CRD schema must include localSiteName field on GatewayRef"
         );
-        assert!(
-            gateway_ref_properties.contains_key("supportsEmptyOverlay"),
-            "CRD schema must include the empty-overlay capability gate"
-        );
-    }
-
-    #[test]
-    fn gateway_ref_empty_overlay_capability_defaults_closed_and_round_trips() {
-        let mut gw: GatewayRef = serde_json::from_value(serde_json::json!({
-            "name": "gw",
-            "namespace": "ns"
-        }))
-        .unwrap_or_else(|_| std::process::abort());
-        assert!(
-            !gw.supports_empty_overlay,
-            "old GatewayRef documents default to unsupported"
-        );
-        gw.supports_empty_overlay = true;
-        let serialized = serde_json::to_value(gw).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(
-            serialized
-                .get("supportsEmptyOverlay")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -2091,7 +2058,6 @@ mod tests {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
             local_site_name: None,
-            supports_empty_overlay: false,
             provider_hop_endpoints: Vec::new(),
             consumer_config: None,
         };

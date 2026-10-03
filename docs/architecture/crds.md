@@ -27,7 +27,6 @@ spec:
     - name: inference-gw
       namespace: praxis-system
       localSiteName: cluster-east   # optional; defaults to network name
-      supportsEmptyOverlay: true    # set only after every consumer accepts empty v1 snapshots
       consumerConfig:               # optional; opt-in consumer Praxis config generation
         enabled: true
         enableProjectedCredentials: true  # generate filter, then roll out consumer
@@ -315,13 +314,12 @@ Praxis `ConfigMap` generation.
 | `tlsCertMountPath` | `/etc/praxis/tls` | Base path for mounted TLS files used when a `clusterEndpoints[]` entry uses `mutual_tls` transport. |
 | `listenerPort` | `8080` | HTTP port for the generated `listeners[0].address` (`0.0.0.0:{listenerPort}`). |
 
-`GatewayRef.supportsEmptyOverlay` is a separate, default-false capability gate.
-Released Praxis images that reject an empty candidate list must not receive an
-empty routing revision. Upgrade and roll every consumer to an image that accepts
-the versioned empty snapshot first; only then set `supportsEmptyOverlay: true`.
-Until opted in, Grid retains the last distributed revision and reports
-`EmptyOverlayUnsupported` in `status.overlayStatus[]` rather than claiming the
-withdrawal was served. Non-empty overlay updates are unaffected.
+Grid publishes a valid empty versioned overlay when no candidates remain.
+Every consumer of that overlay must use a Praxis AI image that accepts empty
+versioned snapshots; older images, including the chart-default 0.4.0 image,
+are incompatible. Upgrade and roll out the consumers before deploying this
+Grid version. Malformed or undeliverable updates still retain the last valid
+revision; an authoritative empty candidate set does not.
 
 When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
 `ConfigMap` in the gateway namespace on each reconcile.  The generated config is a

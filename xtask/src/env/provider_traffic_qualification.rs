@@ -3371,7 +3371,6 @@ fn embedded_serving_gateway_ref(endpoints: &[serde_json::Value]) -> serde_json::
         "name": GRID_SERVING_GATEWAY,
         "namespace": GRID_SYSTEM_NS,
         "localSiteName": CONSUMER_SITE,
-        "supportsEmptyOverlay": true,
         "providerHopEndpoints": provider_hop_endpoints,
         "consumerConfig": {
             "enabled": false,

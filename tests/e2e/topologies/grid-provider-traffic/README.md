@@ -173,12 +173,10 @@ provider-withdrawal lifecycle (fallback, a valid empty/no-route revision,
 backend non-contact, and restoration). `--quick` runs only the original six
 scenarios.
 
-The run-owned `GatewayRef`s explicitly set `supportsEmptyOverlay: true` because
-the qualification builds both consumers from the compatible source under test.
-Production deployments must first upgrade and roll out every consumer; the
-field defaults to false so an older released image (including the chart's
-default AI 0.4.0) retains its prior revision instead of receiving an invalid
-empty snapshot.
+The qualification builds both consumers from compatible source under test.
+Deployments must upgrade and roll out every consumer before using this Grid
+version, because older images (including the chart-default AI 0.4.0) reject
+the authoritative empty snapshot.
 
 Full mode also exercises the generated consumer credential lifecycle in two
 phases: it first renders `credential_inject` with an empty table and rolls out
