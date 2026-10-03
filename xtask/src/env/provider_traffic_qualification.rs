@@ -485,25 +485,33 @@ fn curl_pod_overrides(pod_name: &str, curl_args: &[&str]) -> String {
 /// `kubectl run`'s attached stream can lose output from a short-lived curl
 /// container. Read logs only after Kubernetes reports a terminated container.
 struct ProbeExitStatus {
+    /// Terminated curl process exit code.
     code: i32,
 }
 
 impl ProbeExitStatus {
+    /// Whether curl exited successfully.
     fn success(&self) -> bool {
         self.code == 0
     }
 }
 
+/// Completed curl probe output collected from its temporary Pod.
 struct CurlProbeOutput {
+    /// Curl process status.
     status: ProbeExitStatus,
+    /// Captured standard output.
     stdout: Vec<u8>,
+    /// Captured standard error.
     stderr: Vec<u8>,
 }
 
 /// Delete exactly the temporary probe Pod created by `run_curl_probe`.
-struct ProbePodCleanup<'a> {
-    context: &'a str,
-    name: &'a str,
+struct ProbePodCleanup<'probe> {
+    /// Kubernetes context containing the temporary Pod.
+    context: &'probe str,
+    /// Name of the temporary Pod.
+    name: &'probe str,
 }
 
 impl Drop for ProbePodCleanup<'_> {
@@ -546,6 +554,7 @@ fn probe_pod_exit_code(pod: &serde_json::Value) -> Option<i32> {
 }
 
 /// Run a restricted curl Pod, collect its completed logs, and then remove it.
+#[expect(clippy::too_many_lines, reason = "probe lifecycle and cleanup are one operation")]
 fn run_curl_probe(
     context: &str,
     pod_name: &str,
@@ -2829,6 +2838,7 @@ fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// Change only the run-owned Provider A consumer endpoint transport and return its previous mode.
+#[expect(clippy::too_many_lines, reason = "reads and patches the run-owned consumer endpoint")]
 fn set_generated_consumer_provider_a_transport_mode(mode: &str) -> Result<String, Box<dyn std::error::Error>> {
     let context = cluster_context("provider-a");
     let output = Command::new("kubectl")
@@ -2876,9 +2886,9 @@ fn set_generated_consumer_provider_a_transport_mode(mode: &str) -> Result<String
         .and_then(serde_json::Value::as_str)
         .ok_or("Provider A consumer endpoint has no transport mode")?
         .to_owned();
-    let path =
+    let json_pointer =
         format!("/spec/gatewayRefs/{gateway_index}/consumerConfig/clusterEndpoints/{endpoint_index}/transport/mode");
-    let patch = serde_json::json!([{"op":"replace","path":path,"value":mode}]);
+    let patch = serde_json::json!([{"op":"replace","path":json_pointer,"value":mode}]);
     let patched = Command::new("kubectl")
         .args([
             "--context",
@@ -2982,7 +2992,8 @@ fn wait_for_generated_consumer_config() -> Result<serde_json::Value, Box<dyn std
     }
 }
 
-/// Wait for a generation-current consumer-config render error on the run-owned GatewayRef.
+/// Wait for a generation-current consumer-config render error on the run-owned `GatewayRef`.
+#[expect(clippy::too_many_lines, reason = "polls status through the error transition")]
 fn wait_for_generated_consumer_config_error(
     expected_reason: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -3310,6 +3321,7 @@ fn patch_embedded_provider_hop_endpoints(
 
 /// Wait for the controller's warning that invalid optional hop metadata was
 /// ignored while publishing an empty serving revision.
+#[expect(clippy::too_many_lines, reason = "polls controller logs for the scoped warning")]
 fn wait_for_empty_overlay_invalid_hop_warning(timeout: Duration) -> Result<String, Box<dyn std::error::Error>> {
     let context = cluster_context(CONSUMER_SITE);
     let deadline = Instant::now() + timeout;
@@ -4303,7 +4315,6 @@ fn run_provider_traffic_scenarios(mode: DemoMode, context: &ProviderTrafficConte
 /// the request itself is the only source of the attribution counts.
 #[expect(
     clippy::too_many_lines,
-    clippy::unnecessary_wraps,
     reason = "The assertion framework requires a fallible, named traffic proof boundary."
 )]
 fn assert_provider_gateway_round_robin() -> AssertionResult {
@@ -5105,14 +5116,14 @@ fn assert_provider_withdrawal_lifecycle(
         }
         write_lifecycle_evidence(context, &facts)?;
 
-        let previous_mode = set_generated_consumer_provider_a_transport_mode(
+        let restored_mode = set_generated_consumer_provider_a_transport_mode(
             original_consumer_endpoint_mode
                 .as_deref()
                 .ok_or("negative consumer-config probe lost its original transport mode")?,
         )?;
-        if previous_mode != "plaintext" {
+        if restored_mode != "plaintext" {
             return Err(
-                format!("consumer-config probe expected plaintext before restore, got {previous_mode:?}").into(),
+                format!("consumer-config probe expected plaintext before restore, got {restored_mode:?}").into(),
             );
         }
         original_consumer_endpoint_mode = None;
@@ -5278,12 +5289,11 @@ fn assert_provider_withdrawal_lifecycle(
     })();
 
     let mut consumer_config_restoration_error = None;
-    if let Some(mode) = original_consumer_endpoint_mode.take() {
-        if let Err(error) = set_generated_consumer_provider_a_transport_mode(&mode)
+    if let Some(mode) = original_consumer_endpoint_mode.take()
+        && let Err(error) = set_generated_consumer_provider_a_transport_mode(&mode)
             .and_then(|_| wait_for_generated_consumer_config().map(|_| ()))
-        {
-            consumer_config_restoration_error = Some(error.to_string());
-        }
+    {
+        consumer_config_restoration_error = Some(error.to_string());
     }
     let mut restoration_error = consumer_config_restoration_error.clone();
     if let Some(previous) = original_provider_hop_endpoints.take() {
@@ -5967,20 +5977,20 @@ pub(super) fn deployment_runtime_image_evidence(
                     .and_then(serde_json::Value::as_str)
                     .filter(|image_id| !image_id.is_empty())
                     .ok_or_else(|| format!("pod {pod_name} container {name} has no runtime imageID"))?;
-                let requested = requested_by_name
+                let requested_image = requested_by_name
                     .get(name)
                     .ok_or_else(|| format!("pod {pod_name} container {name} is absent from the Deployment template"))?;
-                let expected = expected_by_image.get(requested);
+                let expected = expected_by_image.get(requested_image);
                 if let Some(expected) = expected
                     && image_id != expected
                 {
                     return Err(format!(
-                        "pod {pod_name} container {name} runs {image_id}, but local image {requested} has config digest {expected}"
+                        "pod {pod_name} container {name} runs {image_id}, but local image {requested_image} has config digest {expected}"
                     ));
                 }
                 Ok(serde_json::json!({
                     "name": name,
-                    "requested": requested,
+                    "requested": requested_image,
                     "imageID": image_id,
                     "expectedLocalConfigDigest": expected,
                     "sourceMatched": expected.is_some(),
@@ -6022,13 +6032,13 @@ mod tests {
             "praxis_http_requests_total{method=\"POST\",status_class=\"2xx\"} 3\n",
             "praxis_http_requests_total{method=\"POST\",status_class=\"5xx\"} 2\n",
         );
-        assert_eq!(parse_provider_gateway_post_count(metrics).unwrap(), Some(5));
+        assert_eq!(parse_provider_gateway_post_count(metrics).ok(), Some(Some(5)));
         assert_eq!(
-            parse_provider_gateway_post_count("praxis_http_requests_total{method=\"GET\"} 8").unwrap(),
-            None,
+            parse_provider_gateway_post_count("praxis_http_requests_total{method=\"GET\"} 8").ok(),
+            Some(None),
             "a cold gateway has no POST series until it handles a POST"
         );
-        assert!(parse_provider_gateway_post_count("").is_err());
+        assert_eq!(parse_provider_gateway_post_count("").ok(), None);
     }
 
     #[test]
@@ -6036,10 +6046,13 @@ mod tests {
         let config = "a".repeat(64);
         let manifest = format!(r#"[{{"Config":"blobs/sha256/{config}"}}]"#);
         assert_eq!(
-            image_config_digest_from_manifest(manifest.as_bytes()).unwrap(),
-            format!("sha256:{config}")
+            image_config_digest_from_manifest(manifest.as_bytes()).ok(),
+            Some(format!("sha256:{config}"))
         );
-        assert!(image_config_digest_from_manifest(br#"[{"Config":"../escape"}]"#).is_err());
+        assert_eq!(
+            image_config_digest_from_manifest(br#"[{"Config":"../escape"}]"#).ok(),
+            None
+        );
     }
 
     #[test]
@@ -6348,7 +6361,7 @@ mod tests {
     #[test]
     fn empty_embedded_serving_snapshot_omits_provider_hop_trust() {
         let omitted = serde_json::json!({"serving_config": {"candidates": []}});
-        assert!(require_empty_serving_provider_hops(&omitted).is_ok());
+        assert!(matches!(require_empty_serving_provider_hops(&omitted), Ok(())));
 
         let explicit_empty = serde_json::json!({
             "serving_config": {
@@ -6357,7 +6370,7 @@ mod tests {
                 "provider_hop_sni": {}
             }
         });
-        assert!(require_empty_serving_provider_hops(&explicit_empty).is_ok());
+        assert!(matches!(require_empty_serving_provider_hops(&explicit_empty), Ok(())));
 
         let stale_trust = serde_json::json!({
             "serving_config": {

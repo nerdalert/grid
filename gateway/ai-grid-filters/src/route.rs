@@ -141,11 +141,11 @@ impl HttpFilter for GridSiteRouteFilter {
 }
 
 /// A prior selector cannot revive a model route after an authoritative empty snapshot.
-enum RouteDecision<'a> {
+enum RouteDecision<'candidate> {
     /// A previous filter selected a cluster while Grid still has candidates.
     KeepEarlier,
     /// Select this candidate from the current snapshot.
-    Select(&'a RouteCandidate),
+    Select(&'candidate RouteCandidate),
     /// No candidate may serve this model.
     NoRoute,
 }
