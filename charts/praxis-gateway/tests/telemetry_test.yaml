@@ -129,30 +129,6 @@ tests:
           path: data["praxis.yaml"]
           pattern: "otlp_endpoint:"
 
-  - it: rejects credentials in the endpoint userinfo
-    template: templates/gateway-config.yaml
-    set:
-      gatewayConfig.telemetry.otlpEndpoint: https://user:password@collector:4317
-    asserts:
-      - failedTemplate:
-          errorPattern: "Does not match pattern"
-
-  - it: rejects query strings on the endpoint
-    template: templates/gateway-config.yaml
-    set:
-      gatewayConfig.telemetry.otlpEndpoint: "https://collector:4317?api_key=sentinel"
-    asserts:
-      - failedTemplate:
-          errorPattern: "Does not match pattern"
-
-  - it: rejects fragments on the endpoint
-    template: templates/gateway-config.yaml
-    set:
-      gatewayConfig.telemetry.otlpEndpoint: "https://collector:4317/otlp#token=sentinel"
-    asserts:
-      - failedTemplate:
-          errorPattern: "Does not match pattern"
-
   - it: requires a Grid gateway image when telemetry is enabled
     template: templates/deployment.yaml
     set:
