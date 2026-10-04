@@ -2101,6 +2101,7 @@ async fn apply_consumer_config_for_gateway(
         cc.listener_port,
         tls,
         &gw_ref.name,
+        cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled),
     )?;
     if let Some(mounts) = cc.mount_reconciliation.as_ref().filter(|mounts| mounts.enabled) {
         let (status, config_applied) = Box::pin(reconcile_delegated_gateway(
@@ -2549,7 +2550,7 @@ async fn reconcile_delegated_gateway(
                 // The owned volume name is derived from its mount path. When a
                 // Secret reference changes at that same path (for example the
                 // Grid CA reference), replace only the Grid-owned volume entry.
-                additions.push(owned_volume_mutation_patch(
+                additions.extend(owned_volume_mutation_patch(
                     template,
                     &delegation.container_name,
                     &desired.volume_name,
@@ -2747,7 +2748,7 @@ async fn reconcile_delegated_gateway(
             }));
         }
         if volumes.iter().any(|volume| &volume.name == name) {
-            volume_deletions.push(owned_volume_mutation_patch(
+            volume_deletions.extend(owned_volume_mutation_patch(
                 template,
                 &delegation.container_name,
                 name,
@@ -2818,7 +2819,7 @@ fn owned_volume_mutation_patch(
     target_container_name: &str,
     volume_name: &str,
     replacement: Option<&Value>,
-) -> Result<Value, OperatorError> {
+) -> Result<Vec<Value>, OperatorError> {
     let mounts_volume = |container: &k8s_openapi::api::core::v1::Container| {
         container
             .volume_mounts
@@ -2847,15 +2848,11 @@ fn owned_volume_mutation_patch(
     }
 
     match replacement {
-        Some(volume) => {
-            let mut patch = volume.clone();
-            patch
-                .as_object_mut()
-                .ok_or_else(|| mount_failure("DeploymentInvalid", "desired volume was not an object"))?
-                .insert("$patch".to_owned(), Value::String("replace".to_owned()));
-            Ok(patch)
+        Some(volume) if volume.is_object() => {
+            Ok(vec![json!({"name": volume_name, "$patch": "delete"}), volume.clone()])
         },
-        None => Ok(json!({"name": volume_name, "$patch": "delete"})),
+        Some(_) => Err(mount_failure("DeploymentInvalid", "desired volume was not an object").into()),
+        None => Ok(vec![json!({"name": volume_name, "$patch": "delete"})]),
     }
 }
 
@@ -7497,12 +7494,14 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
 
-        assert_eq!(replacement_patch.pointer("/$patch"), Some(&json!("replace")));
         assert_eq!(
-            replacement_patch.pointer("/secret/secretName"),
-            Some(&json!("credential-new"))
+            replacement_patch,
+            vec![json!({"name": "grid-credential", "$patch": "delete"}), replacement]
         );
-        assert_eq!(deletion_patch, json!({"name": "grid-credential", "$patch": "delete"}));
+        assert_eq!(
+            deletion_patch,
+            vec![json!({"name": "grid-credential", "$patch": "delete"})]
+        );
         assert_mount_ownership_test_deployment_unchanged(&deployment, &original);
     }
 

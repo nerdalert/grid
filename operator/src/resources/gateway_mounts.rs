@@ -183,8 +183,11 @@ fn revision(input: &str) -> String {
 }
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "test assertions inspect JSON projection values")]
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    reason = "test assertions inspect fixed JSON projection fixtures"
+)]
 mod tests {
     use super::*;
     use crate::resources::consumer_config::{MountRequirement, RequirementGateway, RequirementItem, RequirementSecret};

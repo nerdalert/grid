@@ -866,6 +866,10 @@ impl Default for ConsumerConfig {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "!has(self.enabled) || !self.enabled || has(self.deploymentName)",
+    "message": "deploymentName is required when mount reconciliation is enabled"
+}]))]
 pub struct MountReconciliation {
     /// Enable delegated mount reconciliation. Defaults to `false`.
     #[serde(default)]
@@ -1736,6 +1740,23 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(false),
             "mount reconciliation must remain opt in"
+        );
+    }
+
+    #[test]
+    fn enabled_mount_reconciliation_requires_deployment_name_at_admission() {
+        let crd = crd_json();
+        let rule = crd.pointer(
+            "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties\
+             /gatewayRefs/items/properties/consumerConfig/properties/mountReconciliation\
+             /x-kubernetes-validations/0/rule",
+        );
+        assert_eq!(
+            rule,
+            Some(&serde_json::json!(
+                "!has(self.enabled) || !self.enabled || has(self.deploymentName)"
+            )),
+            "enabled delegation must require a Deployment name at admission"
         );
     }
 

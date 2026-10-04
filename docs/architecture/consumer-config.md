@@ -148,12 +148,15 @@ ConfigMap revision remains distributed while candidates are empty because the
 Praxis route filter rejects an empty candidates array. Other Deployment fields,
 containers, volumes, mounts, and Helm resources are preserved.
 
-All credential, Grid CA, site identity, and custom backend CA Secrets must be
-in the gateway namespace. For server-authenticated `tls` endpoints,
+For delegated mounts, all credential, Grid CA, site identity, and custom backend
+CA Secrets must be in the gateway namespace. For server-authenticated `tls` endpoints,
 `clusterEndpoints[].transport.caSecretRef` can select a custom CA Secret; its
 key defaults to `ca.crt`. Mutual TLS uses the Grid CA and site identity from
 `GridNetwork.spec.tls`. Secret contents and private keys are never copied into
 generated ConfigMaps, status, or logs.
+When mount reconciliation is disabled, the operator still renders the mTLS
+file paths but leaves their mounts with the gateway owner; Grid CA and site
+identity Secret references are required only for delegated mounts.
 
 `consumerConfigStatus[].phase: Rendered` means the config map was rendered and
 applied. It does not mean the gateway has restarted or become ready. With mount
@@ -215,7 +218,7 @@ Example failure output:
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
 | `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]` |
 | `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration — the operator refuses to guess TLS vs plaintext |
-| `MissingSni` | `Error` | A `mutual_tls` cluster endpoint has no (or blank) `sni` — mTLS requires a server name |
+| `MissingSni` | `Error` | A `mutual_tls` or `tls` cluster endpoint has no (or blank) `sni`; TLS requires a server name |
 | `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set — `sni` does not enable TLS; use `mutual_tls` if TLS is intended |
 | `ConsumerConfigRenderFailed` | `Error` | Overlay data produced an unrenderable config (e.g. blank local site) |
 | `ConsumerConfigApplyFailed` | `Error` | Kubernetes API rejected the `ConfigMap` apply (e.g. RBAC, namespace not found) |
@@ -251,13 +254,13 @@ cluster before restarting or rolling out the consumer gateway.
 
 A cluster endpoint has no `transport` field.  The operator requires every
 `clusterEndpoints[]` entry to declare explicit transport intent — either
-`mutual_tls` (with `sni`) or `plaintext`.  Add a `transport` block to the
+`mutual_tls` or `tls` (both with `sni`), or `plaintext`. Add a `transport` block to the
 identified endpoint.  The operator will not guess whether a cluster should use
 TLS or plaintext.
 
 **Phase is `Error` / reason `MissingSni`**
 
-A `mutual_tls` cluster endpoint has a blank or missing `sni` field.  The `sni`
+A `mutual_tls` or `tls` cluster endpoint has a blank or missing `sni` field. The `sni`
 must match the Subject Alternative Name in the provider gateway's server
 certificate.  Add a non-blank `sni` to the endpoint's `transport` block.
 
