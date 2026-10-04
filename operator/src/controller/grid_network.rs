@@ -3232,7 +3232,7 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::swim_endpoint::EndpointResolutionFailure;
+    use crate::{signals::PeerTrustMode as SignalPeerTrustMode, swim_endpoint::EndpointResolutionFailure};
 
     fn seed_addr(value: &str) -> SocketAddr {
         value.parse().unwrap_or_else(|_| std::process::abort())
@@ -3311,7 +3311,7 @@ mod tests {
     #[test]
     fn peer_identity_uses_swim_site_id_for_network_prefixed_grid_site() {
         let site = peer_grid_site("net-pool-b", Some("pool-b"), &["AB"]);
-        let records = peer_identities(&[site], signals::PeerTrustMode::Pin);
+        let records = peer_identities(&[site], SignalPeerTrustMode::Pin);
         let identities = signals::PeerIdentities::new();
         identities.set(records);
 
