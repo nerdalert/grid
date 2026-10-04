@@ -331,6 +331,7 @@ pub fn spawn_grid_routing(config: &GridServingConfig) -> Result<GridRuntime, Fil
 }
 
 /// Build the runtime over `start`, the peer poller constructor.
+#[cfg(test)]
 pub(crate) fn start_runtime(
     config: &GridServingConfig,
     start: crate::control::StartPeer,

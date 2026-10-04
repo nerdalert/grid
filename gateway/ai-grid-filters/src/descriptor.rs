@@ -206,6 +206,7 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
 /// [`FilterError`] if the list exceeds [`MAX_CANDIDATES`], any
 /// name/site/cluster field is blank or oversized, or a duplicate
 /// (kind, name, site, cluster) tuple exists.
+#[cfg(test)]
 pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
     validate_candidates_with_empty(raw, false)
 }

@@ -228,6 +228,7 @@ pub(crate) struct Control {
 
 impl Control {
     /// Build the control plane for `config` without starting any poller.
+    #[cfg(test)]
     pub(crate) fn new(config: &GridServingConfig, start: StartPeer) -> Result<Self, FilterError> {
         Self::new_with_backend_tls(config, start, BTreeMap::new())
     }
@@ -810,6 +811,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: "llama".to_owned(),
             site: site.to_owned(),
+            stable_id: None,
         }
     }
 
@@ -1375,6 +1377,18 @@ mod tests {
         eventually("the rewrite handled", || counts().applied() == 1);
         assert_eq!(sites(&snapshot.load()), ["east", "west"], "the rewrite applied");
         eventually("west polled", || peers.fetches("west") > 0);
+
+        write(&yaml(&[]));
+        eventually("the no-route revision applied", || counts().applied() == 2);
+        assert!(snapshot.load().candidates.is_empty(), "the final withdrawal is serving");
+
+        write("local_site: [not, a, site\n");
+        eventually("the malformed revision rejected", || counts().rejected() == 2);
+        assert!(snapshot.load().candidates.is_empty(), "malformed updates retain the no-route revision");
+
+        write(&yaml(&["east"]));
+        eventually("the restored route applied", || counts().applied() == 3);
+        assert_eq!(sites(&snapshot.load()), ["east"], "restoration resumes routing");
 
         drop(grid);
         std::fs::remove_file(&path).expect("cleanup");

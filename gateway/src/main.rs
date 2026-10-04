@@ -238,31 +238,45 @@ const SERVING_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Minimal view of a load-balancer cluster for provider-hop trust validation.
 #[derive(Deserialize)]
 struct LoadBalancerBackends {
+    /// Configured cluster entries.
     clusters: Vec<BackendCluster>,
 }
 
+/// One upstream cluster.
 #[derive(Deserialize)]
 struct BackendCluster {
+    /// Cluster identifier.
     name: String,
+    /// TLS settings, absent for plaintext.
     tls: Option<BackendTls>,
 }
 
+/// TLS properties required for an authenticated provider hop.
 #[derive(Deserialize)]
 struct BackendTls {
+    /// Expected server name.
     sni: String,
+    /// Certificate verification switch.
     verify: bool,
+    /// Trusted CA bundle.
     ca: Option<BackendCa>,
+    /// Mutual-TLS client identity.
     client_cert: Option<BackendClientCert>,
 }
 
+/// CA trust input used by the load balancer.
 #[derive(Deserialize)]
 struct BackendCa {
+    /// CA certificate path.
     ca_path: String,
 }
 
+/// Client identity used by the load balancer.
 #[derive(Deserialize)]
 struct BackendClientCert {
+    /// Client certificate path.
     cert_path: String,
+    /// Client private key path.
     key_path: String,
 }
 
@@ -272,12 +286,20 @@ fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, String>, pr
     let mut backends = BTreeMap::new();
     let mut unverified = BTreeSet::new();
     for chain in &config.filter_chains {
-        if !chain.filters.iter().any(|filter| filter.filter_type == "grid_site_route") {
+        if !chain
+            .filters
+            .iter()
+            .any(|filter| filter.filter_type == "grid_site_route")
+        {
             continue;
         }
-        for filter in chain.filters.iter().filter(|filter| filter.filter_type == "load_balancer") {
-            let parsed: LoadBalancerBackends = serde_yaml::from_value(filter.config.clone())
-                .map_err(|error| -> praxis_filter::FilterError {
+        for filter in chain
+            .filters
+            .iter()
+            .filter(|filter| filter.filter_type == "load_balancer")
+        {
+            let parsed: LoadBalancerBackends =
+                serde_yaml::from_value(filter.config.clone()).map_err(|error| -> praxis_filter::FilterError {
                     format!("grid: parsing load_balancer backends: {error}").into()
                 })?;
             for backend in parsed.clusters {
@@ -333,6 +355,7 @@ fn config_arg<I: IntoIterator<Item = String>>(args: I) -> Result<Option<String>,
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test fixtures use checked parsing")]
 mod tests {
     use std::ffi::OsStr;
 
