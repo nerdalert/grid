@@ -335,6 +335,9 @@ spec:
                                 description: Enable delegated mount reconciliation. Defaults to `false`.
                                 type: boolean
                             type: object
+                            x-kubernetes-validations:
+                              - message: deploymentName is required when mount reconciliation is enabled
+                                rule: '!has(self.enabled) || !self.enabled || has(self.deploymentName)'
                           telemetry:
                             description: |-
                               Optional OpenTelemetry exporter and sampling settings for this gateway.

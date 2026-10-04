@@ -111,8 +111,8 @@ pub enum ConsumerConfigError {
     #[error("overlay has no inference_model candidates for the consumer pipeline")]
     NoInferenceCandidates,
 
-    /// A `mutual_tls` cluster endpoint has no SNI (or blank SNI).
-    #[error("mutual_tls transport for cluster {cluster:?} requires a non-blank sni")]
+    /// A TLS cluster endpoint has no SNI (or blank SNI).
+    #[error("TLS transport for cluster {cluster:?} requires a non-blank sni")]
     MissingSni {
         /// Cluster name with missing SNI.
         cluster: String,
@@ -480,7 +480,10 @@ fn render_no_provider_praxis_config(
 /// Only credential-bearing candidates whose site is this gateway's local site
 /// produce backend credential requirements. Mutual TLS requirements are added
 /// only for candidate clusters that the generated load balancer actually uses.
-#[expect(clippy::too_many_arguments, reason = "all render inputs are explicit API fields")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "render inputs include the delegated-mount ownership decision"
+)]
 #[expect(
     clippy::too_many_lines,
     reason = "configuration and mount requirements are derived from one candidate pass"
@@ -494,6 +497,7 @@ pub(crate) fn render_consumer_config(
     tls: &TlsConfig,
     gateway_name: &str,
     telemetry: Option<&GatewayTelemetryConfig>,
+    delegated_mounts: bool,
 ) -> Result<ConsumerRenderResult, ConsumerConfigError> {
     let inference_candidates: Vec<&RoutingCandidate> = overlay
         .candidates
@@ -547,6 +551,8 @@ pub(crate) fn render_consumer_config(
     });
     if needs_mutual_tls {
         validate_absolute_normalized_path(tls_cert_mount_path)?;
+    }
+    if needs_mutual_tls && delegated_mounts {
         let ca_ref = tls
             .ca_secret_ref
             .as_ref()
@@ -1233,6 +1239,7 @@ mod tests {
             &TlsConfig::default(),
             "grid-a",
             None,
+            false,
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -1262,6 +1269,7 @@ mod tests {
             &TlsConfig::default(),
             "gateway",
             None,
+            false,
         )
         .unwrap_or_else(|_| std::process::abort());
         let parsed: serde_yaml::Value =
@@ -1325,6 +1333,7 @@ mod tests {
             &tls,
             "gateway",
             None,
+            true,
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -1357,6 +1366,41 @@ mod tests {
             2,
             "both source Secrets project into one stable volume"
         );
+    }
+
+    #[test]
+    fn owner_managed_mutual_tls_mounts_do_not_require_grid_secret_references() {
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "model",
+            "site-a",
+            "peer",
+            true,
+        )]);
+        let endpoint = ClusterEndpointConfig {
+            cluster: "peer".to_owned(),
+            address: "peer.example:8443".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::MutualTls,
+                sni: Some("peer.grid.internal".to_owned()),
+                ca_secret_ref: None,
+            }),
+        };
+        let rendered = render_consumer_config(
+            &overlay,
+            MOUNT_BASE,
+            &[endpoint],
+            "/etc/praxis/tls",
+            8080,
+            &TlsConfig::default(),
+            "gateway",
+            false,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert!(rendered.requirements.is_empty());
+        assert!(rendered.config_yaml.contains("/etc/praxis/tls/ca.crt"));
+        assert!(rendered.config_yaml.contains("/etc/praxis/tls/tls.key"));
     }
 
     #[test]
@@ -1394,6 +1438,7 @@ mod tests {
             &TlsConfig::default(),
             "gateway",
             None,
+            false,
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -1427,6 +1472,7 @@ mod tests {
             &TlsConfig::default(),
             "gateway",
             None,
+            false,
         );
         assert!(matches!(result, Err(ConsumerConfigError::MountPathConflict { .. })));
     }
@@ -1446,6 +1492,7 @@ mod tests {
             &TlsConfig::default(),
             "gateway",
             None,
+            false,
         );
         assert!(matches!(result, Err(ConsumerConfigError::MountPathConflict { .. })));
     }
