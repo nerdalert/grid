@@ -1221,22 +1221,8 @@ mod tests {
 
     #[test]
     fn owner_managed_mutual_tls_mounts_do_not_require_grid_secret_references() {
-        let overlay = simple_overlay(vec![plain_candidate(
-            "inference_model",
-            "model",
-            "site-a",
-            "peer",
-            true,
-        )]);
-        let endpoint = ClusterEndpointConfig {
-            cluster: "peer".to_owned(),
-            address: "peer.example:8443".to_owned(),
-            transport: Some(EndpointTransport {
-                mode: TransportMode::MutualTls,
-                sni: Some("peer.grid.internal".to_owned()),
-                ca_secret_ref: None,
-            }),
-        };
+        let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "site-a", "peer", true)]);
+        let endpoint = mtls_ep("peer", "peer.example:8443", "peer.grid.internal");
         let rendered = render_consumer_config(
             &overlay,
             MOUNT_BASE,
@@ -1249,9 +1235,18 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
 
-        assert!(rendered.requirements.is_empty());
-        assert!(rendered.config_yaml.contains("/etc/praxis/tls/ca.crt"));
-        assert!(rendered.config_yaml.contains("/etc/praxis/tls/tls.key"));
+        assert!(
+            rendered.requirements.is_empty(),
+            "owner-managed mTLS mounts must not require Grid Secret references"
+        );
+        assert!(
+            rendered.config_yaml.contains("/etc/praxis/tls/ca.crt"),
+            "owner-managed mTLS must still render the CA certificate path"
+        );
+        assert!(
+            rendered.config_yaml.contains("/etc/praxis/tls/tls.key"),
+            "owner-managed mTLS must still render the client key path"
+        );
     }
 
     #[test]
