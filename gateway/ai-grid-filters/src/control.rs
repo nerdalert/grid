@@ -1384,7 +1384,10 @@ mod tests {
 
         write("local_site: [not, a, site\n");
         eventually("the malformed revision rejected", || counts().rejected() == 2);
-        assert!(snapshot.load().candidates.is_empty(), "malformed updates retain the no-route revision");
+        assert!(
+            snapshot.load().candidates.is_empty(),
+            "malformed updates retain the no-route revision"
+        );
 
         write(&yaml(&["east"]));
         eventually("the restored route applied", || counts().applied() == 3);
