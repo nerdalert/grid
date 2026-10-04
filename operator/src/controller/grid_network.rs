@@ -4454,10 +4454,6 @@ fn log_capacity_changes(logged: &ChangeLog, network: &str, providers: &[Inferenc
 /// advances on spec and status writes, and falls back to `metadata.generation`
 /// when no parseable resource version is present.  Equal revisions break ties
 /// via `writer_id`, which is the advertising SWIM site identity.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the provider-to-CRDT mapping keeps every advertised field derived from one source object"
-)]
 fn provider_state_from_kube(
     provider: &InferenceProvider,
     network_id: &str,
