@@ -2964,7 +2964,7 @@ fn read_dynamic_overlay(cluster: &str) -> Result<DynamicOverlaySnapshot, Box<dyn
 fn parse_dynamic_overlay_json(bytes: &[u8]) -> Result<DynamicOverlaySnapshot, Box<dyn std::error::Error>> {
     let configmap: serde_json::Value = serde_json::from_slice(bytes)?;
     let semantic_revision = configmap
-        .pointer("/metadata/annotations/grid.praxis-proxy.io~1overlay-revision")
+        .pointer("/metadata/annotations/grid.praxis.fast~1overlay-revision")
         .and_then(serde_json::Value::as_str)
         .ok_or("overlay semantic revision missing")?
         .to_owned();
@@ -8558,7 +8558,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         let json = serde_json::json!({
             "metadata": {
                 "resourceVersion": "55",
-                "annotations": {"grid.praxis-proxy.io/overlay-revision": "sha256:revision"}
+                "annotations": {"grid.praxis.fast/overlay-revision": "sha256:revision"}
             },
             "data": {"routing-config.json": serde_json::json!({
                 "selection_policy": {"mode": "weightedRandom"},
@@ -8578,7 +8578,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         let empty = serde_json::json!({
             "metadata": {
                 "resourceVersion": "56",
-                "annotations": {"grid.praxis-proxy.io/overlay-revision": "sha256:empty-revision"}
+                "annotations": {"grid.praxis.fast/overlay-revision": "sha256:empty-revision"}
             },
             "data": {"routing-config.json": serde_json::json!({
                 "selection_policy": {"mode": "weightedRandom"},
