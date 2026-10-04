@@ -31,7 +31,7 @@ on:
           - full
 
 concurrency:
-  group: grid-triggered-integration-${{ inputs.pr_number || inputs.branch || 'main' }}-${{ inputs.mode }}
+  group: grid-triggered-integration-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ inputs.mode }}
   cancel-in-progress: true
 
 permissions: {}
