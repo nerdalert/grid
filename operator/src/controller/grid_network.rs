@@ -1395,10 +1395,7 @@ async fn reconcile_routing_overlay_inner(
         ));
         placement::fresh_signal_values(&local, &peers, metric, now_ms, max_age)
     });
-    let signal_origin_site = ctx
-        .swim
-        .as_ref()
-        .map_or_else(String::new, |swim| swim.site_name().to_owned());
+    let signal_origin_site = ctx.swim().map_or_else(String::new, |swim| swim.site_name().to_owned());
 
     if pressure_config.is_some() {
         let active_state_keys: BTreeSet<String> = network
@@ -1542,12 +1539,7 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
-        let rendered_at = stable_rendered_at(
-            find_prior_overlay(network, gw_ref),
-            &render.revision_hex,
-            &resource_version,
-            &render.rendered_at,
-        );
+        let rendered_at = render.rendered_at.clone();
         overlay_statuses.push(distributed_overlay_status(
             gw_ref,
             render,
@@ -1598,9 +1590,6 @@ async fn reconcile_routing_overlay_inner(
         serving_retry,
     })
 }
-
-/// Overlay status reason while a gateway has no candidates.
-const EMPTY_CANDIDATES: &str = "EmptyCandidates";
 
 /// What one routing overlay pass produced, per gateway.
 struct OverlayOutcome {
@@ -1714,16 +1703,6 @@ async fn apply_serving_config(
     source.gate.record(&key, now);
     info!(cm_name = %name, digest = %serving_config::digest(&text), "applied grid serving config");
     Ok(None)
-}
-
-/// Whether the last recorded status for this gateway already had no candidates.
-fn already_empty(network: &GridNetwork, gw_ref: &GatewayRef) -> bool {
-    network.status.as_ref().is_some_and(|status| {
-        status
-            .overlay_status
-            .iter()
-            .any(|e| e.gateway_name == gw_ref.name && e.namespace == gw_ref.namespace && e.reason == EMPTY_CANDIDATES)
-    })
 }
 
 /// Find the last successfully distributed overlay status for a gateway.
@@ -3440,31 +3419,6 @@ mod tests {
             "spec": { "seeds": [], "gridId": "test-id" }
         }))
         .unwrap_or_else(|_| std::process::abort())
-    }
-
-    #[test]
-    fn empty_overlay_warns_only_on_entering_the_state() {
-        let gw: GatewayRef = serde_json::from_value(serde_json::json!({"name": "gw", "namespace": "ns"}))
-            .unwrap_or_else(|_| std::process::abort());
-        let with_reason = |reason: &str| {
-            let mut network = base_network();
-            network.status = Some(
-                serde_json::from_value(serde_json::json!({"overlayStatus": [{
-                    "gatewayName": "gw", "namespace": "ns", "configMapName": "c", "schemaVersion": "v",
-                    "renderedRevision": "r", "distributedRevision": "r", "contentDigest": "r", "reason": reason,
-                }]}))
-                .unwrap_or_else(|_| std::process::abort()),
-            );
-            network
-        };
-        let cases = [
-            ("no status yet", base_network(), false),
-            ("was distributed", with_reason(""), false),
-            ("was already empty", with_reason("EmptyCandidates"), true),
-        ];
-        for (label, network, want) in cases {
-            assert_eq!(already_empty(&network, &gw), want, "{label}");
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -5552,17 +5506,31 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_empty_candidates_overlay_writes_no_status() {
+    fn unchanged_retained_overlay_writes_no_status() {
         let gw = make_gw_ref("gw", "grid-system");
         let mut network = network_with_overlay(rendered_overlay_status(&gw));
         let first_render = make_render_result(&"c".repeat(64), 0);
-        let first = retained_overlay_status(&network, &gw, 4, Some(&first_render), EMPTY_CANDIDATES, "no candidates");
+        let first = retained_overlay_status(
+            &network,
+            &gw,
+            4,
+            Some(&first_render),
+            "OverlayApplyFailed",
+            "apply failed",
+        );
         let first = desired_with_overlay(&network, first);
         network.status = Some(first.clone());
         let mut next_render = make_render_result(&"c".repeat(64), 0);
         FRESH.clone_into(&mut next_render.rendered_at);
 
-        let next = retained_overlay_status(&network, &gw, 4, Some(&next_render), EMPTY_CANDIDATES, "no candidates");
+        let next = retained_overlay_status(
+            &network,
+            &gw,
+            4,
+            Some(&next_render),
+            "OverlayApplyFailed",
+            "apply failed",
+        );
         let desired = desired_with_overlay(&network, next);
 
         assert_eq!(only_overlay(&desired).rendered_at, only_overlay(&first).rendered_at);
@@ -5574,12 +5542,26 @@ mod tests {
         let gw = make_gw_ref("gw", "grid-system");
         let mut network = base_network();
         let first_render = make_render_result(&"c".repeat(64), 0);
-        let first = retained_overlay_status(&network, &gw, 1, Some(&first_render), EMPTY_CANDIDATES, "no candidates");
+        let first = retained_overlay_status(
+            &network,
+            &gw,
+            1,
+            Some(&first_render),
+            "OverlayApplyFailed",
+            "apply failed",
+        );
         network.status = Some(desired_with_overlay(&network, first));
         let mut next_render = make_render_result(&"c".repeat(64), 0);
         FRESH.clone_into(&mut next_render.rendered_at);
 
-        let next = retained_overlay_status(&network, &gw, 1, Some(&next_render), EMPTY_CANDIDATES, "no candidates");
+        let next = retained_overlay_status(
+            &network,
+            &gw,
+            1,
+            Some(&next_render),
+            "OverlayApplyFailed",
+            "apply failed",
+        );
         let desired = desired_with_overlay(&network, next);
 
         assert_eq!(only_overlay(&desired).phase, OverlayPhase::Error);
@@ -5605,8 +5587,8 @@ mod tests {
         };
         let new_reason = OverlayRevisionStatus {
             phase: OverlayPhase::Retained,
-            reason: EMPTY_CANDIDATES.to_owned(),
-            message: "no candidates".to_owned(),
+            reason: "OverlayApplyFailed".to_owned(),
+            message: "apply failed".to_owned(),
             rendered_at: FRESH.to_owned(),
             ..prior
         };
