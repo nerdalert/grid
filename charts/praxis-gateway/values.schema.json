@@ -188,8 +188,8 @@
             "serviceName": { "type": "string", "pattern": "^(|.*\\S.*)$", "description": "OpenTelemetry service.name resource attribute." },
             "serviceVersion": { "type": "string", "pattern": "^(|.*\\S.*)$", "description": "OpenTelemetry service.version resource attribute." },
             "environment": { "type": "string", "pattern": "^(|.*\\S.*)$", "description": "deployment.environment resource attribute." },
-            "batchIntervalSecs": { "type": ["integer", "null"], "minimum": 1, "description": "Positive batch exporter interval in seconds." },
-            "batchSize": { "type": ["integer", "null"], "minimum": 1, "description": "Positive maximum spans per export batch." }
+            "batchIntervalSecs": { "type": ["integer", "null"], "minimum": 1, "maximum": 300, "description": "Positive batch exporter interval in seconds." },
+            "batchSize": { "type": ["integer", "null"], "minimum": 1, "maximum": 65536, "description": "Positive maximum spans per export batch." }
           }
         }
       }

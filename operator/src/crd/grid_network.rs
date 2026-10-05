@@ -852,6 +852,11 @@ pub struct ConsumerConfig {
     pub telemetry: Option<GatewayTelemetryConfig>,
 }
 
+/// Maximum batch interval accepted by Praxis telemetry configuration.
+const MAX_TELEMETRY_BATCH_INTERVAL_SECS: u64 = 300;
+/// Maximum batch size accepted by Praxis telemetry configuration.
+const MAX_TELEMETRY_BATCH_SIZE: usize = 65_536;
+
 /// Validated OpenTelemetry settings rendered into operator-generated Praxis YAML.
 ///
 /// Secret material is intentionally not part of this type. Supply collector
@@ -889,13 +894,13 @@ pub struct GatewayTelemetryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
 
-    /// Batch exporter interval in seconds. Must be positive when set.
-    #[schemars(range(min = 1))]
+    /// Batch exporter interval in seconds. Must be in the inclusive range 1–300 when set.
+    #[schemars(range(min = 1, max = 300))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_interval_secs: Option<u64>,
 
-    /// Maximum spans per export batch. Must be positive when set.
-    #[schemars(range(min = 1))]
+    /// Maximum spans per export batch. Must be in the inclusive range 1–65,536 when set.
+    #[schemars(range(min = 1, max = 65_536))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<usize>,
 }
@@ -905,8 +910,8 @@ impl GatewayTelemetryConfig {
     ///
     /// # Errors
     ///
-    /// Returns an explanatory message for empty strings, invalid sampling
-    /// rates, or zero-valued batch settings.
+    /// Returns an explanatory message for invalid strings, sampling rates, or
+    /// batch settings outside their supported ranges.
     #[expect(
         clippy::too_many_lines,
         reason = "validates all telemetry settings before CRD rendering"
@@ -935,11 +940,21 @@ impl GatewayTelemetryConfig {
         {
             return Err("telemetry.samplingRate must be between 0.0 and 1.0".to_owned());
         }
-        if self.batch_interval_secs == Some(0) {
-            return Err("telemetry.batchIntervalSecs must be greater than zero".to_owned());
+        if self
+            .batch_interval_secs
+            .is_some_and(|seconds| !(1..=MAX_TELEMETRY_BATCH_INTERVAL_SECS).contains(&seconds))
+        {
+            return Err(format!(
+                "telemetry.batchIntervalSecs must be between 1 and {MAX_TELEMETRY_BATCH_INTERVAL_SECS}"
+            ));
         }
-        if self.batch_size == Some(0) {
-            return Err("telemetry.batchSize must be greater than zero".to_owned());
+        if self
+            .batch_size
+            .is_some_and(|size| !(1..=MAX_TELEMETRY_BATCH_SIZE).contains(&size))
+        {
+            return Err(format!(
+                "telemetry.batchSize must be between 1 and {MAX_TELEMETRY_BATCH_SIZE}"
+            ));
         }
         for (field, value) in [
             ("serviceName", self.service_name.as_deref()),
@@ -1747,6 +1762,45 @@ mod tests {
             empty_endpoint.validate().is_ok(),
             "an empty endpoint must use the deployment environment fallback"
         );
+    }
+
+    #[test]
+    fn telemetry_batch_bounds_appear_in_crd_schema() {
+        let crd = crd_json();
+        let properties = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties/consumerConfig/properties/telemetry/properties",
+            )
+            .unwrap_or_else(|| std::process::abort());
+
+        for (field, maximum) in [("batchIntervalSecs", 300.0), ("batchSize", 65_536.0)] {
+            let schema = properties.get(field).unwrap_or_else(|| std::process::abort());
+            assert_eq!(
+                schema.get("minimum").and_then(serde_json::Value::as_f64),
+                Some(1.0),
+                "{field} CRD schema must enforce the inclusive lower bound"
+            );
+            assert_eq!(
+                schema.get("maximum").and_then(serde_json::Value::as_f64),
+                Some(maximum),
+                "{field} CRD schema must enforce the inclusive upper bound"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_batch_bounds_are_enforced_at_runtime() {
+        for (field, maximum) in [("batchIntervalSecs", 300_u64), ("batchSize", 65_536_u64)] {
+            for (value, expected_valid) in [(0, false), (1, true), (maximum, true), (maximum + 1, false)] {
+                let telemetry = serde_json::from_value::<GatewayTelemetryConfig>(serde_json::json!({(field): value}))
+                    .unwrap_or_else(|_| std::process::abort());
+                assert_eq!(
+                    telemetry.validate().is_ok(),
+                    expected_valid,
+                    "{field}={value} runtime validation mismatch"
+                );
+            }
+        }
     }
 
     #[test]

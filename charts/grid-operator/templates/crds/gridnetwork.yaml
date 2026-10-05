@@ -299,14 +299,16 @@ spec:
                             nullable: true
                             properties:
                               batchIntervalSecs:
-                                description: Batch exporter interval in seconds. Must be positive when set.
+                                description: Batch exporter interval in seconds. Must be in the inclusive range 1–300 when set.
                                 format: uint64
+                                maximum: 300.0
                                 minimum: 1.0
                                 nullable: true
                                 type: integer
                               batchSize:
-                                description: Maximum spans per export batch. Must be positive when set.
+                                description: Maximum spans per export batch. Must be in the inclusive range 1–65,536 when set.
                                 format: uint
+                                maximum: 65536.0
                                 minimum: 1.0
                                 nullable: true
                                 type: integer

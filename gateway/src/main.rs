@@ -19,6 +19,10 @@ use tracing::info;
 
 /// Log line emitted once tracing is up; the startup test waits for it.
 const STARTUP_MESSAGE: &str = "starting grid-gateway";
+/// OTel-standard environment variable used as the OTLP endpoint fallback.
+const OTLP_ENDPOINT_ENV_VAR: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+/// OTel-standard environment variable containing exporter headers.
+const OTLP_HEADERS_ENV_VAR: &str = "OTEL_EXPORTER_OTLP_HEADERS";
 
 fn main() -> ExitCode {
     // Install the crypto provider before anything builds a TLS config.
@@ -35,6 +39,8 @@ fn main() -> ExitCode {
         .unwrap_or_else(|err| praxis::fatal(&err));
     let config = praxis::with_bootstrap_logging(|| Config::from_config_file_or(config_file.as_ref(), DEFAULT_CONFIG))
         .unwrap_or_else(|err| praxis::fatal(&err));
+
+    validate_otlp_endpoint_transport(&config).unwrap_or_else(|err| praxis::fatal(&err));
 
     // Without a subscriber every log line, including reload results, is dropped.
     let tracing_guard = praxis::init_tracing(&config).unwrap_or_else(|err| praxis::fatal(&err));
@@ -67,6 +73,45 @@ fn main() -> ExitCode {
     // The Praxis guard shuts down the OTLP provider and flushes queued spans.
     drop(tracing_guard);
     exit_code
+}
+
+/// Refuse to send configured OTLP headers to an unencrypted HTTP endpoint.
+///
+/// Praxis resolves the endpoint and headers from config first, then environment
+/// variables. Validate the same effective values before initializing its
+/// exporter so Secret-backed `OTEL_EXPORTER_OTLP_HEADERS` cannot be sent in
+/// cleartext through either endpoint source.
+fn validate_otlp_endpoint_transport(config: &Config) -> Result<(), &'static str> {
+    let environment_endpoint = std::env::var(OTLP_ENDPOINT_ENV_VAR).ok();
+    let environment_headers_present = std::env::var_os(OTLP_HEADERS_ENV_VAR).is_some_and(|value| !value.is_empty());
+    let configured_headers_present = config.telemetry.otlp_headers.as_ref().map(|headers| !headers.is_empty());
+
+    validate_otlp_endpoint_transport_values(
+        config.telemetry.otlp_endpoint.as_deref(),
+        environment_endpoint.as_deref(),
+        configured_headers_present,
+        environment_headers_present,
+    )
+}
+
+/// Validate endpoint/header pairs using Praxis's config-before-environment precedence.
+fn validate_otlp_endpoint_transport_values(
+    configured_endpoint: Option<&str>,
+    environment_endpoint: Option<&str>,
+    configured_headers_present: Option<bool>,
+    environment_headers_present: bool,
+) -> Result<(), &'static str> {
+    let endpoint = configured_endpoint.or_else(|| environment_endpoint.filter(|value| !value.trim().is_empty()));
+    let headers_present = configured_headers_present.unwrap_or(environment_headers_present);
+    let endpoint_uses_http = endpoint
+        .and_then(|value| value.trim().split_once("://"))
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http"));
+
+    if headers_present && endpoint_uses_http {
+        return Err("OTLP exporter headers require HTTPS; refusing to send OTLP credentials over HTTP");
+    }
+
+    Ok(())
 }
 
 /// Start the cross-site pollers and register `grid_site_route` over their snapshot.
@@ -120,7 +165,7 @@ fn config_arg<I: IntoIterator<Item = String>>(args: I) -> Result<Option<String>,
 
 #[cfg(test)]
 mod tests {
-    use super::{USAGE, config_arg};
+    use super::{USAGE, config_arg, validate_otlp_endpoint_transport_values};
 
     fn parse(args: &[&str]) -> Result<Option<String>, String> {
         config_arg(args.iter().map(|arg| (*arg).to_owned()))
@@ -156,5 +201,62 @@ mod tests {
         ] {
             assert_eq!(parse(args), Err(USAGE.to_owned()), "{args:?}");
         }
+    }
+
+    #[test]
+    fn rejects_http_endpoint_when_otlp_headers_are_configured() {
+        assert!(
+            validate_otlp_endpoint_transport_values(Some("http://collector:4317"), None, Some(true), false).is_err(),
+            "an explicitly configured HTTP endpoint must not receive headers"
+        );
+    }
+
+    #[test]
+    fn rejects_http_environment_fallback_when_otlp_headers_are_configured() {
+        assert!(
+            validate_otlp_endpoint_transport_values(None, Some("http://collector:4317"), None, true).is_err(),
+            "the OTEL_EXPORTER_OTLP_ENDPOINT fallback must not receive headers over HTTP"
+        );
+    }
+
+    #[test]
+    fn accepts_https_endpoints_with_otlp_headers() {
+        for (configured, fallback, configured_headers, environment_headers) in [
+            (Some("https://collector:4317"), None, Some(true), false),
+            (None, Some("https://collector:4317"), None, true),
+        ] {
+            assert!(
+                validate_otlp_endpoint_transport_values(
+                    configured,
+                    fallback,
+                    configured_headers,
+                    environment_headers,
+                )
+                .is_ok(),
+                "HTTPS endpoints must remain usable with headers"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_http_behavior_when_otlp_headers_are_absent() {
+        assert!(
+            validate_otlp_endpoint_transport_values(Some("http://collector:4317"), None, None, false).is_ok(),
+            "HTTP without exporter headers remains supported"
+        );
+    }
+
+    #[test]
+    fn configured_endpoint_takes_precedence_over_environment_fallback() {
+        assert!(
+            validate_otlp_endpoint_transport_values(
+                Some("https://configured:4317"),
+                Some("http://fallback:4317"),
+                None,
+                true,
+            )
+            .is_ok(),
+            "an unused HTTP fallback must not reject the configured HTTPS endpoint"
+        );
     }
 }
