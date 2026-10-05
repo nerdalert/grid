@@ -41,15 +41,34 @@ configurations, Services, and credential mounts. Dedicated clusters are
 recommended when provider credentials, private backends, compliance ownership,
 or failure and scaling budgets need an independent infrastructure boundary.
 This is a topology recommendation, not a requirement that every role run in a
-different cluster.
+different cluster. A combined site can run both roles in one cluster with
+separate gateway Deployments and policy; it shares a cluster control plane and
+failure domain, so it does not provide the isolation of dedicated clusters.
+Neither layout by itself supplies complete tenant isolation; the
+deployment owner must provide the surrounding identity, authorization, Secret,
+and network controls. See [auth and policy](architecture/auth.md) and
+[deployment topologies](architecture/overview.md#deployment-topologies).
 
-A combined site can run both roles in one cluster using separate gateway
-Deployments and policy. It shares a cluster control plane and failure domain,
-so it does not provide the isolation of dedicated clusters. Neither layout by
-itself supplies complete tenant isolation; the deployment owner must provide
-the surrounding identity, authorization, Secret, and network controls. See
-[deployment topologies](architecture/overview.md#deployment-topologies) and
-[auth and policy](architecture/auth.md).
+## Helm Charts
+
+Grid separates the operator and gateway workloads into independent Helm
+releases:
+
+| Chart | Use | Boundary |
+| --- | --- | --- |
+| [`grid-operator`](../charts/grid-operator/README.md) | Deploys the Grid control-plane operator and, by default, its CRDs. With `grid.id`, it can also render the GridNetwork, this site's GridSite, and InferenceProviders. | It reconciles Grid resources and references gateway Services; it does not create Praxis gateway Deployments. Set `crds.enabled: false` when a platform manages the CRDs. |
+| [`praxis-gateway`](../charts/praxis-gateway/README.md) | Deploys a Praxis gateway as its own Deployment and Service; usable standalone or as a Grid consumer/provider gateway. | Install separate releases with distinct configuration and Services for separate gateway roles. The chart does not require the operator or Grid CRDs for standalone use. |
+| [`grid-site` chart source](../charts/grid-site/Chart.yaml) | Alternative to the operator chart's `grid.*` values for rendering GridNetwork, GridSite, and InferenceProvider resources for a site. | The Grid CRDs must already be installed; this chart does not deploy the operator or gateway workloads. Use one rendering path for each set of resources. |
+| [`grid-enrollment`](../charts/grid-enrollment/README.md) | Optionally deploys the enrollment service and its supporting resources. | Enrollment is a site-identity bootstrap path; it does not provision clusters, models, or gateways. |
+
+Check each chart's version and upgrade guidance before rollout. The operator
+chart does not promise a general migration path; its CRD API-group migration
+requires a fresh install.
+
+The charts package component workloads and Kubernetes resources; they do not
+provision inter-cluster networking or provider models, integrate tenant/user
+identity, or provide public ingress. The [existing-cluster installation guide](installation/existing-clusters.md)
+shows a Helm-based setup and deployment-owner responsibilities.
 
 ## Adjacent Platform Capabilities
 
