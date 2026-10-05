@@ -84,7 +84,11 @@ fn main() -> ExitCode {
 fn validate_otlp_endpoint_transport(config: &Config) -> Result<(), &'static str> {
     let environment_endpoint = std::env::var(OTLP_ENDPOINT_ENV_VAR).ok();
     let environment_headers_present = std::env::var_os(OTLP_HEADERS_ENV_VAR).is_some_and(|value| !value.is_empty());
-    let configured_headers_present = config.telemetry.otlp_headers.as_ref().map(|headers| !headers.is_empty());
+    let configured_headers_present = config
+        .telemetry
+        .otlp_headers
+        .as_ref()
+        .map(|headers| !headers.is_empty());
 
     validate_otlp_endpoint_transport_values(
         config.telemetry.otlp_endpoint.as_deref(),
@@ -226,13 +230,8 @@ mod tests {
             (None, Some("https://collector:4317"), None, true),
         ] {
             assert!(
-                validate_otlp_endpoint_transport_values(
-                    configured,
-                    fallback,
-                    configured_headers,
-                    environment_headers,
-                )
-                .is_ok(),
+                validate_otlp_endpoint_transport_values(configured, fallback, configured_headers, environment_headers,)
+                    .is_ok(),
                 "HTTPS endpoints must remain usable with headers"
             );
         }

@@ -894,12 +894,12 @@ pub struct GatewayTelemetryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
 
-    /// Batch exporter interval in seconds. Must be in the inclusive range 1–300 when set.
+    /// Batch exporter interval in seconds. Must be from 1 through 300 when set.
     #[schemars(range(min = 1, max = 300))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_interval_secs: Option<u64>,
 
-    /// Maximum spans per export batch. Must be in the inclusive range 1–65,536 when set.
+    /// Maximum spans per export batch. Must be from 1 through 65,536 when set.
     #[schemars(range(min = 1, max = 65_536))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<usize>,

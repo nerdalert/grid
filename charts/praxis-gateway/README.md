@@ -210,7 +210,7 @@ Praxis AI image; these values may advance independently.
 | `gatewayConfig.telemetry.otlpEndpoint` | string | `""` | OTLP endpoint without URL userinfo, query, or fragment credentials. Omitted or empty uses `OTEL_EXPORTER_OTLP_ENDPOINT` from the container environment. If `OTEL_EXPORTER_OTLP_HEADERS` is set, the resolved endpoint must use HTTPS; the gateway refuses to send exporter headers over HTTP. |
 | `gatewayConfig.telemetry.samplingRate` | number | unset | Root sampling probability, from `0.0` through `1.0`. |
 | `gatewayConfig.telemetry.serviceName` / `serviceVersion` / `environment` | string | unset | OpenTelemetry resource attributes. |
-| `gatewayConfig.telemetry.batchIntervalSecs` / `batchSize` | int | unset | OTLP batch export interval from 1–300 seconds and maximum batch size from 1–65,536 spans. |
+| `gatewayConfig.telemetry.batchIntervalSecs` / `batchSize` | int | unset | OTLP batch export interval from 1 through 300 seconds and maximum batch size from 1 through 65,536 spans. |
 | `gatewayConfig.model` | string | **required** for a consumer without `gridServing` | Model advertised on the routing candidates. |
 | `gatewayConfig.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `gatewayConfig.backends[].site` | string | `localSite` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `localSite`. Its `transport.sni` defaults to `<site>.grid.internal`. |
