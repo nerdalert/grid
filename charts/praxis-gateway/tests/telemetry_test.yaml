@@ -17,7 +17,7 @@ tests:
           transport:
             mode: plaintext
       gatewayConfig.telemetry.enabled: true
-      gatewayConfig.telemetry.otlpEndpoint: http://otel-collector.observability:4317
+      gatewayConfig.telemetry.otlpEndpoint: https://otel-collector.observability:4317
       gatewayConfig.telemetry.samplingRate: 0.25
       gatewayConfig.telemetry.serviceName: grid-edge
       gatewayConfig.telemetry.batchIntervalSecs: 3
@@ -31,7 +31,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["praxis.yaml"]
-          pattern: "(?s)telemetry:\\n\\s+otlp_endpoint: \\\"http://otel-collector\\.observability:4317\\\".*sampling_rate: 0.25.*service_name: \\\"grid-edge\\\".*batch_interval_secs: 3.*batch_size: 32"
+          pattern: "(?s)telemetry:\\n\\s+otlp_endpoint: \\\"https://otel-collector\\.observability:4317\\\".*sampling_rate: 0.25.*service_name: \\\"grid-edge\\\".*batch_interval_secs: 3.*batch_size: 32"
       - matchRegex:
           path: data["praxis.yaml"]
           pattern: "(?s)filters:\\n\\s+- filter: trace_context"
