@@ -1424,6 +1424,7 @@ version = "0.1.4"
 dependencies = [
  "ai-grid-filters",
  "certs",
+ "opentelemetry-otlp",
  "praxis-ai-filters",
  "praxis-proxy",
  "praxis-proxy-core",
@@ -4646,6 +4647,7 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",

@@ -63,10 +63,24 @@ env:
         key: headers
 ```
 
-The Secret value uses the OpenTelemetry `key=value` header format. The operator
+The Secret value uses the OpenTelemetry `key=value` header format. Generic
+`OTEL_EXPORTER_OTLP_HEADERS`, trace-specific
+`OTEL_EXPORTER_OTLP_TRACES_HEADERS`, and configured `otlp_headers` all require
+an explicitly specified `https://` collector endpoint. A scheme-less endpoint
+is rejected when headers are present, regardless of the OTLP `INSECURE`
+environment settings. This gateway build supports OTLP/gRPC; it rejects
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` while the locked Praxis HTTP
+exporter and batch processor are incompatible. The operator
 only creates the consumer `ConfigMap`; the deployment manager must add the same
 Secret-backed environment reference to its gateway Deployment. Praxis redacts
 OTLP header values from its config debug representation.
+
+The HTTPS preflight protects exporter headers from plaintext transport; it
+does not prove certificate-verified delivery. Credentialed HTTPS export
+requires the Praxis trust fix in
+[praxis#1354](https://github.com/praxis-proxy/praxis/issues/1354), a Praxis
+release containing it, and the Grid qualification tracked in
+[Grid #301](https://github.com/praxis-proxy/grid/issues/301).
 
 Exporter setup runs once at process startup. Helm rolls gateway pods when its
 telemetry values change. An externally managed consumer Deployment must be
@@ -79,7 +93,7 @@ provider and flushes queued spans.
 
 The `grid-gateway` binary built by `deploy/gateway/Containerfile` enables the
 Praxis `otel` feature and the Praxis AI v0.4.1 `opentelemetry` feature. The
-tracked gateway lockfile currently resolves Praxis 0.7.1. Use an image built
+tracked gateway lockfile currently resolves Praxis 0.7.3. Use an image built
 from this Grid target, published as `ghcr.io/praxis-proxy/grid-gateway`, for
 this configuration. The chart's default `ghcr.io/praxis-proxy/ai:0.4.0` image
 does not include the Grid build features.
@@ -87,7 +101,7 @@ does not include the Grid build features.
 With the AI feature enabled, these short semantic spans are supported when the
 corresponding filters run:
 
-- HTTP server spans and `upstream_exchange` internal spans from Praxis 0.7.1.
+- HTTP server spans and `upstream_exchange` internal spans from Praxis 0.7.3.
 - `routing.select` from `intelligent_route`, including the serving overlay
   semantic revision when that revision is available to the filter.
 - `provider.route` from `provider_route`, including a validated edge overlay
@@ -101,7 +115,7 @@ served the request.
 
 ## Cross-gateway trace linkage
 
-Praxis 0.7.1 forwards W3C trace headers but does not connect them to the
+The locked Praxis 0.7.3 build forwards W3C trace headers but does not connect them to the
 exported HTTP server span or emit an exported HTTP client span for the upstream
 attempt. Edge and provider gateways therefore export separate local traces,
 even when the backend receives a forwarded `traceparent`. The routing spans
