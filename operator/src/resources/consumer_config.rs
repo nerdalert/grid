@@ -1025,7 +1025,7 @@ fn render_cluster_entry(
                 let key = ca_ref.key.as_deref().unwrap_or("ca.crt");
                 let path = backend_ca_file_path(&ca_ref.name, key);
                 let quoted_path = yaml_scalar(&path).unwrap_or_else(|_| "\"\"".to_owned());
-                format!("            ca:\n              ca_path: {quoted_path}\n")
+                format!("              ca:\n                ca_path: {quoted_path}\n")
             });
             Ok(format!(
                 "          - name: {quoted_name}\n\
@@ -1407,7 +1407,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "asserts generated TLS config and its matching projected CA requirement"
     )]
-    fn server_tls_backend_ca_is_rendered_and_reported_as_a_file_requirement() {
+    fn server_tls_backend_ca_is_rendered_and_reported_as_a_file_requirement() -> Result<(), serde_yaml::Error> {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
             "model",
@@ -1441,11 +1441,28 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
 
-        assert!(rendered.config_yaml.contains("filter: load_balancer"));
-        assert!(
-            rendered
-                .config_yaml
-                .contains("/run/secrets/grid-backend-ca/model-ca/ca.crt")
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&rendered.config_yaml)?;
+        let filters = parsed["filter_chains"][0]["filters"]
+            .as_sequence()
+            .unwrap_or_else(|| std::process::abort());
+        let load_balancer = filters
+            .iter()
+            .find(|filter| filter["filter"].as_str() == Some("load_balancer"))
+            .unwrap_or_else(|| std::process::abort());
+        let clusters = load_balancer["clusters"]
+            .as_sequence()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(clusters.len(), 1, "the TLS backend must render one cluster");
+        assert_eq!(clusters[0]["name"].as_str(), Some("backend"));
+        assert_eq!(
+            clusters[0]["tls"]["ca"]["ca_path"].as_str(),
+            Some("/run/secrets/grid-backend-ca/model-ca/ca.crt"),
+            "backend CA path must be nested under tls.ca"
+        );
+        assert_eq!(
+            clusters[0]["tls"]["sni"].as_str(),
+            Some("model.example"),
+            "backend SNI must be nested under tls"
         );
         assert_eq!(rendered.requirements.len(), 1);
         assert_eq!(rendered.requirements[0].purpose, MountPurpose::BackendCa);
@@ -1454,6 +1471,7 @@ mod tests {
             rendered.requirements[0].items[0].path,
             "/run/secrets/grid-backend-ca/model-ca/ca.crt"
         );
+        Ok(())
     }
 
     #[test]

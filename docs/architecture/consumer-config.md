@@ -46,8 +46,9 @@ Key differences:
 
 When `spec.gatewayRefs[].consumerConfig.enabled: true`, the `GridNetwork`
 controller renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace
-when the candidate overlay is nonempty and consumer configuration renders
-successfully. The generated config includes:
+when consumer configuration renders successfully. An empty candidate overlay
+produces a fail-closed 503-only config without route filters. For nonempty
+candidates, the generated config includes:
 
 **Validation status:** `verify-api-fallback-native` proves end-to-end runtime
 consumption of the operator-generated `ConfigMap`.  The xtask harness reads the
@@ -102,7 +103,7 @@ status reports the outcome under `status.consumerConfigStatus[]`.
 
 ### Delegated mount reconciliation
 
-Secret mount management remains opt in. Set
+Secret mount management remains opt-in. Set
 `consumerConfig.mountReconciliation.enabled: true` and name the exact Deployment
 and Praxis container. The operator verifies that the Deployment carries the
 matching explicit opt-in annotations and mounts the generated `praxis.yaml`
@@ -149,12 +150,15 @@ to reach available pods before applying the matching Praxis configuration.
 Then it rolls the Deployment for config changes and Secret resource-version
 changes. When a reference is removed, the old mount remains until pods with the
 new config are ready, then Grid removes only mounts recorded as Grid-owned.
-If the last provider disappears, the generated consumer config becomes a
-503-only response (with no `intelligent_route` filter); the config rollout
-completes before obsolete Grid-owned mounts are pruned. The last overlay
-ConfigMap revision remains distributed while candidates are empty because the
-Praxis route filter rejects an empty candidates array. Other Deployment fields,
-containers, volumes, mounts, and Helm resources are preserved.
+If the last provider disappears, the operator distributes an empty authoritative
+routing overlay and renders the generated consumer config as a 503-only response
+with no `intelligent_route` filter. For delegated mounts, the empty overlay is
+published before the 503-only config is reconciled, so consumers using the
+watched overlay stop selecting providers even if config reconciliation fails.
+A static-only consumer still needs the 503-only config to apply and reload.
+Obsolete Grid-owned mounts are pruned only after the matching config rollout is
+ready. Other Deployment fields, containers, volumes, mounts, and Helm resources
+are preserved.
 
 For delegated mounts, all credential, Grid CA, site identity, and custom backend
 CA Secrets must be in the gateway namespace. For server-authenticated `tls` endpoints,
@@ -289,11 +293,12 @@ Listener and other startup settings still require a restart. The routing
 overlay is a separate file that `intelligent_route` validates and reloads. See
 [Reload and rollout](#reload-and-rollout) below.
 
-When no inference candidates remain, the operator removes its generated static
-consumer `ConfigMap` so a future start cannot load stale routes. That deletion
-does not revoke routes already loaded by a running static-only consumer; use a
-rollout or explicit reload for that path. The dynamic overlay and grid serving
-config publish an empty authoritative candidate set and fail closed in process.
+When no inference candidates remain, the operator distributes an empty
+authoritative routing overlay and updates its generated consumer `ConfigMap` to
+a 503-only response with no `intelligent_route` filter. The ConfigMap update
+does not itself restart gateway pods; use a supported file reload or restart
+when the running gateway does not reload it. The empty overlay also fails closed
+for routes already using the dynamic overlay.
 
 ## Edge-ingress deployments
 

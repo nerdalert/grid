@@ -433,7 +433,7 @@ gateway's Service name. When using `fullnameOverride`, set
 
 ### Delegated consumer Secret mounts
 
-Consumer config and Secret mount reconciliation is opt in on both the
+Consumer config and Secret mount reconciliation is opt-in on both the
 `GridNetwork` and this chart. The `GatewayRef.name`, chart
 `mountReconciliation.gatewayRef`, chart Deployment name, and
 `consumerConfig.mountReconciliation.deploymentName` must agree. The operator
