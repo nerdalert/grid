@@ -541,7 +541,10 @@ pub(crate) fn render_consumer_config(
         )?;
     }
 
-    let used_clusters: BTreeSet<&str> = inference_candidates.iter().map(|candidate| candidate.cluster.as_str()).collect();
+    let used_clusters: BTreeSet<&str> = inference_candidates
+        .iter()
+        .map(|candidate| candidate.cluster.as_str())
+        .collect();
     let needs_mutual_tls = cluster_endpoints.iter().any(|endpoint| {
         used_clusters.contains(endpoint.cluster.as_str())
             && endpoint
@@ -1380,6 +1383,7 @@ mod tests {
             8080,
             &TlsConfig::default(),
             "gateway",
+            None,
             false,
         )
         .unwrap_or_else(|_| std::process::abort());

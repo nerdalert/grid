@@ -771,10 +771,7 @@ async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), Operat
 /// object outranks a discovered stub. `status` is deliberately not read: it is
 /// populated from gossip, and a member could advertise its own certificate under
 /// another site's name. The labels are the local object's for the same reason.
-fn peer_identities(
-    sites: &[GridSite],
-    trust: PeerTrustMode,
-) -> BTreeMap<String, signals::PeerRecord> {
+fn peer_identities(sites: &[GridSite], trust: PeerTrustMode) -> BTreeMap<String, signals::PeerRecord> {
     let pinned = trust == PeerTrustMode::Pin;
     let mut ranked = BTreeMap::<String, ((bool, bool), signals::PeerRecord)>::new();
     for site in sites {
@@ -1988,10 +1985,7 @@ async fn ensure_tls_secrets(
 
 /// Create `secret`, returning whether this call created it: a Secret another writer
 /// created first is never overwritten.
-async fn create_secret(
-    api: &Api<Secret>,
-    secret: Secret,
-) -> Result<bool, OperatorError> {
+async fn create_secret(api: &Api<Secret>, secret: Secret) -> Result<bool, OperatorError> {
     match api.create(&kube::api::PostParams::default(), &secret).await {
         Ok(_) => Ok(true),
         Err(kube::Error::Api(response)) if response.code == 409 => Ok(false),
@@ -2203,10 +2197,11 @@ async fn reconcile_routing_overlay_inner(
         // routing overlay. An empty overlay is published first so a mount or
         // config failure cannot retain a previously serving route.
         let mut delegated_mount_reconciled = false;
-        if !no_candidates && let Some(cc) = gw_ref
-            .consumer_config
-            .as_ref()
-            .filter(|cc| cc.enabled && cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled))
+        if !no_candidates
+            && let Some(cc) = gw_ref
+                .consumer_config
+                .as_ref()
+                .filter(|cc| cc.enabled && cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled))
         {
             match Box::pin(apply_consumer_config_for_gateway(
                 &overlay,
@@ -5811,7 +5806,6 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 mod tests {
     use super::*;
 
-
     #[test]
     fn a_provider_not_ready_publishes_ready_zero_without_a_fresh_scrape() {
         let ready = |value: f64| signals::Observation {
@@ -5889,7 +5883,7 @@ mod tests {
         );
     }
 
-    fn network_with_modes(spec: &serde_json::Value) -> GridNetwork {
+    fn network_with_modes(spec: &Value) -> GridNetwork {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridNetwork",
@@ -10046,7 +10040,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_agent_tool_provider(name: &str, network: &str, tools: &[&str]) -> AgentToolProvider {
-        let tools_json: Vec<serde_json::Value> = tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        let tools_json: Vec<Value> = tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
             "kind": "AgentToolProvider",
@@ -10066,7 +10060,7 @@ mod tests {
         spec_tools: &[&str],
         discovered: &[&str],
     ) -> AgentToolProvider {
-        let tools_json: Vec<serde_json::Value> = spec_tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        let tools_json: Vec<Value> = spec_tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
         let discovered_json: Vec<&str> = discovered.to_vec();
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
