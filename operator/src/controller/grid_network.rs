@@ -987,6 +987,9 @@ const FIELD_MANAGER: &str = "grid-operator";
 /// Finalizer that keeps a `GridNetwork` present until its SWIM scope withdraws.
 const GRID_NETWORK_WITHDRAWAL_FINALIZER: &str = "grid.praxis.fast/gridnetwork-withdrawal";
 
+/// Bound retries when another reconcile updates a `GridNetwork` finalizer at the same time.
+const FINALIZER_PATCH_ATTEMPTS: usize = 4;
+
 /// Retry interval while a deleting network awaits local SWIM withdrawal.
 const WITHDRAWAL_RETRY_REQUEUE: Duration = Duration::from_secs(5);
 
@@ -1112,33 +1115,82 @@ fn persisted_grid_id(network: &GridNetwork) -> Option<&str> {
 }
 
 /// Add or remove the SWIM-withdrawal finalizer without changing other finalizers.
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded conflict retry must keep its rebase invariants together"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async Kubernetes API calls carry large request and response values"
+)]
 async fn patch_withdrawal_finalizer(
     network: &GridNetwork,
     client: &Client,
     present: bool,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    let mut resource_version = network.metadata.resource_version.clone();
     let mut finalizers = network.metadata.finalizers.clone().unwrap_or_default();
-    if present {
-        if finalizers
-            .iter()
-            .any(|finalizer| finalizer == GRID_NETWORK_WITHDRAWAL_FINALIZER)
-        {
+
+    for attempt in 0..FINALIZER_PATCH_ATTEMPTS {
+        if !set_withdrawal_finalizer(&mut finalizers, present) {
             return Ok(());
         }
-        finalizers.push(GRID_NETWORK_WITHDRAWAL_FINALIZER.to_owned());
-    } else {
-        finalizers.retain(|finalizer| finalizer != GRID_NETWORK_WITHDRAWAL_FINALIZER);
-    }
-    let patch = serde_json::json!({
-        "metadata": {
-            "resourceVersion": network.metadata.resource_version,
-            "finalizers": finalizers,
+
+        let patch = serde_json::json!({
+            "metadata": {
+                "resourceVersion": resource_version,
+                "finalizers": finalizers,
+            }
+        });
+        match api.patch(name, &PatchParams::default(), &Patch::Merge(&patch)).await {
+            Ok(_) => return Ok(()),
+            Err(kube::Error::Api(error)) if error.code == 409 => {
+                if attempt + 1 == FINALIZER_PATCH_ATTEMPTS {
+                    return Err(kube::Error::Api(error).into());
+                }
+
+                // A normal reconcile can update status while this finalizer patch is in flight.
+                // Rebase the narrow metadata change onto the latest finalizer list so we neither
+                // surface a transient conflict as an operator error nor overwrite another finalizer.
+                let Some(latest) = api.get_opt(name).await? else {
+                    return Ok(());
+                };
+                resource_version.clone_from(&latest.metadata.resource_version);
+                finalizers = latest.metadata.finalizers.unwrap_or_default();
+                let already_present = finalizers
+                    .iter()
+                    .any(|finalizer| finalizer == GRID_NETWORK_WITHDRAWAL_FINALIZER);
+                if already_present == present {
+                    return Ok(());
+                }
+            },
+            Err(error) => return Err(error.into()),
         }
-    });
-    let api: Api<GridNetwork> = Api::all(client.clone());
-    api.patch(name, &PatchParams::default(), &Patch::Merge(&patch)).await?;
+    }
+
     Ok(())
+}
+
+/// Set the operator finalizer in place, preserving every unrelated finalizer.
+///
+/// Returns whether the list changed.
+fn set_withdrawal_finalizer(finalizers: &mut Vec<String>, present: bool) -> bool {
+    let had_finalizer = finalizers
+        .iter()
+        .any(|finalizer| finalizer == GRID_NETWORK_WITHDRAWAL_FINALIZER);
+    match (present, had_finalizer) {
+        (true, false) => {
+            finalizers.push(GRID_NETWORK_WITHDRAWAL_FINALIZER.to_owned());
+            true
+        },
+        (false, true) => {
+            finalizers.retain(|finalizer| finalizer != GRID_NETWORK_WITHDRAWAL_FINALIZER);
+            true
+        },
+        _ => false,
+    }
 }
 
 /// Complete a deleting network's local SWIM withdrawal before Kubernetes removes it.
@@ -7076,6 +7128,22 @@ mod tests {
             .get_or_insert_default()
             .push(GRID_NETWORK_WITHDRAWAL_FINALIZER.to_owned());
         assert!(has_withdrawal_finalizer(&network));
+    }
+
+    #[test]
+    fn withdrawal_finalizer_updates_preserve_other_finalizers_and_are_idempotent() {
+        let mut finalizers = vec!["other.example/finalizer".to_owned()];
+
+        assert!(set_withdrawal_finalizer(&mut finalizers, true));
+        assert_eq!(
+            finalizers,
+            ["other.example/finalizer", GRID_NETWORK_WITHDRAWAL_FINALIZER,]
+        );
+        assert!(!set_withdrawal_finalizer(&mut finalizers, true));
+
+        assert!(set_withdrawal_finalizer(&mut finalizers, false));
+        assert_eq!(finalizers, ["other.example/finalizer"]);
+        assert!(!set_withdrawal_finalizer(&mut finalizers, false));
     }
 
     /// The operator self-signs only a grid with neither Secret, never over an existing CA.
