@@ -1173,9 +1173,8 @@ async fn patch_withdrawal_finalizer(
     Ok(())
 }
 
-/// Set the operator finalizer in place, preserving every unrelated finalizer.
-///
-/// Returns whether the list changed.
+/// Finalizer patches replace the list, so retain entries owned by other controllers
+/// to avoid bypassing their cleanup during a conflicting reconcile.
 fn set_withdrawal_finalizer(finalizers: &mut Vec<String>, present: bool) -> bool {
     let had_finalizer = finalizers
         .iter()
@@ -7134,16 +7133,33 @@ mod tests {
     fn withdrawal_finalizer_updates_preserve_other_finalizers_and_are_idempotent() {
         let mut finalizers = vec!["other.example/finalizer".to_owned()];
 
-        assert!(set_withdrawal_finalizer(&mut finalizers, true));
+        assert!(
+            set_withdrawal_finalizer(&mut finalizers, true),
+            "adding the withdrawal finalizer must change the list"
+        );
         assert_eq!(
             finalizers,
-            ["other.example/finalizer", GRID_NETWORK_WITHDRAWAL_FINALIZER,]
+            ["other.example/finalizer", GRID_NETWORK_WITHDRAWAL_FINALIZER,],
+            "adding the withdrawal finalizer must preserve unrelated entries"
         );
-        assert!(!set_withdrawal_finalizer(&mut finalizers, true));
+        assert!(
+            !set_withdrawal_finalizer(&mut finalizers, true),
+            "adding an existing withdrawal finalizer must be idempotent"
+        );
 
-        assert!(set_withdrawal_finalizer(&mut finalizers, false));
-        assert_eq!(finalizers, ["other.example/finalizer"]);
-        assert!(!set_withdrawal_finalizer(&mut finalizers, false));
+        assert!(
+            set_withdrawal_finalizer(&mut finalizers, false),
+            "removing the withdrawal finalizer must change the list"
+        );
+        assert_eq!(
+            finalizers,
+            ["other.example/finalizer"],
+            "removing the withdrawal finalizer must preserve unrelated entries"
+        );
+        assert!(
+            !set_withdrawal_finalizer(&mut finalizers, false),
+            "removing an absent withdrawal finalizer must be idempotent"
+        );
     }
 
     /// The operator self-signs only a grid with neither Secret, never over an existing CA.

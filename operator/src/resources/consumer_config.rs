@@ -1453,7 +1453,11 @@ mod tests {
             .as_sequence()
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(clusters.len(), 1, "the TLS backend must render one cluster");
-        assert_eq!(clusters[0]["name"].as_str(), Some("backend"));
+        assert_eq!(
+            clusters[0]["name"].as_str(),
+            Some("backend"),
+            "the rendered TLS cluster must be the selected backend"
+        );
         assert_eq!(
             clusters[0]["tls"]["ca"]["ca_path"].as_str(),
             Some("/run/secrets/grid-backend-ca/model-ca/ca.crt"),
