@@ -3,7 +3,6 @@
 use std::{collections::BTreeMap, path::Path};
 
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 
 use crate::{
     error::GatewayMountFailure,
@@ -26,8 +25,8 @@ pub(crate) struct DesiredMount {
 /// Build sorted projected volumes from a reference-only requirements document.
 ///
 /// Credential Secrets mount at their generated per-Secret parent directory.
-/// Grid CA and site identity keys share the configured TLS directory so the
-/// existing Praxis file paths remain valid.
+/// Grid CA and site identity keys use the parent of their rendered file paths,
+/// preserving the TLS directory configured for Praxis.
 #[expect(
     clippy::too_many_lines,
     reason = "the reference-to-volume transformation validates and groups paths in one pass"
@@ -84,19 +83,9 @@ pub(crate) fn desired_mounts(document: &MountRequirementsDocument) -> Result<Vec
             }
             destinations.insert(item.path.clone(), source);
 
-            let group_mount_path = match requirement.purpose {
-                MountPurpose::BackendCredential => mount_path.to_owned(),
-                MountPurpose::BackendCa | MountPurpose::GridPeerCa | MountPurpose::GridSiteIdentity => {
-                    let file_mount_path = Path::new(&item.path).parent().and_then(Path::to_str).ok_or_else(|| {
-                        GatewayMountFailure::new("InvalidMountPath", format!("invalid mount path {:?}", item.path))
-                    })?;
-                    file_mount_path.to_owned()
-                },
-                MountPurpose::GridServingTls => continue,
-            };
             projections
                 .entry((
-                    group_mount_path,
+                    mount_path.to_owned(),
                     requirement.secret.namespace.clone(),
                     requirement.secret.name.clone(),
                 ))
@@ -178,8 +167,10 @@ fn revision_prefix(input: &str) -> String {
 
 /// Hash an input to its stable lowercase SHA-256 digest.
 fn revision(input: &str) -> String {
-    let digest = Sha256::digest(input.as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    crate::resources::tls_backend::sha256(input.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]

@@ -1050,11 +1050,16 @@ pub enum TransportMode {
 /// `sni` is required for both TLS modes and forbidden for plaintext.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null",
+    "message": "caSecretRef is only valid for tls transport"
+}]))]
 pub struct EndpointTransport {
     /// Transport mode: `mutual_tls`, `tls`, or explicit `plaintext`.
     pub mode: TransportMode,
 
     /// TLS Server Name Indication, required when mode is `mutual_tls` or `tls`.
+    #[schemars(length(min = 1))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
 
@@ -2153,6 +2158,20 @@ mod tests {
         assert!(
             transport_properties.contains_key("caSecretRef"),
             "CRD schema must include optional custom CA Secret reference"
+        );
+        assert_eq!(
+            transport_properties.get("sni").and_then(|sni| sni.get("minLength")),
+            Some(&serde_json::json!(1)),
+            "an explicitly empty SNI must fail admission"
+        );
+        assert_eq!(
+            endpoint_properties
+                .get("transport")
+                .and_then(|transport| transport.pointer("/x-kubernetes-validations/0/rule")),
+            Some(&serde_json::json!(
+                "self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null"
+            )),
+            "custom CA references must be admitted only for tls transport"
         );
     }
 

@@ -3209,19 +3209,23 @@ async fn reconcile_delegated_gateway(
     let deployment = deployments
         .get_opt(deployment_name)
         .await
-        .map_err(|_error| mount_failure("DeploymentReadFailed", "could not read the delegated Deployment"))?
+        .map_err(|error| {
+            mount_failure(
+                "DeploymentReadFailed",
+                format!("could not read the delegated Deployment: {error}"),
+            )
+        })?
         .ok_or_else(|| mount_failure("DeploymentMissing", "the delegated Deployment does not exist"))?;
     let chart_managed_serving_tls =
         validate_deployment_delegation(&deployment, network_name, gw_ref, delegation, &cc.config_map_name)?;
     let requirements =
         delegated_mount_requirements_document(rendered, network_name, gw_ref, cc, tls, chart_managed_serving_tls)?;
     let requirements_revision = gateway_mounts::requirements_revision(&requirements)?;
-    apply_mount_requirements_document(&requirements, network_name, gw_ref, cc, client).await?;
-
     let resource_versions = validate_required_secrets(&requirements, &gw_ref.namespace, client).await?;
     if chart_managed_serving_tls {
         validate_chart_managed_serving_tls(&requirements, &deployment, delegation)?;
     }
+    apply_mount_requirements_document(&requirements, network_name, gw_ref, cc, client).await?;
     let secret_revision = gateway_mounts::secret_revision(&resource_versions)?;
     let desired_mounts = gateway_mounts::desired_mounts(&requirements)?;
     let pod_template = deployment
@@ -3733,7 +3737,12 @@ async fn validate_required_secrets(
         let secret = api
             .get_opt(&name)
             .await
-            .map_err(|_error| mount_failure("SecretReadFailed", format!("could not read Secret {namespace}/{name}")))?
+            .map_err(|error| {
+                mount_failure(
+                    "SecretReadFailed",
+                    format!("could not read Secret {namespace}/{name}: {error}"),
+                )
+            })?
             .ok_or_else(|| mount_failure("MissingSecret", format!("Secret {namespace}/{name} does not exist")))?;
         for key in keys {
             if secret

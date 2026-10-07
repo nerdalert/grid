@@ -263,11 +263,15 @@ spec:
                                       type: string
                                     sni:
                                       description: TLS Server Name Indication, required when mode is `mutual_tls` or `tls`.
+                                      minLength: 1
                                       nullable: true
                                       type: string
                                   required:
                                     - mode
                                   type: object
+                                  x-kubernetes-validations:
+                                    - message: caSecretRef is only valid for tls transport
+                                      rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
                               required:
                                 - address
                                 - cluster

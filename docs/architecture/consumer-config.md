@@ -166,9 +166,20 @@ CA Secrets must be in the gateway namespace. For server-authenticated `tls` endp
 key defaults to `ca.crt`. Mutual TLS uses the Grid CA and site identity from
 `GridNetwork.spec.tls`. Secret contents and private keys are never copied into
 generated ConfigMaps, status, or logs.
+The operator does not maintain a per-reference Secret allowlist: an
+`InferenceProvider` author can select a Secret key in the gateway namespace for
+the final-hop credential. Restrict `InferenceProvider` writes to trusted
+control-plane users and keep only gateway-authorized credentials in that
+namespace. The chart's `managedCredentialNames` supports mount handoff; it is
+not an authorization list.
 When mount reconciliation is disabled, the operator still renders the mTLS
 file paths but leaves their mounts with the gateway owner; Grid CA and site
 identity Secret references are required only for delegated mounts.
+Disabling mount reconciliation or deleting the `GridNetwork` does not remove
+previously Grid-owned Deployment mounts. Hand ownership back to the Deployment
+manager or remove those mounts explicitly after moving the gateway off the
+generated configuration. Do not treat disabling the feature as credential
+revocation; revoke or rotate the Secret and verify the Deployment separately.
 
 `consumerConfigStatus[].phase: Rendered` means the config map was rendered and
 applied. It does not mean the gateway has restarted or become ready. With mount
@@ -179,6 +190,8 @@ the selected Praxis container must mount Grid's generated ConfigMap and
 `praxis.yaml` key at `/etc/praxis`. Secret resource versions are hashed before
 they are placed in pod annotations; Secret values are never used as rollout
 metadata.
+A deliberately scaled-to-zero Deployment stays `WaitingForRollout` until pods
+are started and a complete rollout proves the mounts and config are present.
 
 The operator's `grid-operator-resources` RoleBinding needs `deployments` `get`
 and `patch` in the gateway namespace for this opt-in feature. With a nonempty
