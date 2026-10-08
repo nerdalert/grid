@@ -43,9 +43,13 @@ spec:
               mode: mutual_tls         # mTLS with CA verification and client cert
               sni: site-a.grid.internal
           - cluster: api-provider
-            address: "mock-api.default.svc:8080"
+            address: "api.example.internal:443"
             transport:
-              mode: plaintext          # explicit insecure/dev-only — no TLS
+              mode: tls                # verified server TLS
+              sni: api.example.internal
+              caSecretRef:
+                name: api-provider-ca  # Secret in praxis-system (gateway namespace)
+                # key: ca.crt          # optional; defaults to ca.crt
   region: us-east-1
   zone: us-east-1a
   swim:
@@ -118,7 +122,13 @@ With delegation disabled, the operator still publishes a reference-only
 
 `clusterEndpoints[].transport.mode` accepts `mutual_tls`, `tls`, or `plaintext`.
 The optional `transport.caSecretRef` is valid for `tls` and names a custom CA
-Secret key (default `ca.crt`). `mutual_tls` uses `spec.tls.caSecretRef` and
+Secret in the target `GatewayRef.namespace`; it has `name` and optional `key`
+fields only, with the key defaulting to `ca.crt`. Existing manifests must remove
+its former `namespace` field and place the Secret in the gateway namespace.
+CRD pruning removes unknown fields: `Warn` mode accepts the object and reports a
+warning, `Ignore` silently drops the field, and `Strict` rejects the request.
+This namespace-local reference is distinct from `spec.tls.caSecretRef`, which
+retains its explicit `namespace`. `mutual_tls` uses `spec.tls.caSecretRef` and
 `spec.tls.siteSecretRef` and does not accept a custom CA override.
 
 ### Tenant budget tracking
@@ -284,8 +294,9 @@ Praxis `ConfigMap` generation.
 | `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
 | `configMapName` | `praxis-consumer-config` | Name of the generated `ConfigMap` in the gateway namespace. |
 | `clusterEndpoints[]` | `[]` | Endpoint topology for `load_balancer` clusters. Each entry maps a candidate cluster name to an address with explicit `transport` configuration. Missing transport fails closed. |
-| `clusterEndpoints[].transport.mode` | _(required)_ | `mutual_tls` (mTLS with CA/client cert/SNI/verify) or `plaintext` (no TLS, insecure/dev-only). |
-| `clusterEndpoints[].transport.sni` | _(required for `mutual_tls`)_ | TLS Server Name Indication; must match the provider certificate SAN. |
+| `clusterEndpoints[].transport.mode` | _(required)_ | `mutual_tls` (CA/client cert/SNI/verify), `tls` (server-authenticated TLS), or `plaintext` (no TLS, insecure/dev-only). |
+| `clusterEndpoints[].transport.sni` | _(required for TLS modes)_ | TLS Server Name Indication; must match the provider certificate SAN. |
+| `clusterEndpoints[].transport.caSecretRef` | omitted | Optional CA Secret for `tls`, resolved in `GatewayRef.namespace`; `name` required, `key` defaults to `ca.crt`, and `namespace` is not a field. |
 | `tlsCertMountPath` | `/etc/praxis/tls` | Base path for mounted TLS files used when a `clusterEndpoints[]` entry uses `mutual_tls` transport. |
 | `listenerPort` | `8080` | HTTP port for the generated `listeners[0].address` (`0.0.0.0:{listenerPort}`). |
 

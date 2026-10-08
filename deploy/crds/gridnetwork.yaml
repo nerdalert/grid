@@ -227,32 +227,24 @@ spec:
                                   properties:
                                     caSecretRef:
                                       description: |-
-                                        Optional Secret supplying a custom CA bundle for `tls` transport.
-                                        The mounted path is `/run/secrets/grid-backend-ca/{secret-name}/{key}`;
-                                        the key defaults to `ca.crt`. Omitted uses the process trust store.
+                                        Optional gateway-namespace Secret supplying a custom CA bundle for `tls` transport.
+                                        Specify only its name and optional key; the Secret must be in the namespace
+                                        named by the containing `GatewayRef`. The mounted path is
+                                        `/run/secrets/grid-backend-ca/{secret-name}/{key}`; the key defaults to
+                                        `ca.crt`. Omitted uses the process trust store.
                                       nullable: true
                                       properties:
                                         key:
-                                          description: |-
-                                            Key within the Secret's `data` map.
-
-                                            Required when the Secret holds multiple keys (e.g. credential references
-                                            in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
-                                            Secret is consumed (e.g. TLS `ca_secret_ref`).
+                                          description: Optional key containing the CA bundle. Defaults to `ca.crt`.
                                           minLength: 1
                                           nullable: true
                                           type: string
                                         name:
-                                          description: Secret name.
-                                          minLength: 1
-                                          type: string
-                                        namespace:
-                                          description: Secret namespace.
+                                          description: Secret name in the target gateway namespace.
                                           minLength: 1
                                           type: string
                                       required:
                                         - name
-                                        - namespace
                                       type: object
                                     mode:
                                       description: 'Transport mode: `mutual_tls`, `tls`, or explicit `plaintext`.'

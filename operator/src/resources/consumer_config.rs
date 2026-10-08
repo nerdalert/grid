@@ -496,6 +496,7 @@ pub(crate) fn render_consumer_config(
     listener_port: u16,
     tls: &TlsConfig,
     gateway_name: &str,
+    gateway_namespace: &str,
     telemetry: Option<&GatewayTelemetryConfig>,
     delegated_mounts: bool,
 ) -> Result<ConsumerRenderResult, ConsumerConfigError> {
@@ -605,7 +606,7 @@ pub(crate) fn render_consumer_config(
             &mut requirements,
             MountPurpose::BackendCa,
             gateway_name,
-            &ca_ref.namespace,
+            gateway_namespace,
             &ca_ref.name,
             key,
             &path,
@@ -1118,7 +1119,7 @@ fn dns_safe(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        crd::grid_network::{EndpointTransport, SecretRef},
+        crd::grid_network::{EndpointCaSecretRef, EndpointTransport, SecretRef},
         resources::{
             geography::{AdmissionState, LocalityTier},
             routing_overlay::{ProjectedCredential, ProjectedCredentialRef},
@@ -1241,6 +1242,7 @@ mod tests {
             8080,
             &TlsConfig::default(),
             "grid-a",
+            "gateway-ns",
             None,
             false,
         )
@@ -1271,6 +1273,7 @@ mod tests {
             8080,
             &TlsConfig::default(),
             "gateway",
+            "gateway-ns",
             None,
             false,
         )
@@ -1335,6 +1338,7 @@ mod tests {
             8080,
             &tls,
             "gateway",
+            "gateway-ns",
             None,
             true,
         )
@@ -1383,6 +1387,7 @@ mod tests {
             8080,
             &TlsConfig::default(),
             "gateway",
+            "gateway-ns",
             None,
             false,
         )
@@ -1421,9 +1426,8 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::Tls,
                 sni: Some("model.example".to_owned()),
-                ca_secret_ref: Some(SecretRef {
+                ca_secret_ref: Some(EndpointCaSecretRef {
                     name: "model-ca".to_owned(),
-                    namespace: "gateway-ns".to_owned(),
                     key: None,
                 }),
             }),
@@ -1436,6 +1440,7 @@ mod tests {
             8080,
             &TlsConfig::default(),
             "gateway",
+            "gateway-ns",
             None,
             false,
         )
@@ -1470,6 +1475,8 @@ mod tests {
         );
         assert_eq!(rendered.requirements.len(), 1);
         assert_eq!(rendered.requirements[0].purpose, MountPurpose::BackendCa);
+        assert_eq!(rendered.requirements[0].secret.namespace, "gateway-ns");
+        assert_eq!(rendered.requirements[0].secret.name, "model-ca");
         assert_eq!(rendered.requirements[0].items[0].key, "ca.crt");
         assert_eq!(
             rendered.requirements[0].items[0].path,
@@ -1492,6 +1499,7 @@ mod tests {
             8080,
             &TlsConfig::default(),
             "gateway",
+            "gateway-ns",
             None,
             false,
         );
@@ -1512,6 +1520,7 @@ mod tests {
             8080,
             &TlsConfig::default(),
             "gateway",
+            "gateway-ns",
             None,
             false,
         );

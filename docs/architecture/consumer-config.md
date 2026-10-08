@@ -40,7 +40,35 @@ Key differences:
 - `transport.mode` is the security switch (`mutual_tls`, server-authenticated
   `tls`, or explicit insecure/dev-only `plaintext`), not `sni` presence.
 - Missing `transport` fails closed — the operator will not render the cluster entry.
-- `plaintext` must not set `sni` (rejected as likely misconfiguration).
+- `plaintext` must not set a nonblank `sni` (rejected as likely misconfiguration).
+
+### Custom backend CA Secret namespace
+
+`clusterEndpoints[].transport.caSecretRef` is namespace-local to the target
+gateway. Specify the Secret `name` and, optionally, its `key`; the Secret must
+exist in the namespace from that entry's `GatewayRef.namespace`:
+
+```yaml
+transport:
+  mode: tls
+  sni: api.example.internal
+  caSecretRef:
+    name: api-provider-ca
+    # key: ca.crt
+```
+
+This is a field-specific API change: remove `namespace` from existing
+`transport.caSecretRef` values and ensure the Secret is in the target gateway
+namespace before applying the updated `GridNetwork`. Kubernetes prunes unknown
+fields from CRD requests: `Warn` mode accepts the object and reports a warning,
+while `Ignore` mode drops the field silently. `Strict` mode rejects the request;
+`kubectl --validate=true` uses strict validation where supported. Existing
+objects accepted under the previous schema should be updated from a manifest
+with the field removed. Do not rely on an old namespace value or move/copy
+Secrets across namespaces. This change does not affect
+`GridNetwork.spec.tls.caSecretRef`, provider credential references, or provider
+health-check TLS references; those keep their existing explicit namespace
+behavior.
 
 ## Implemented: GatewayRef.consumerConfig
 
@@ -161,11 +189,11 @@ ready. Other Deployment fields, containers, volumes, mounts, and Helm resources
 are preserved.
 
 For delegated mounts, all credential, Grid CA, site identity, and custom backend
-CA Secrets must be in the gateway namespace. For server-authenticated `tls` endpoints,
-`clusterEndpoints[].transport.caSecretRef` can select a custom CA Secret; its
-key defaults to `ca.crt`. Mutual TLS uses the Grid CA and site identity from
-`GridNetwork.spec.tls`. Secret contents and private keys are never copied into
-generated ConfigMaps, status, or logs.
+CA Secrets must be in the gateway namespace. For server-authenticated `tls`
+endpoints, `clusterEndpoints[].transport.caSecretRef` selects a CA Secret from
+that gateway namespace; its key defaults to `ca.crt`. Mutual TLS uses the Grid
+CA and site identity from `GridNetwork.spec.tls`. Secret contents and private
+keys are never copied into generated ConfigMaps, status, or logs.
 The operator does not maintain a per-reference Secret allowlist: an
 `InferenceProvider` author can select a Secret key in the gateway namespace for
 the final-hop credential. Restrict `InferenceProvider` writes to trusted

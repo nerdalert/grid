@@ -2811,6 +2811,7 @@ async fn apply_consumer_config_for_gateway(
         cc.listener_port,
         tls,
         &gw_ref.name,
+        &gw_ref.namespace,
         cc.telemetry.as_ref(),
         cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled),
     )?;

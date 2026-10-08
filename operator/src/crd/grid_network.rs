@@ -1065,11 +1065,30 @@ pub struct EndpointTransport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
 
-    /// Optional Secret supplying a custom CA bundle for `tls` transport.
-    /// The mounted path is `/run/secrets/grid-backend-ca/{secret-name}/{key}`;
-    /// the key defaults to `ca.crt`. Omitted uses the process trust store.
+    /// Optional gateway-namespace Secret supplying a custom CA bundle for `tls` transport.
+    /// Specify only its name and optional key; the Secret must be in the namespace
+    /// named by the containing `GatewayRef`. The mounted path is
+    /// `/run/secrets/grid-backend-ca/{secret-name}/{key}`; the key defaults to
+    /// `ca.crt`. Omitted uses the process trust store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ca_secret_ref: Option<SecretRef>,
+    pub ca_secret_ref: Option<EndpointCaSecretRef>,
+}
+
+/// Gateway-namespace Secret reference for a consumer backend CA bundle.
+///
+/// Unlike [`SecretRef`], this reference has no namespace field: the Secret is
+/// resolved in the target gateway's namespace.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointCaSecretRef {
+    /// Secret name in the target gateway namespace.
+    #[schemars(length(min = 1))]
+    pub name: String,
+
+    /// Optional key containing the CA bundle. Defaults to `ca.crt`.
+    #[schemars(length(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// Endpoint configuration for one consumer `load_balancer` cluster.
@@ -2185,6 +2204,50 @@ mod tests {
                 "self.mode == 'plaintext' || !has(self.sni) || self.sni == null || self.sni.size() > 0"
             )),
             "explicitly empty SNI must be admitted only for plaintext transport"
+        );
+
+        let ca_ref = transport_properties
+            .get("caSecretRef")
+            .unwrap_or_else(|| std::process::abort());
+        let ca_ref_properties = ca_ref
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            ca_ref_properties.contains_key("name"),
+            "transport CA reference must expose name"
+        );
+        assert!(
+            ca_ref_properties.contains_key("key"),
+            "transport CA reference must expose optional key"
+        );
+        assert!(
+            !ca_ref_properties.contains_key("namespace"),
+            "transport CA reference must resolve in the gateway namespace"
+        );
+        assert_eq!(
+            ca_ref.pointer("/required"),
+            Some(&serde_json::json!(["name"])),
+            "only the transport CA Secret name is required"
+        );
+
+        let grid_ca_ref = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/tls/properties/caSecretRef")
+            .unwrap_or_else(|| std::process::abort());
+        let grid_ca_properties = grid_ca_ref
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            grid_ca_properties.contains_key("namespace"),
+            "spec.tls.caSecretRef must retain its explicit namespace"
+        );
+        assert!(
+            grid_ca_ref
+                .pointer("/required")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|required| required.iter().any(|field| field == "namespace")),
+            "spec.tls.caSecretRef must continue requiring namespace"
         );
     }
 
