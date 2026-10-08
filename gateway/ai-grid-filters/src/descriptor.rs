@@ -223,7 +223,13 @@ pub(crate) fn validate_serving_candidates(raw: Vec<CandidateConfig>) -> Result<V
     clippy::too_many_lines,
     reason = "one validation pass keeps all candidate invariants adjacent"
 )]
-pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
+fn validate_candidates_with_empty(
+    raw: Vec<CandidateConfig>,
+    allow_empty: bool,
+) -> Result<Vec<RouteCandidate>, FilterError> {
+    if raw.is_empty() && !allow_empty {
+        return Err("grid: candidates must not be empty outside a versioned serving config".into());
+    }
     if raw.len() > MAX_CANDIDATES {
         return Err(format!("grid: candidates exceeds maximum of {MAX_CANDIDATES}").into());
     }
@@ -433,8 +439,8 @@ mod tests {
 
     #[test]
     fn empty_candidates_are_an_authoritative_no_route_snapshot() {
-        let candidates = validate_candidates(vec![]).unwrap_or_else(|_| std::process::abort());
-        assert!(candidates.is_empty());
+        let candidates = validate_serving_candidates(vec![]).expect("versioned serving can withdraw every candidate");
+        assert!(candidates.is_empty(), "the empty serving revision is authoritative");
     }
 
     #[test]

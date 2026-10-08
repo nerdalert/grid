@@ -27,8 +27,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use k8s_openapi::api::core::v1::ConfigMap;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::crd::grid_network::SelectionMode;
 use crate::{
-    crd::grid_network::{ClusterEndpointConfig, GatewayTelemetryConfig, SelectionMode, TlsConfig, TransportMode},
+    crd::grid_network::{ClusterEndpointConfig, GatewayTelemetryConfig, TlsConfig, TransportMode},
     resources::routing_overlay::{RoutingCandidate, RoutingOverlay},
 };
 
@@ -109,6 +111,21 @@ pub enum ConsumerConfigError {
         /// Cluster name with missing transport.
         cluster: String,
     },
+
+    /// Multiple entries use the same backend cluster name.
+    #[error("duplicate cluster endpoint for {cluster:?}")]
+    DuplicateClusterEndpoint {
+        /// Duplicated cluster name.
+        cluster: String,
+    },
+
+    /// A reloadable gateway needs an endpoint inventory for later restoration.
+    #[error("gateway has no cluster endpoints")]
+    NoClusterEndpoints,
+
+    /// The selected Praxis image does not support projected credentials.
+    #[error("projected credentials require supportsProjectedCredentials=true on a compatible Praxis AI image")]
+    ProjectedCredentialsUnsupported,
 
     /// The overlay contains no inference candidates for this pipeline.
     #[error("overlay has no inference_model candidates for the consumer pipeline")]
@@ -308,6 +325,7 @@ pub(crate) fn generate_consumer_praxis_config(
     clippy::too_many_arguments,
     reason = "preserves the renderer's established inputs and adds optional telemetry"
 )]
+#[cfg(test)]
 pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     overlay: &RoutingOverlay,
     credential_mount_base: &str,
@@ -354,7 +372,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     };
 
     let credential_inject_section =
-        render_credential_inject(&inference_candidates, credential_mount_base, &overlay.local_site);
+        render_credential_inject(&inference_candidates, credential_mount_base, &overlay.local_site, false);
     let load_balancer_section = render_load_balancer(&inference_candidates, cluster_endpoints, tls_cert_mount_path)?;
 
     // Listeners section: one public listener referencing the consumer filter chain.
@@ -452,30 +470,144 @@ fn render_telemetry(telemetry: &GatewayTelemetryConfig) -> Result<String, Consum
 }
 
 /// Render a valid startup configuration while no inference route is eligible.
-fn render_no_provider_praxis_config(
+/// Render a reloadable consumer pipeline with the full endpoint inventory.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "gateway scope and transport inputs are independent"
+)]
+fn generate_consumer_praxis_config_for_gateway_with_telemetry(
+    overlay: &RoutingOverlay,
+    credential_mount_base: &str,
+    cluster_endpoints: &[ClusterEndpointConfig],
+    tls_cert_mount_path: &str,
     listener_port: u16,
+    gateway_name: &str,
+    gateway_namespace: &str,
+    projected_credentials: bool,
     telemetry: Option<&GatewayTelemetryConfig>,
 ) -> Result<String, ConsumerConfigError> {
+    if overlay.local_site.trim().is_empty() {
+        return Err(ConsumerConfigError::BlankLocalSite);
+    }
+    if cluster_endpoints.is_empty() {
+        return Err(ConsumerConfigError::NoClusterEndpoints);
+    }
+    let hop_clusters = render_provider_hop_clusters(cluster_endpoints)?;
+    let endpoint_map: BTreeMap<&str, &ClusterEndpointConfig> =
+        cluster_endpoints.iter().map(|ep| (ep.cluster.as_str(), ep)).collect();
+    for candidate in overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == INFERENCE_MODEL)
+    {
+        if !endpoint_map.contains_key(candidate.cluster.as_str()) {
+            return Err(ConsumerConfigError::MissingClusterEndpoint {
+                cluster: candidate.cluster.clone(),
+            });
+        }
+    }
+    if let Some(telemetry) = telemetry {
+        telemetry.validate().map_err(ConsumerConfigError::InvalidTelemetry)?;
+    }
+    let mut endpoints = cluster_endpoints.iter().collect::<Vec<_>>();
+    endpoints.sort_by(|left, right| left.cluster.cmp(&right.cluster));
+    let clusters = endpoints
+        .into_iter()
+        .map(|endpoint| {
+            let quoted = yaml_scalar(&endpoint.cluster)?;
+            render_cluster_entry(&quoted, endpoint, tls_cert_mount_path)
+        })
+        .collect::<Result<Vec<_>, ConsumerConfigError>>()?
+        .join("\n");
+    let network = yaml_scalar(&overlay.network)?;
+    let gateway = yaml_scalar(gateway_name)?;
+    let namespace = yaml_scalar(gateway_namespace)?;
+    let local_site = yaml_scalar(&overlay.local_site)?;
+    let trace_context_filter = if telemetry.is_some() {
+        "      - filter: trace_context\n"
+    } else {
+        ""
+    };
     let mut config = format!(
-        "listeners:\n\
-         \x20 - name: public\n\
-         \x20   address: \"0.0.0.0:{listener_port}\"\n\
-         \x20   filter_chains: [no-provider-chain]\n\
-         filter_chains:\n\
-         \x20 - name: no-provider-chain\n\
-         \x20   filters:\n\
-         \x20     - filter: static_response\n\
-         \x20       status: 503\n\
-         \x20       headers:\n\
-         \x20         - name: Content-Type\n\
-         \x20           value: application/json\n\
-         \x20       body: '{{\"error\":\"no providers available\"}}'\n"
+        concat!(
+            "listeners:\n",
+            "  - name: public\n",
+            "    address: \"0.0.0.0:{listener_port}\"\n",
+            "    filter_chains: [consumer-chain]\n",
+            "filter_chains:\n",
+            "  - name: consumer-chain\n",
+            "    filters:\n",
+            "{trace_context_filter}",
+            "      - filter: json_body_field\n",
+            "        field: model\n",
+            "        header: X-Model\n",
+            "      - filter: intelligent_route\n",
+            "        local_site: {local_site}\n",
+            "        model_header: X-Model\n",
+            "        overlay_file: {overlay_file}\n",
+            "        expected_overlay_scope:\n",
+            "          network: {network}\n",
+            "          gateway: {gateway}\n",
+            "          namespace: {namespace}\n",
+            "          local_site: {local_site}\n",
+            "        reload:\n",
+            "          enabled: true\n",
+            "{hop_clusters}",
+        ),
+        listener_port = listener_port,
+        trace_context_filter = trace_context_filter,
+        local_site = local_site,
+        overlay_file = CONSUMER_OVERLAY_FILE,
+        network = network,
+        gateway = gateway,
+        namespace = namespace,
+        hop_clusters = hop_clusters,
     );
+    let candidates: Vec<_> = overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == INFERENCE_MODEL)
+        .collect();
+    let inject = if projected_credentials {
+        render_credential_inject(&[], credential_mount_base, &overlay.local_site, true)
+    } else {
+        render_credential_inject(&candidates, credential_mount_base, &overlay.local_site, false)
+    };
+    config.push_str(&inject);
+    config.push_str("\n      - filter: load_balancer\n        clusters:\n");
+    config.push_str(&clusters);
     if let Some(telemetry) = telemetry {
         config.push_str(&render_telemetry(telemetry)?);
     }
-    config.push_str("admin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
+    config.push_str("\nadmin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
     Ok(config)
+}
+
+/// Test-facing wrapper for the production gateway config renderer.
+#[cfg(test)]
+#[expect(clippy::too_many_arguments, reason = "matches the gateway renderer inputs")]
+fn generate_consumer_praxis_config_for_gateway(
+    overlay: &RoutingOverlay,
+    credential_mount_base: &str,
+    cluster_endpoints: &[ClusterEndpointConfig],
+    tls_cert_mount_path: &str,
+    listener_port: u16,
+    gateway_name: &str,
+    gateway_namespace: &str,
+    projected_credentials: bool,
+) -> Result<String, ConsumerConfigError> {
+    generate_consumer_praxis_config_for_gateway_with_telemetry(
+        overlay,
+        credential_mount_base,
+        cluster_endpoints,
+        tls_cert_mount_path,
+        listener_port,
+        gateway_name,
+        gateway_namespace,
+        projected_credentials,
+        None,
+    )
 }
 
 /// Render Praxis YAML and its Secret-file requirements from the same inputs.
@@ -491,7 +623,7 @@ fn render_no_provider_praxis_config(
     clippy::too_many_lines,
     reason = "configuration and mount requirements are derived from one candidate pass"
 )]
-pub(crate) fn render_consumer_config(
+pub(crate) fn render_consumer_config_with_projected(
     overlay: &RoutingOverlay,
     credential_mount_base: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
@@ -501,6 +633,7 @@ pub(crate) fn render_consumer_config(
     gateway_name: &str,
     gateway_namespace: &str,
     telemetry: Option<&GatewayTelemetryConfig>,
+    projected_credentials: bool,
     delegated_mounts: bool,
 ) -> Result<ConsumerRenderResult, ConsumerConfigError> {
     let inference_candidates: Vec<&RoutingCandidate> = overlay
@@ -508,18 +641,17 @@ pub(crate) fn render_consumer_config(
         .iter()
         .filter(|candidate| candidate.kind == INFERENCE_MODEL)
         .collect();
-    let config_yaml = if inference_candidates.is_empty() {
-        render_no_provider_praxis_config(listener_port, telemetry)?
-    } else {
-        generate_consumer_praxis_config_with_telemetry(
-            overlay,
-            credential_mount_base,
-            cluster_endpoints,
-            tls_cert_mount_path,
-            listener_port,
-            telemetry,
-        )?
-    };
+    let config_yaml = generate_consumer_praxis_config_for_gateway_with_telemetry(
+        overlay,
+        credential_mount_base,
+        cluster_endpoints,
+        tls_cert_mount_path,
+        listener_port,
+        gateway_name,
+        gateway_namespace,
+        projected_credentials,
+        telemetry,
+    )?;
     let mut requirements = BTreeMap::<(MountPurpose, String, String, String), BTreeSet<RequirementItem>>::new();
 
     for candidate in &inference_candidates {
@@ -529,11 +661,18 @@ pub(crate) fn render_consumer_config(
         let Some(credential) = candidate.credential.as_ref() else {
             continue;
         };
-        let path = credential_file_path(
-            credential_mount_base,
-            &credential.secret_ref.name,
-            &credential.secret_ref.key,
-        );
+        let path = if projected_credentials {
+            format!(
+                "{credential_mount_base}/{}/{}/{}",
+                credential.secret_ref.namespace, credential.secret_ref.name, credential.secret_ref.key
+            )
+        } else {
+            credential_file_path(
+                credential_mount_base,
+                &credential.secret_ref.name,
+                &credential.secret_ref.key,
+            )
+        };
         add_requirement(
             &mut requirements,
             MountPurpose::BackendCredential,
@@ -545,9 +684,9 @@ pub(crate) fn render_consumer_config(
         )?;
     }
 
-    let used_clusters: BTreeSet<&str> = inference_candidates
+    let used_clusters: BTreeSet<&str> = cluster_endpoints
         .iter()
-        .map(|candidate| candidate.cluster.as_str())
+        .map(|endpoint| endpoint.cluster.as_str())
         .collect();
     let needs_mutual_tls = cluster_endpoints.iter().any(|endpoint| {
         used_clusters.contains(endpoint.cluster.as_str())
@@ -630,6 +769,36 @@ pub(crate) fn render_consumer_config(
         config_yaml,
         requirements,
     })
+}
+
+/// Exercise the default renderer contract in local tests.
+#[cfg(test)]
+#[expect(clippy::too_many_arguments, reason = "matches the production renderer inputs")]
+fn render_consumer_config(
+    overlay: &RoutingOverlay,
+    credential_mount_base: &str,
+    cluster_endpoints: &[ClusterEndpointConfig],
+    tls_cert_mount_path: &str,
+    listener_port: u16,
+    tls: &TlsConfig,
+    gateway_name: &str,
+    gateway_namespace: &str,
+    telemetry: Option<&GatewayTelemetryConfig>,
+    delegated_mounts: bool,
+) -> Result<ConsumerRenderResult, ConsumerConfigError> {
+    render_consumer_config_with_projected(
+        overlay,
+        credential_mount_base,
+        cluster_endpoints,
+        tls_cert_mount_path,
+        listener_port,
+        tls,
+        gateway_name,
+        gateway_namespace,
+        telemetry,
+        false,
+        delegated_mounts,
+    )
 }
 
 /// Add one validated file reference to the grouped requirements map.
@@ -773,6 +942,7 @@ pub(crate) fn build_consumer_config_map(
 ///
 /// Each candidate is indented and includes `credential.secretRef` when present.
 /// Token values are never included.
+#[cfg(test)]
 fn render_candidates(candidates: &[&RoutingCandidate], local_site: &str) -> String {
     candidates
         .iter()
@@ -782,6 +952,7 @@ fn render_candidates(candidates: &[&RoutingCandidate], local_site: &str) -> Stri
 }
 
 /// Render the explicit Grid-owned request-selection policy.
+#[cfg(test)]
 fn render_selection_policy(policy: Option<&crate::crd::grid_network::SelectionPolicyConfig>) -> String {
     let Some(policy) = policy else {
         return String::new();
@@ -867,6 +1038,7 @@ pub(crate) fn provider_hop_clusters(
     clippy::too_many_lines,
     reason = "Candidate YAML fields are kept together to mirror the wire contract."
 )]
+#[cfg(test)]
 fn render_candidate(c: &RoutingCandidate, include_credential: bool) -> String {
     let mut lines = vec![
         format!(
@@ -906,6 +1078,7 @@ fn render_candidate(c: &RoutingCandidate, include_credential: bool) -> String {
 }
 
 /// Render the `credential.secretRef` block for one candidate.
+#[cfg(test)]
 fn render_credential_reference(cred: &crate::resources::routing_overlay::ProjectedCredential) -> Vec<String> {
     vec![
         "           credential:".to_owned(),
@@ -941,7 +1114,8 @@ fn render_credential_inject(
     candidates: &[&RoutingCandidate],
     credential_mount_base: &str,
     local_site: &str,
-) -> Option<String> {
+    enable_projected_credentials: bool,
+) -> String {
     // Collect unique (strategy, name, namespace, key) → rendered entry.
     // BTreeMap provides deterministic sorted order by key.
     let mut entries: BTreeMap<(String, String, String, String), String> = BTreeMap::new();
@@ -1012,6 +1186,7 @@ fn render_credential_inject(
 /// deterministically.  Every cluster must have a matching entry in
 /// `cluster_endpoints` with explicit transport configuration; missing
 /// endpoint, missing transport, or missing SNI on mTLS all fail closed.
+#[cfg(test)]
 fn render_load_balancer(
     candidates: &[&RoutingCandidate],
     cluster_endpoints: &[ClusterEndpointConfig],
@@ -1353,9 +1528,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_candidate_config_fails_closed_without_an_invalid_route_filter() {
+    fn empty_candidate_config_requires_endpoint_inventory_for_restoration() {
         let overlay = simple_overlay(Vec::new());
-        let rendered = render_consumer_config(
+        let error = render_consumer_config(
             &overlay,
             MOUNT_BASE,
             &[],
@@ -1367,22 +1542,11 @@ mod tests {
             None,
             false,
         )
-        .unwrap_or_else(|_| std::process::abort());
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(&rendered.config_yaml).unwrap_or_else(|_| std::process::abort());
-        let filters = parsed
-            .get("filter_chains")
-            .and_then(serde_yaml::Value::as_sequence)
-            .and_then(|chains| chains.first())
-            .and_then(|chain| chain.get("filters"))
-            .and_then(serde_yaml::Value::as_sequence)
-            .unwrap_or_else(|| std::process::abort());
-
-        assert_eq!(rendered.requirements.len(), 0);
-        assert_eq!(filters[0]["filter"], "static_response");
-        assert_eq!(filters[0]["status"], 503);
-        assert!(!rendered.config_yaml.contains("intelligent_route"));
-        assert!(rendered.config_yaml.contains("no providers available"));
+        .expect_err("restoration needs an endpoint inventory");
+        assert!(
+            matches!(error, ConsumerConfigError::NoClusterEndpoints),
+            "missing inventory must fail closed"
+        );
     }
 
     #[test]
@@ -1656,6 +1820,7 @@ mod tests {
         endpoints[0].transport = Some(EndpointTransport {
             mode: TransportMode::MutualTls,
             sni: Some("provider-a.grid.internal".to_owned()),
+            ca_secret_ref: None,
         });
         endpoints.push(ClusterEndpointConfig {
             cluster: "provider-b".to_owned(),
@@ -1663,6 +1828,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::Plaintext,
                 sni: None,
+                ca_secret_ref: None,
             }),
         });
 
@@ -1723,6 +1889,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::Plaintext,
                 sni: None,
+                ca_secret_ref: None,
             }),
         }];
         let yaml = generate_consumer_praxis_config_for_gateway(
@@ -1766,6 +1933,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::Plaintext,
                 sni: None,
+                ca_secret_ref: None,
             }),
         }];
         let yaml = generate_consumer_praxis_config_for_gateway(
@@ -2806,6 +2974,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "checks every rendered mTLS property")]
     fn cluster_with_mtls_transport_renders_mtls_entry() {
         let endpoints = [mtls_ep("site-a", "172.18.0.4:30080", "site-a.grid.internal")];
         let overlay = simple_overlay(vec![plain_candidate(

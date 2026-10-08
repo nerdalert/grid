@@ -68,7 +68,7 @@ pub(crate) fn generate_all_in_dir(cluster_names: &[String], dir: &Path) -> Resul
     let ca = load_or_generate_ca(dir)?;
 
     for name in cluster_names {
-        if ca_was_complete && identity_exists(&dir, name) && names_its_site(&dir, name)? {
+        if ca_was_complete && identity_exists(dir, name) && names_its_site(dir, name)? {
             restrict_private_key(&dir.join(format!("{name}-key.pem")))?;
             eprintln!("  reusing cert for {name}");
             continue;
@@ -448,7 +448,11 @@ mod tests {
 
         let fingerprint = site_certificate_fingerprint_in_dir("provider-b", test_dir.path())
             .unwrap_or_else(|_| std::process::abort());
-        assert_eq!(fingerprint.len(), 64);
+        assert_eq!(
+            fingerprint,
+            certificate_sha256(&test_dir.path().join("provider-b-cert.pem")).unwrap_or_else(|_| std::process::abort()),
+            "the helper must read the certificate from the supplied directory"
+        );
     }
 
     #[test]

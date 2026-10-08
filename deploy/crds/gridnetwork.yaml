@@ -349,6 +349,18 @@ spec:
                             x-kubernetes-validations:
                               - message: deploymentName is required when mount reconciliation is enabled
                                 rule: '!has(self.enabled) || !self.enabled || has(self.deploymentName)'
+                          supportsProjectedCredentials:
+                            default: false
+                            description: |-
+                              Declare that the running consumer has the dynamic `credential_inject`
+                              filter configured with the projected Secret mount root. This is a
+                              fail-closed capability gate for credential-bearing overlay revisions.
+                              Set it only after the consumer has loaded a config containing that
+                              filter; the Grid operator does not own or roll out the consumer
+                              Deployment.
+
+                              Default: `false`.
+                            type: boolean
                           telemetry:
                             description: |-
                               Optional OpenTelemetry exporter and sampling settings for this gateway.
@@ -464,21 +476,46 @@ spec:
                             transport:
                               description: TLS mode and SNI configured for that embedded gateway upstream.
                               properties:
+                                caSecretRef:
+                                  description: |-
+                                    Optional gateway-namespace Secret supplying a custom CA bundle for `tls` transport.
+                                    Specify only its name and optional key; the Secret must be in the namespace
+                                    named by the containing `GatewayRef`. The mounted path is
+                                    `/run/secrets/grid-backend-ca/{secret-name}/{key}`; the key defaults to
+                                    `ca.crt`. Omitted uses the process trust store.
+                                  nullable: true
+                                  properties:
+                                    key:
+                                      description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                      minLength: 1
+                                      nullable: true
+                                      type: string
+                                    name:
+                                      description: Secret name in the target gateway namespace.
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                    - name
+                                  type: object
                                 mode:
-                                  description: 'Transport mode: `mutual_tls` or `plaintext`.'
+                                  description: 'Transport mode: `mutual_tls`, `tls`, or explicit `plaintext`.'
                                   enum:
                                     - mutual_tls
+                                    - tls
                                     - plaintext
                                   type: string
                                 sni:
-                                  description: |-
-                                    TLS Server Name Indication (required when mode is `mutual_tls`;
-                                    must not be set when mode is `plaintext`).
+                                  description: TLS Server Name Indication, required when mode is `mutual_tls` or `tls`.
                                   nullable: true
                                   type: string
                               required:
                                 - mode
                               type: object
+                              x-kubernetes-validations:
+                                - message: caSecretRef is only valid for tls transport
+                                  rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
+                                - message: an explicitly empty sni is only valid for plaintext transport
+                                  rule: self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0
                           required:
                             - cluster
                             - transport

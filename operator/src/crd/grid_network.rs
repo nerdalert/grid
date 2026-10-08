@@ -795,6 +795,10 @@ pub struct GatewayRef {
 /// entries use a `file:` source under `credentialMountBase`; the mounted
 /// Kubernetes Secret provides the token at runtime.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "wire-compatible opt-in and attestation fields are separate"
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.

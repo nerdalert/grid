@@ -1520,6 +1520,7 @@ dependencies = [
  "praxis-proxy-protocol",
  "praxis-proxy-tls",
  "rustls",
+ "serde",
  "tokio",
  "tokio-rustls",
  "tracing",

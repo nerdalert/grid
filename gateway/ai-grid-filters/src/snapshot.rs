@@ -42,6 +42,9 @@ pub struct RouteSnapshot {
 
     /// Models answering 503 because every healthy site serving them is past full.
     pub shedding: BTreeSet<Arc<str>>,
+
+    /// Verified provider-hop clusters from the same serving revision as the candidates.
+    pub provider_hop_clusters: Arc<BTreeSet<String>>,
 }
 
 /// Per model while shedding is decided: whether every site is measured, and whether each
@@ -76,6 +79,7 @@ impl RouteSnapshot {
             local_site,
             scores,
             shedding: BTreeSet::new(),
+            provider_hop_clusters: Arc::default(),
         }
     }
 
@@ -91,23 +95,6 @@ impl RouteSnapshot {
         candidates: Vec<RouteCandidate>,
         local_site: Arc<str>,
         inputs: &mut Inputs<'_, S>,
-    ) -> Self {
-        Self::from_store_with_provider_hops(candidates, local_site, store, now_ms, window_ms, BTreeSet::new())
-    }
-
-    /// Order candidates by load and keep the provider-hop allowlist in the same
-    /// immutable snapshot so route and trust decisions change atomically.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the immutable snapshot constructor takes all independent routing inputs explicitly"
-    )]
-    pub fn from_store_with_provider_hops(
-        candidates: Vec<RouteCandidate>,
-        local_site: Arc<str>,
-        store: &LoadStore,
-        now_ms: i64,
-        window_ms: i64,
-        provider_hop_clusters: BTreeSet<String>,
     ) -> Self {
         // Score each candidate once, then sort the pairs: load_of allocates a
         // store key and scans a window, too costly to repeat inside sort_by.
@@ -325,7 +312,9 @@ impl RouteSnapshot {
                 (demoted, candidate)
             })
             .collect();
-        Self::ranked(ranked, self.local_site)
+        let mut ordered = Self::ranked(ranked, self.local_site);
+        ordered.provider_hop_clusters = self.provider_hop_clusters;
+        ordered
     }
 
     /// This snapshot, after setting `grid_route_site_score` for each of its site/cluster pairs.
@@ -371,6 +360,7 @@ impl RouteSnapshot {
             scores,
             local_site,
             shedding: BTreeSet::new(),
+            provider_hop_clusters: Arc::default(),
         }
     }
 }

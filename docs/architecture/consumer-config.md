@@ -74,9 +74,9 @@ behavior.
 
 When `spec.gatewayRefs[].consumerConfig.enabled: true`, the `GridNetwork`
 controller renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace
-when consumer configuration renders successfully. An empty candidate overlay
-produces a fail-closed 503-only config without route filters. For nonempty
-candidates, the generated config includes:
+when consumer configuration renders successfully. The generated config keeps
+the watched route filter and complete endpoint inventory even when the current
+overlay has no candidates, so a later revision can restore routing.
 
 **Validation status:** `verify-api-fallback-native` proves end-to-end runtime
 consumption of the operator-generated `ConfigMap`.  The xtask harness reads the
@@ -202,9 +202,8 @@ an empty list in arbitrary startup YAML:
 
 Grid publishes authoritative empty revisions without a capability flag. Every
 consumer of a gateway's overlay must therefore run an image with empty-snapshot
-support before this Grid version is deployed. The chart-default Praxis AI 0.4.0
-image is not compatible; the paired AI change and a compatible image release
-are prerequisites for the next Grid release.
+support before this Grid version is deployed. The paired AI change and a
+compatible image release are prerequisites for the next Grid release.
 
 The embedded gateway's filter chain and upstream cluster definitions remain in
 its startup Praxis configuration, but its changing candidate list is not a
@@ -272,9 +271,11 @@ one patch. Old pods keep their previous config and projections during rollout.
 Grid waits until no old replicas remain before reusing the inactive slot or
 pruning obsolete mounts. This also lets a new Deployment become ready before
 Grid replaces the bootstrap config. This verifies the Kubernetes rollout, not
-Praxis acceptance of populated routes. The current generated inline candidates
-include `admission_state` and `selection_group`, which the tested Praxis image
-rejects. Populated-route use requires the versioned-overlay config in
+Praxis acceptance of populated routes. Older generated configs embedded
+`admission_state` and `selection_group` in inline candidates, which the
+previously supported Praxis AI image rejected. Populated routes require a
+Praxis AI image that accepts Grid's versioned-overlay config. They also require
+the versioned-overlay config in
 [Grid #270](https://github.com/praxis-proxy/grid/pull/270), a compatible image
 containing [Praxis AI #1539](https://github.com/praxis-proxy/ai/pull/1539), and
 an unmodified generated-config request probe. Until then, do not release
@@ -291,11 +292,11 @@ Secret reference and key changes. When a reference is removed, the old mount
 remains until pods with the new config are ready, then Grid removes only mounts
 recorded as Grid-owned.
 If the last provider disappears, the operator distributes an empty authoritative
-routing overlay and renders the generated consumer config as a 503-only response
-with no `intelligent_route` filter. For delegated mounts, the empty overlay is
-published before the 503-only config is reconciled, so consumers using the
-watched overlay stop selecting providers even if config reconciliation fails.
-A static-only consumer still needs the 503-only config to apply and reload.
+routing overlay. The generated consumer config retains `intelligent_route`, its
+overlay watcher, and the complete endpoint inventory so a later revision can
+restore routing. For delegated mounts, the empty overlay is published before
+config reconciliation, so consumers using the watched overlay stop selecting
+providers even if config reconciliation fails.
 Obsolete Grid-owned mounts are pruned only after the matching config rollout is
 ready. Other Deployment fields, containers, volumes, mounts, and Helm resources
 are preserved.
@@ -451,11 +452,10 @@ overlay is a separate file that `intelligent_route` validates and reloads. See
 [Reload and rollout](#reload-and-rollout) below.
 
 When no inference candidates remain, the operator distributes an empty
-authoritative routing overlay and updates its generated consumer `ConfigMap` to
-a 503-only response with no `intelligent_route` filter. The ConfigMap update
-does not itself restart gateway pods; use a supported file reload or restart
-when the running gateway does not reload it. The empty overlay also fails closed
-for routes already using the dynamic overlay.
+authoritative routing overlay. The generated consumer `ConfigMap` retains the
+watched `intelligent_route` filter and configured endpoints for restoration.
+The ConfigMap update does not itself restart gateway pods; use a supported file
+reload or restart when the running gateway does not reload it.
 
 ## Edge-ingress deployments
 

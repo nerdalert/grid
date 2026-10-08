@@ -164,13 +164,21 @@ pub(crate) fn should_skip_kind_image_loading() -> bool {
 /// Import a host image into a run-owned Kind node using only its linux/amd64
 /// image content. This avoids OCI-index imports failing when the local Docker
 /// store has only the linux/amd64 child content.
+#[expect(
+    clippy::too_many_lines,
+    reason = "ensures both image processes are reaped on every failure path"
+)]
 pub(crate) fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let control_plane = format!("{kind_name}-control-plane");
     let mut save = Command::new("docker")
         .args(["save", "--platform", "linux/amd64", image])
         .stdout(Stdio::piped())
         .spawn()?;
-    let save_stdout = save.stdout.take().ok_or("docker save did not provide stdout")?;
+    let Some(save_stdout) = save.stdout.take() else {
+        drop(save.kill());
+        drop(save.wait());
+        return Err("docker save did not provide stdout".into());
+    };
     let import_status = Command::new("docker")
         .args([
             "exec",
@@ -186,7 +194,15 @@ pub(crate) fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Resul
             "-",
         ])
         .stdin(save_stdout)
-        .status()?;
+        .status();
+    let import_status = match import_status {
+        Ok(status) => status,
+        Err(error) => {
+            drop(save.kill());
+            drop(save.wait());
+            return Err(error.into());
+        },
+    };
     let save_status = save.wait()?;
     if !save_status.success() {
         return Err(format!("docker save failed for {image}").into());

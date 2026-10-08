@@ -1636,20 +1636,32 @@ mod tests {
 
     #[test]
     fn no_matching_sites_reason_takes_precedence_over_probe_phase() {
-        assert!(selector_has_no_matches(1, &[]));
+        assert!(
+            selector_has_no_matches(1, &[]),
+            "an observed empty site inventory withdraws the provider"
+        );
         assert!(
             !selector_has_no_matches(0, &[]),
             "no inventory preserves Phase 1 fallback"
         );
-        assert!(!selector_has_no_matches(1, &["site-a".to_owned()]));
-        // The reason is based on authoritative selector inventory, not the
-        // eventual health-probe phase. resolve_phase_and_sites returns this
-        // Pending withdrawal before it can become Degraded.
-        assert_eq!(no_matching_sites_reason(true).as_deref(), Some("NoMatchingSites"));
-        assert_eq!(no_matching_sites_reason(false), None);
+        assert!(
+            !selector_has_no_matches(1, &["site-a".to_owned()]),
+            "a matching site retains the provider"
+        );
+        assert_eq!(
+            no_matching_sites_reason(true).as_deref(),
+            Some("NoMatchingSites"),
+            "selector withdrawal takes precedence over probe phase"
+        );
+        assert_eq!(
+            no_matching_sites_reason(false),
+            None,
+            "a matching selector has no withdrawal reason"
+        );
         assert_eq!(
             phase_from_probe(ProbeOutcome::Degraded, ProviderPhase::Pending),
-            ProviderPhase::Degraded
+            ProviderPhase::Degraded,
+            "without selector withdrawal, a degraded probe remains degraded"
         );
     }
 

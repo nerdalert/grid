@@ -2242,6 +2242,26 @@ async fn reconcile_routing_overlay_inner(
                 "routing overlay has no candidates; distributing authoritative no-route state"
             );
         }
+        let credential_bearing = overlay
+            .candidates
+            .iter()
+            .any(|candidate| candidate.credential.is_some());
+        if credential_bearing
+            && let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled)
+            && !cc.enable_projected_credentials
+        {
+            let error = OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported);
+            consumer_statuses.push(consumer_config_status_error(gw_ref, cc, &error, observed_generation));
+            overlay_statuses.push(retained_overlay_status(
+                network,
+                gw_ref,
+                observed_generation,
+                Some(&render),
+                "ProjectedCredentialsUnsupported",
+                "credential-bearing overlay requires a rolled-out projected credential filter and mounted Secrets",
+            ));
+            continue;
+        }
         // For delegated gateways, make the generated config and all of its
         // Secret mounts available before publishing candidates that can use
         // them. A pending or failed mount/config rollout retains the previous
@@ -2266,7 +2286,7 @@ async fn reconcile_routing_overlay_inner(
             .await
             {
                 Ok(outcome) => {
-                    if outcome.config_applied {
+                    if outcome.config_applied && (!credential_bearing || cc.supports_projected_credentials) {
                         consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
                     }
                     if let Some(status) = outcome.mount_status {
@@ -2303,6 +2323,23 @@ async fn reconcile_routing_overlay_inner(
                 ));
                 continue;
             }
+        }
+
+        if credential_bearing
+            && let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled)
+            && !cc.supports_projected_credentials
+        {
+            let error = OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported);
+            consumer_statuses.push(consumer_config_status_error(gw_ref, cc, &error, observed_generation));
+            overlay_statuses.push(retained_overlay_status(
+                network,
+                gw_ref,
+                observed_generation,
+                Some(&render),
+                "ProjectedCredentialsUnsupported",
+                "credential-bearing overlay requires a rolled-out projected credential filter and mounted Secrets",
+            ));
+            continue;
         }
 
         let resource_version = match distribute_overlay_configmap(&overlay, &render, network_name, gw_ref, client).await
@@ -2406,10 +2443,6 @@ async fn reconcile_routing_overlay_inner(
     })
 }
 
-/// Legacy status reason used by retained-status compatibility tests.
-#[cfg(test)]
-const EMPTY_CANDIDATES: &str = "EmptyCandidates";
-
 /// What one routing overlay pass produced, per gateway.
 struct OverlayOutcome {
     /// Consumer config render and apply results.
@@ -2485,8 +2518,10 @@ fn render_serving_text(
             cc.tls_cert_mount_path.as_str()
         });
     let provider_hop_sni = serving_provider_hop_sni_for_overlay(overlay, gw_ref)?;
-    let provider_hop_clusters = provider_hop_sni.keys().cloned().collect();
+    let provider_hop_clusters: BTreeSet<String> = provider_hop_sni.keys().cloned().collect();
     let inputs = ServingInputs {
+        provider_hop_clusters: &provider_hop_clusters,
+        provider_hop_sni: &provider_hop_sni,
         tls_mount,
         local_signals_addr: source.settings.local_signals_addr.as_deref(),
         pins: &source.pins,
@@ -2500,13 +2535,13 @@ fn render_serving_text(
 fn serving_provider_hop_sni_for_overlay(
     overlay: &routing_overlay::RoutingOverlay,
     gw_ref: &GatewayRef,
-) -> Result<std::collections::BTreeMap<String, String>, OperatorError> {
+) -> Result<BTreeMap<String, String>, OperatorError> {
     if overlay.candidates.is_empty() {
         if let Err(error) = serving_provider_hop_clusters(gw_ref) {
             tracing::warn!(gateway = %gw_ref.name, %error,
                 "invalid provider-hop declaration ignored for empty serving revision");
         }
-        Ok(std::collections::BTreeMap::new())
+        Ok(BTreeMap::new())
     } else {
         serving_provider_hop_clusters(gw_ref)?;
         Ok(gw_ref
@@ -2889,7 +2924,7 @@ async fn apply_consumer_config_for_gateway(
     observed_generation: i64,
     client: &Client,
 ) -> Result<ConsumerApplyOutcome, OperatorError> {
-    let rendered = consumer_config::render_consumer_config(
+    let rendered = consumer_config::render_consumer_config_with_projected(
         overlay,
         &cc.credential_mount_base,
         &cc.cluster_endpoints,
@@ -2899,6 +2934,7 @@ async fn apply_consumer_config_for_gateway(
         &gw_ref.name,
         &gw_ref.namespace,
         cc.telemetry.as_ref(),
+        cc.enable_projected_credentials,
         cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled),
     )?;
     if let Some(mounts) = cc.mount_reconciliation.as_ref().filter(|mounts| mounts.enabled) {
@@ -4463,7 +4499,10 @@ fn provider_state_from_kube(
     let provider_id = provider.metadata.name.as_deref()?;
     let routing_cluster = routing_overlay::routing_identity(provider)?.to_owned();
     let models = provider.spec.models.iter().map(|m| m.name.clone()).collect();
-    let phase = crdt_phase_from_provider(provider.status.as_ref().map(|s| &s.phase));
+    let phase = crdt_phase_from_provider(
+        provider.status.as_ref(),
+        provider.metadata.generation.unwrap_or_default(),
+    );
     let revision = provider_revision(&provider.metadata);
     let capacity_weight = effective_capacity_weight(provider);
     Some(crdt::ProviderState {
@@ -4516,7 +4555,15 @@ fn tool_provider_state_from_kube(
 ) -> Option<crdt::ProviderState> {
     let name = provider.metadata.name.as_deref()?;
     let tools = tool_names_from_agent_tool_provider(provider);
-    let phase = crdt_phase_from_provider(provider.status.as_ref().map(|s| &s.phase));
+    let phase = provider
+        .status
+        .as_ref()
+        .map_or(crdt::ProviderPhase::Pending, |status| match status.phase {
+            crate::crd::inference_provider::ProviderPhase::Available => crdt::ProviderPhase::Available,
+            crate::crd::inference_provider::ProviderPhase::Degraded => crdt::ProviderPhase::Degraded,
+            crate::crd::inference_provider::ProviderPhase::Unavailable => crdt::ProviderPhase::Unavailable,
+            crate::crd::inference_provider::ProviderPhase::Pending => crdt::ProviderPhase::Pending,
+        });
     let revision = provider_revision(&provider.metadata);
     // Prefix with "tool/" to distinguish from InferenceProvider names in the
     // CRDT key (network/site/provider_id). Without this, an InferenceProvider
@@ -5166,6 +5213,9 @@ pub(crate) fn consumer_config_status_error(
         OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingSni { .. }) => "MissingSni",
         OperatorError::ConsumerConfigRender(ConsumerConfigError::PlaintextWithSni { .. }) => "PlaintextWithSni",
         OperatorError::ConsumerConfigRender(ConsumerConfigError::NoInferenceCandidates) => "NoInferenceCandidates",
+        OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported) => {
+            "ProjectedCredentialsUnsupported"
+        },
         OperatorError::ConsumerConfigRender(_) => "ConsumerConfigRenderFailed",
         OperatorError::MountReconciliation(failure) => failure.reason,
         OperatorError::Kube(_) => "ConsumerConfigApplyFailed",
@@ -6050,10 +6100,7 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        crd::grid_network::{ClusterEndpointConfig, EndpointTransport, ProviderHopEndpointConfig},
-        swim_endpoint::EndpointResolutionFailure,
-    };
+    use crate::swim_endpoint::EndpointResolutionFailure;
 
     #[test]
     fn a_provider_not_ready_publishes_ready_zero_without_a_fresh_scrape() {

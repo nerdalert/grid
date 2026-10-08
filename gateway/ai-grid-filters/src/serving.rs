@@ -7,7 +7,7 @@
 //! resolved order. A watch on the config file applies the operator's rewrites.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs,
     path::PathBuf,
     sync::{Arc, Mutex, PoisonError},
@@ -319,7 +319,10 @@ pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError>
 /// Returns [`FilterError`] if the local site or candidate topology is invalid, a
 /// peer's certificate material cannot be read or parsed, or a poller thread
 /// cannot be spawned.
-pub fn spawn_grid_routing(config: &GridServingConfig) -> Result<GridRuntime, FilterError> {
+pub fn spawn_grid_routing(
+    config: &GridServingConfig,
+    backend_tls: BTreeMap<String, String>,
+) -> Result<GridRuntime, FilterError> {
     // The peer scrapers load TLS here, before the server installs the provider.
     praxis_tls::provider::install();
     let start = Box::new(|peer: &PeerServingConfig, poller: &_, store, refresh| {

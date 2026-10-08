@@ -86,6 +86,9 @@ pub(crate) struct ServingConfig {
 /// One routable `(model, site, cluster)`, `cluster` naming a `load_balancer` cluster.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ServingCandidate {
+    /// Overlay-assigned stable identity used by authenticated provider hops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stable_id: Option<String>,
     /// Always `inference_model`.
     pub(crate) kind: &'static str,
     /// Model name.
@@ -141,6 +144,10 @@ pub(crate) struct ServingPeer {
 /// Per-gateway inputs that are not in the overlay.
 #[derive(Clone, Debug)]
 pub(crate) struct ServingInputs<'input> {
+    /// Verified gateway clusters allowed to carry provider-hop context.
+    pub(crate) provider_hop_clusters: &'input BTreeSet<String>,
+    /// Declared TLS identity for each provider-hop cluster.
+    pub(crate) provider_hop_sni: &'input BTreeMap<String, String>,
     /// Directory holding this site's `ca.crt`, `tls.crt`, `tls.key` in the gateway pod.
     pub(crate) tls_mount: &'input str,
     /// Operator-configured address of this site's own signals endpoint.
@@ -165,7 +172,7 @@ where
 {
     let candidates = candidates(overlay);
     let sites: BTreeSet<&str> = candidates.iter().map(|candidate| candidate.site.as_str()).collect();
-    let mut addrs = remote_addrs(members, &sites, &overlay.local_site);
+    let mut addrs = remote_addrs(members, &sites, &overlay.local_site, overlay.candidates.is_empty());
     if let Some(addr) = inputs.local_signals_addr
         && certs::validate_site_name(&overlay.local_site).is_ok()
     {
@@ -225,7 +232,7 @@ type CandidateKey<'overlay> = (bool, &'overlay str, &'overlay str, &'overlay str
 fn dedup<'overlay>(
     overlay: impl Iterator<Item = &'overlay RoutingCandidate>,
     local_site: &str,
-) -> BTreeMap<CandidateKey<'overlay>, (bool, AdmissionState)> {
+) -> BTreeMap<CandidateKey<'overlay>, (bool, AdmissionState, Option<String>)> {
     let mut unique = BTreeMap::new();
     for candidate in overlay.filter(|candidate| routable(candidate)) {
         let key = (
@@ -238,9 +245,14 @@ fn dedup<'overlay>(
         // Seeded with the identities of both folds, so the first candidate and every
         // duplicate after it take the same path: fresh only if all are, admission as
         // restricted as the most restricted.
-        let (fresh, held) = unique.entry(key).or_insert((true, AdmissionState::NewAndExisting));
+        let (fresh, held, stable_id) = unique
+            .entry(key)
+            .or_insert_with(|| (true, AdmissionState::NewAndExisting, candidate.stable_id.clone()));
         *fresh &= candidate.fresh;
         *held = (*held).max(admission);
+        if stable_id.is_none() {
+            stable_id.clone_from(&candidate.stable_id);
+        }
     }
     unique
 }
@@ -249,6 +261,9 @@ fn dedup<'overlay>(
 ///
 /// Past the cap, candidates taking new requests are kept before the rest.
 fn candidates(overlay: &RoutingOverlay) -> Vec<ServingCandidate> {
+    if overlay.candidates.is_empty() {
+        return Vec::new();
+    }
     // Local first so cold start, before any signal, prefers this site.
     let unique = dedup(overlay.candidates.iter().chain(&overlay.excluded), &overlay.local_site);
     let mut kept: Vec<_> = unique.into_iter().collect();
@@ -257,19 +272,22 @@ fn candidates(overlay: &RoutingOverlay) -> Vec<ServingCandidate> {
             candidates = kept.len(),
             "serving config: dropping candidates past the gateway cap"
         );
-        kept.sort_by_key(|(key, (_, admission))| (*admission != AdmissionState::NewAndExisting, *key));
+        kept.sort_by_key(|(key, (_, admission, _))| (*admission != AdmissionState::NewAndExisting, *key));
         kept.truncate(MAX_CANDIDATES);
         kept.sort_by_key(|(key, _)| *key);
     }
     kept.into_iter()
-        .map(|((_, site, name, cluster), (fresh, admission))| ServingCandidate {
-            kind: INFERENCE_MODEL,
-            name: name.to_owned(),
-            site: site.to_owned(),
-            cluster: cluster.to_owned(),
-            fresh,
-            admission,
-        })
+        .map(
+            |((_, site, name, cluster), (fresh, admission, stable_id))| ServingCandidate {
+                stable_id,
+                kind: INFERENCE_MODEL,
+                name: name.to_owned(),
+                site: site.to_owned(),
+                cluster: cluster.to_owned(),
+                fresh,
+                admission,
+            },
+        )
         .collect()
 }
 
@@ -323,13 +341,16 @@ fn remote_addrs<'member, Members>(
     members: Members,
     sites: &BTreeSet<&str>,
     local_site: &str,
+    include_all: bool,
 ) -> BTreeMap<String, String>
 where
     Members: IntoIterator<Item = (&'member str, &'member str)>,
 {
     members
         .into_iter()
-        .filter(|(site, _)| *site != local_site && sites.contains(site) && certs::validate_site_name(site).is_ok())
+        .filter(|(site, _)| {
+            *site != local_site && (include_all || sites.contains(site)) && certs::validate_site_name(site).is_ok()
+        })
         .filter_map(|(site, endpoint)| {
             let Some(parsed) = SignalsEndpoint::parse(endpoint).filter(SignalsEndpoint::is_dialable) else {
                 tracing::warn!(site, endpoint, "serving config: refusing advertised peer address");
@@ -474,6 +495,8 @@ mod tests {
     static NO_PROVIDER_HOP_SNI: BTreeMap<String, String> = BTreeMap::new();
 
     const INPUTS: ServingInputs<'static> = ServingInputs {
+        provider_hop_clusters: &NO_PROVIDER_HOPS,
+        provider_hop_sni: &NO_PROVIDER_HOP_SNI,
         tls_mount: "/etc/praxis/tls",
         local_signals_addr: None,
         pins: &NO_PINS,
@@ -541,9 +564,16 @@ mod tests {
     #[test]
     fn empty_overlay_renders_authoritative_no_route_config() {
         let config = render(&overlay(Vec::new()), [("site-b", "203.0.113.7:9091")], &INPUTS);
-        assert!(config.candidates.is_empty());
-        assert!(config.peers.is_empty());
-        assert!(to_text(&config).expect("json").contains("\"candidates\": []"));
+        assert!(config.candidates.is_empty(), "the empty overlay withdraws every route");
+        assert_eq!(
+            peer_sites(&config),
+            [("site-b", "203.0.113.7:9091")],
+            "signals pollers remain ready for restoration"
+        );
+        assert!(
+            to_text(&config).expect("json").contains("\"candidates\": []"),
+            "the serialized revision carries an empty candidate list"
+        );
     }
 
     #[test]
@@ -682,10 +712,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "table-driven test covers both irrelevant and unsafe peer addresses"
-    )]
     fn unsafe_or_irrelevant_peers_are_refused() {
         let cases = [
             ("loopback", "127.0.0.1:9091"),
@@ -759,6 +785,19 @@ mod tests {
                 ("site-b", "203.0.113.7:9091"),
             ],
             "no-route config retains metrics connections for route restoration"
+        );
+    }
+
+    #[test]
+    fn excluded_history_cannot_restore_an_authoritative_empty_revision() {
+        let mut withdrawn = overlay(Vec::new());
+        withdrawn
+            .excluded
+            .push(cand("llama", "site-b", "provider-b", Some("none")));
+        let config = render(&withdrawn, [], &INPUTS);
+        assert!(
+            config.candidates.is_empty(),
+            "an empty active overlay withdraws prior excluded history"
         );
     }
 

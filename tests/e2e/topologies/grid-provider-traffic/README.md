@@ -175,7 +175,7 @@ scenarios.
 
 The qualification builds both consumers from compatible source under test.
 Deployments must upgrade and roll out every consumer before using this Grid
-version, because older images (including the chart-default AI 0.4.0) reject
+version, because images without empty-overlay support reject
 the authoritative empty snapshot.
 
 Full mode also exercises the generated consumer credential lifecycle in two
@@ -210,9 +210,11 @@ A qualifying run demonstrates:
 - in full mode, a partial withdrawal serves only the remaining providers;
 - in full mode, last-route withdrawal publishes a new empty revision that the
   overlay-backed and embedded Grid gateway consumers both accept and serve;
-- new and previously bound overlay-backed requests receive an unattributed
-  no-route response, with provider workloads still Ready and backend counters
-  unchanged;
+- in full mode, new and previously bound overlay-backed requests and, when
+  embedded gateway setup succeeds, equivalent embedded Grid gateway requests
+  receive unattributed HTTP 404 responses (RFC 9110 §15.5.5);
+- provider workloads are Ready before the no-route probes; backend request and
+  provider-gateway POST counters remain unchanged across the probes;
 - restoration publishes and serves a new revision and attributed requests
   resume;
 - teardown removes the clusters and shared network.
