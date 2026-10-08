@@ -2781,6 +2781,21 @@ const SECRET_RESOURCE_VERSIONS_ANNOTATION: &str = "grid.praxis-proxy.io/secret-r
 /// Reserved prefix for projected volume names owned by Grid.
 const GRID_MOUNT_PREFIX: &str = "grid-mount-";
 
+/// A second, bounded config slot lets old and new Pod revisions retain their matching files.
+fn alternate_consumer_config_map_name(base: &str) -> String {
+    let digest = gateway_mounts::config_revision(base);
+    format!("grid-consumer-config-{}", digest.chars().take(16).collect::<String>())
+}
+
+/// Reuse only a config slot that the completed Deployment rollout no longer mounts.
+fn inactive_consumer_config_map_name(base: &str, active: &str) -> String {
+    if active == base {
+        alternate_consumer_config_map_name(base)
+    } else {
+        base.to_owned()
+    }
+}
+
 /// Render Praxis config and requirements, optionally reconciling a delegated gateway.
 #[expect(
     clippy::too_many_arguments,
@@ -2816,17 +2831,25 @@ async fn apply_consumer_config_for_gateway(
         cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled),
     )?;
     if let Some(mounts) = cc.mount_reconciliation.as_ref().filter(|mounts| mounts.enabled) {
-        let (status, config_applied) = Box::pin(reconcile_delegated_gateway(
-            &rendered,
-            network_name,
-            gw_ref,
-            cc,
-            mounts,
-            tls,
-            observed_generation,
-            client,
-        ))
-        .await?;
+        let mut attempts = 0;
+        let (status, config_applied) = loop {
+            let result = Box::pin(reconcile_delegated_gateway(
+                &rendered,
+                network_name,
+                gw_ref,
+                cc,
+                mounts,
+                tls,
+                observed_generation,
+                client,
+            ))
+            .await;
+            if result.as_ref().is_err_and(OperatorError::is_conflict) && attempts < 2 {
+                attempts += 1;
+                continue;
+            }
+            break result?;
+        };
         return Ok(ConsumerApplyOutcome {
             config_applied,
             mount_status: Some(status),
@@ -3128,25 +3151,36 @@ async fn apply_consumer_config_map(
     cc: &ConsumerConfig,
     client: &Client,
 ) -> Result<(), OperatorError> {
+    apply_consumer_config_map_named(config_yaml, network_name, gw_ref, &cc.config_map_name, client).await
+}
+
+/// Publish a config into a selected slot before switching the delegated Pod template to it.
+async fn apply_consumer_config_map_named(
+    config_yaml: &str,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    config_map_name: &str,
+    client: &Client,
+) -> Result<(), OperatorError> {
     let cm = consumer_config::build_consumer_config_map(
         config_yaml,
-        &cc.config_map_name,
+        config_map_name,
         &gw_ref.namespace,
         network_name,
         &gw_ref.name,
     );
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
-    if Box::pin(config_map_current(&api, &cc.config_map_name, &cm)).await? {
+    if Box::pin(config_map_current(&api, config_map_name, &cm)).await? {
         return Ok(());
     }
     api.patch(
-        &cc.config_map_name,
+        config_map_name,
         &PatchParams::apply(FIELD_MANAGER).force(),
         &Patch::Apply(&cm),
     )
     .await?;
     info!(
-        config_map = %cc.config_map_name,
+        config_map = %config_map_name,
         namespace = %gw_ref.namespace,
         "applied consumer Praxis config ConfigMap"
     );
@@ -3163,6 +3197,72 @@ async fn config_map_current(api: &Api<ConfigMap>, name: &str, desired: &ConfigMa
         tracing::debug!(config_map = %name, "consumer Praxis config unchanged");
     }
     Ok(current)
+}
+
+/// Keep a strategic patch tied to the Deployment version used to compute mount ownership.
+fn guarded_deployment_patch(mut patch: Value, deployment: &Deployment) -> Result<Value, OperatorError> {
+    let version = deployment
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(|| mount_failure("DeploymentInvalid", "the delegated Deployment has no resourceVersion"))?;
+    let metadata = patch
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| mount_failure("DeploymentInvalid", "the Deployment patch has no metadata"))?;
+    metadata.insert("resourceVersion".to_owned(), json!(version));
+    Ok(patch)
+}
+
+/// Preserve conflict errors so the caller can retry from a fresh Deployment read.
+async fn patch_delegated_deployment(
+    deployments: &Api<Deployment>,
+    name: &str,
+    deployment: &Deployment,
+    patch: Value,
+    failure_message: &'static str,
+) -> Result<(), OperatorError> {
+    let patch = guarded_deployment_patch(patch, deployment)?;
+    match deployments
+        .patch(name, &PatchParams::default(), &Patch::Strategic(patch))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if matches!(&error, kube::Error::Api(status) if status.code == 409) => Err(error.into()),
+        Err(_) => Err(mount_failure("DeploymentPatchFailed", failure_message).into()),
+    }
+}
+
+/// Switch config source, Secret projections, and their revisions in one Pod-template update.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the staged patch keeps config, mounts, and revisions in one write"
+)]
+fn staged_config_mount_patch(
+    mut volume_mutations: Vec<Value>,
+    mount_additions: &[Value],
+    config_volume_name: &str,
+    next_config_name: &str,
+    container_name: &str,
+    deployment_annotations: &Value,
+    template_annotations: &Value,
+) -> Value {
+    volume_mutations.push(json!({"name": config_volume_name, "configMap": {"name": next_config_name}}));
+    let mut pod_spec_patch = serde_json::Map::new();
+    pod_spec_patch.insert("volumes".to_owned(), Value::Array(volume_mutations));
+    if !mount_additions.is_empty() {
+        pod_spec_patch.insert(
+            "containers".to_owned(),
+            json!([{"name": container_name, "volumeMounts": mount_additions}]),
+        );
+    }
+    json!({
+        "metadata": {"annotations": deployment_annotations},
+        "spec": {"template": {
+            "metadata": {"annotations": template_annotations},
+            "spec": pod_spec_patch
+        }}
+    })
 }
 
 /// Validate and reconcile one explicitly delegated gateway Deployment.
@@ -3245,6 +3345,17 @@ async fn reconcile_delegated_gateway(
         .ok_or_else(|| mount_failure("ContainerMissing", "the named Praxis container is absent"))?;
     let volumes = template.volumes.as_deref().unwrap_or_default();
     let target_mounts = target_container.volume_mounts.as_deref().unwrap_or_default();
+    let config_volume_name = target_mounts
+        .iter()
+        .find(|mount| mount.mount_path == "/etc/praxis")
+        .map(|mount| mount.name.as_str())
+        .ok_or_else(|| mount_failure("ConfigSourceMismatch", "the Praxis config mount is absent"))?;
+    let active_config_name = volumes
+        .iter()
+        .find(|volume| volume.name == config_volume_name)
+        .and_then(|volume| volume.config_map.as_ref())
+        .map(|source| source.name.as_str())
+        .ok_or_else(|| mount_failure("ConfigSourceMismatch", "the Praxis config source is absent"))?;
     let mut owned_mounts = read_owned_mounts(&deployment)?;
     let expected_names: BTreeSet<String> = desired_mounts.iter().map(|mount| mount.volume_name.clone()).collect();
     let mut additions = Vec::new();
@@ -3334,122 +3445,36 @@ async fn reconcile_delegated_gateway(
     let has_mount_revision = template_annotations
         .get(MOUNT_REVISION_ANNOTATION)
         .is_some_and(|revision| revision == &requirements_revision);
+    let config_revision = gateway_mounts::config_revision(&rendered.config_yaml);
+    let resource_versions_json = serde_json::to_string(&resource_versions)?;
     let owned_mounts_json = serde_json::to_string(&owned_mounts.iter().collect::<Vec<_>>())?;
     let current_owned_mounts_json = deployment
         .metadata
         .annotations
         .as_ref()
         .and_then(|annotations| annotations.get(OWNED_MOUNTS_ANNOTATION));
-    if !additions.is_empty()
+    let active_cm = consumer_config::build_consumer_config_map(
+        &rendered.config_yaml,
+        active_config_name,
+        &gw_ref.namespace,
+        network_name,
+        &gw_ref.name,
+    );
+    let config_api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    let active_config_current = Box::pin(config_map_current(&config_api, active_config_name, &active_cm)).await?;
+    let needs_revision_rollout = !additions.is_empty()
         || !mount_additions.is_empty()
         || !has_mount_revision
         || current_owned_mounts_json != Some(&owned_mounts_json)
-    {
-        let mut pod_spec_patch = serde_json::Map::new();
-        if !additions.is_empty() {
-            pod_spec_patch.insert("volumes".to_owned(), Value::Array(additions));
-        }
-        if !mount_additions.is_empty() {
-            pod_spec_patch.insert(
-                "containers".to_owned(),
-                json!([{"name": delegation.container_name, "volumeMounts": mount_additions}]),
-            );
-        }
-        let patch = json!({
-            "metadata": {"annotations": {OWNED_MOUNTS_ANNOTATION: owned_mounts_json}},
-            "spec": {"template": {
-                "metadata": {"annotations": {MOUNT_REVISION_ANNOTATION: requirements_revision}},
-                "spec": pod_spec_patch
-            }}
-        });
-        deployments
-            .patch(deployment_name, &PatchParams::default(), &Patch::Strategic(patch))
-            .await
-            .map_err(|_error| {
-                mount_failure(
-                    "DeploymentPatchFailed",
-                    "could not add Grid-owned mounts to the Deployment",
-                )
-            })?;
-        return Ok((
-            mount_status(
-                gw_ref,
-                Some(delegation),
-                MountReconciliationPhase::MountsReconciling,
-                &requirements_revision,
-                "",
-                "Grid-owned mount additions were applied; waiting for the Deployment rollout",
-                "",
-                observed_generation,
-                deployment.metadata.generation.unwrap_or(0),
-            ),
-            false,
-        ));
-    }
-
-    if !deployment_rollout_ready(&deployment) {
-        return Ok((
-            mount_status(
-                gw_ref,
-                Some(delegation),
-                MountReconciliationPhase::WaitingForRollout,
-                &requirements_revision,
-                "",
-                "the required mounts are in the pod template; waiting for available updated replicas",
-                "",
-                observed_generation,
-                deployment.metadata.generation.unwrap_or(0),
-            ),
-            false,
-        ));
-    }
-
-    apply_consumer_config_map(&rendered.config_yaml, network_name, gw_ref, cc, client).await?;
-    let config_revision = gateway_mounts::config_revision(&rendered.config_yaml);
-    let resource_versions_json = serde_json::to_string(&resource_versions)?;
-    let annotations = pod_template
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.annotations.as_ref())
-        .cloned()
-        .unwrap_or_default();
-    let needs_config_rollout = annotations.get(CONFIG_REVISION_ANNOTATION) != Some(&config_revision)
-        || annotations.get(SECRET_REVISION_ANNOTATION) != Some(&secret_revision)
+        || template_annotations.get(CONFIG_REVISION_ANNOTATION) != Some(&config_revision)
+        || template_annotations.get(SECRET_REVISION_ANNOTATION) != Some(&secret_revision)
         || deployment
             .metadata
             .annotations
             .as_ref()
             .and_then(|values| values.get(SECRET_RESOURCE_VERSIONS_ANNOTATION))
-            != Some(&resource_versions_json);
-    if needs_config_rollout {
-        let patch = json!({
-            "metadata": {"annotations": {SECRET_RESOURCE_VERSIONS_ANNOTATION: resource_versions_json}},
-            "spec": {"template": {"metadata": {"annotations": {
-                CONFIG_REVISION_ANNOTATION: config_revision,
-                SECRET_REVISION_ANNOTATION: secret_revision
-            }}}}
-        });
-        deployments
-            .patch(deployment_name, &PatchParams::default(), &Patch::Strategic(patch))
-            .await
-            .map_err(|_error| {
-                mount_failure("DeploymentPatchFailed", "could not request the matching config rollout")
-            })?;
-        return Ok((
-            mount_status(
-                gw_ref,
-                Some(delegation),
-                MountReconciliationPhase::WaitingForRollout,
-                &requirements_revision,
-                "",
-                "the Praxis config and Secret resource versions were recorded; waiting for the matching rollout",
-                "",
-                observed_generation,
-                deployment.metadata.generation.unwrap_or(0),
-            ),
-            true,
-        ));
-    }
+            != Some(&resource_versions_json)
+        || !active_config_current;
     if !deployment_rollout_ready(&deployment) {
         return Ok((
             mount_status(
@@ -3458,7 +3483,81 @@ async fn reconcile_delegated_gateway(
                 MountReconciliationPhase::WaitingForRollout,
                 &requirements_revision,
                 "",
-                "waiting for the Deployment revision carrying the matching Praxis config",
+                "waiting for the previous Deployment revision to finish before changing config and mounts",
+                "",
+                observed_generation,
+                deployment.metadata.generation.unwrap_or(0),
+            ),
+            false,
+        ));
+    }
+    if needs_revision_rollout {
+        let next_config_name = inactive_consumer_config_map_name(&cc.config_map_name, active_config_name);
+        let config_shared = template
+            .containers
+            .iter()
+            .filter(|container| container.name != delegation.container_name)
+            .any(|container| {
+                container
+                    .volume_mounts
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|mount| mount.name == config_volume_name)
+            })
+            || template
+                .init_containers
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|container| {
+                    container
+                        .volume_mounts
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|mount| mount.name == config_volume_name)
+                });
+        if config_shared {
+            return Err(mount_failure(
+                "OwnershipConflict",
+                "the delegated Praxis config volume is also mounted outside the target container",
+            )
+            .into());
+        }
+        apply_consumer_config_map_named(&rendered.config_yaml, network_name, gw_ref, &next_config_name, client).await?;
+        let patch = staged_config_mount_patch(
+            additions,
+            &mount_additions,
+            config_volume_name,
+            &next_config_name,
+            &delegation.container_name,
+            &json!({
+                OWNED_MOUNTS_ANNOTATION: owned_mounts_json,
+                SECRET_RESOURCE_VERSIONS_ANNOTATION: resource_versions_json
+            }),
+            &json!({
+                MOUNT_REVISION_ANNOTATION: requirements_revision,
+                CONFIG_REVISION_ANNOTATION: config_revision,
+                SECRET_REVISION_ANNOTATION: secret_revision
+            }),
+        );
+        patch_delegated_deployment(
+            &deployments,
+            deployment_name,
+            &deployment,
+            patch,
+            "could not stage the matching Praxis config and Secret mounts",
+        )
+        .await?;
+        return Ok((
+            mount_status(
+                gw_ref,
+                Some(delegation),
+                MountReconciliationPhase::WaitingForRollout,
+                &requirements_revision,
+                "",
+                "the matching Praxis config and Secret mounts were staged; waiting for the Deployment rollout",
                 "",
                 observed_generation,
                 deployment.metadata.generation.unwrap_or(0),
@@ -3503,10 +3602,14 @@ async fn reconcile_delegated_gateway(
             "metadata": {"annotations": {OWNED_MOUNTS_ANNOTATION: owned_json}},
             "spec": {"template": {"spec": pod_spec_patch}}
         });
-        deployments
-            .patch(deployment_name, &PatchParams::default(), &Patch::Strategic(patch))
-            .await
-            .map_err(|_error| mount_failure("DeploymentPatchFailed", "could not remove obsolete Grid-owned mounts"))?;
+        patch_delegated_deployment(
+            &deployments,
+            deployment_name,
+            &deployment,
+            patch,
+            "could not remove obsolete Grid-owned mounts",
+        )
+        .await?;
         return Ok((
             mount_status(
                 gw_ref,
@@ -3693,7 +3796,9 @@ fn validate_deployment_config_source(
                 .iter()
                 .any(|item| item.key == "praxis.yaml" && item.path == "praxis.yaml")
     });
-    if config_map.name != config_map_name || config_map.optional == Some(true) || !projects_config {
+    let valid_name =
+        config_map.name == config_map_name || config_map.name == alternate_consumer_config_map_name(config_map_name);
+    if !valid_name || config_map.optional == Some(true) || !projects_config {
         return Err(mount_failure(
             "ConfigSourceMismatch",
             "the Praxis config mount does not project the generated praxis.yaml",
@@ -9271,9 +9376,22 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "config source validation cases share one Deployment fixture"
+    )]
     fn delegated_config_source_requires_the_expected_config_map_and_projection() {
         let valid = delegated_config_source_fixture();
         assert!(matches!(delegated_config_source_check(valid.clone()), Ok(false)));
+        let mut alternate = valid.clone();
+        let source_name = alternate
+            .pointer_mut("/spec/template/spec/volumes/0/configMap/name")
+            .unwrap_or_else(|| std::process::abort());
+        *source_name = json!(alternate_consumer_config_map_name("praxis-consumer-config"));
+        assert!(
+            matches!(delegated_config_source_check(alternate), Ok(false)),
+            "a Grid-managed alternate config slot must remain a valid delegated source"
+        );
 
         for (pointer, replacement) in [
             (
@@ -9301,6 +9419,77 @@ mod tests {
                 "invalid config source at {pointer} must fail closed"
             );
         }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one patch must carry config, Secret volume, revision, and resourceVersion together"
+    )]
+    fn config_and_secret_projection_switch_in_one_version_guarded_patch() {
+        let mut fixture = delegated_config_source_fixture();
+        let metadata = fixture
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+            .unwrap_or_else(|| std::process::abort());
+        metadata.insert("resourceVersion".to_owned(), json!("42"));
+        let deployment: Deployment = serde_json::from_value(fixture).unwrap_or_else(|_| std::process::abort());
+        let base = "praxis-consumer-config";
+        let alternate = inactive_consumer_config_map_name(base, base);
+        assert_eq!(
+            inactive_consumer_config_map_name(base, &alternate),
+            base,
+            "the next complete rollout reuses the now-inactive base slot"
+        );
+        let patch = staged_config_mount_patch(
+            vec![json!({"name": "grid-mount-ca", "projected": {"sources": [{"secret": {"name": "new-ca"}}]}})],
+            &[json!({"name": "grid-mount-ca", "mountPath": "/etc/praxis/tls"})],
+            "config",
+            &alternate,
+            "praxis",
+            &json!({OWNED_MOUNTS_ANNOTATION: "[\"grid-mount-ca\"]"}),
+            &json!({MOUNT_REVISION_ANNOTATION: "mount-2", CONFIG_REVISION_ANNOTATION: "config-2"}),
+        );
+        let guarded = guarded_deployment_patch(patch, &deployment).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            guarded.pointer("/metadata/resourceVersion"),
+            Some(&json!("42")),
+            "a concurrent Deployment writer must cause the whole stage to conflict"
+        );
+        let mut unversioned = deployment.clone();
+        unversioned.metadata.resource_version = None;
+        assert!(
+            matches!(
+                guarded_deployment_patch(guarded.clone(), &unversioned),
+                Err(OperatorError::MountReconciliation(failure)) if failure.reason == "DeploymentInvalid"
+            ),
+            "the operator must not patch a Deployment without a concurrency precondition"
+        );
+        let volumes = guarded
+            .pointer("/spec/template/spec/volumes")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            volumes.iter().any(|volume| {
+                volume.get("name") == Some(&json!("config"))
+                    && volume.pointer("/configMap/name") == Some(&json!(alternate))
+            }),
+            "the new Pod revision must mount the inactive config slot"
+        );
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| volume.get("name") == Some(&json!("grid-mount-ca"))),
+            "the matching Secret projection must be in the same Pod-template patch"
+        );
+        assert_eq!(
+            guarded.pointer(&format!(
+                "/spec/template/metadata/annotations/{}",
+                MOUNT_REVISION_ANNOTATION.replace('/', "~1")
+            )),
+            Some(&json!("mount-2")),
+            "the staged Pod revision must carry the matching mount revision"
+        );
     }
 
     #[expect(

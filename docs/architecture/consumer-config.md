@@ -164,20 +164,23 @@ GridNetwork's site identity and CA references; the chart enforces the fixed
 mount path.
 
 Create the referenced ConfigMap with a valid bootstrap `praxis.yaml` before
-installing the gateway. The first rollout adds Secret mounts while the current
-config is still active; after those pods are ready, Grid writes the generated
-config and requests its rollout. This also lets a new Deployment become ready
-before Grid replaces the bootstrap config.
+installing the gateway. Once the bootstrap Deployment is ready, Grid writes the
+generated config to an inactive, Grid-managed ConfigMap slot and changes the
+Pod template's config source, Secret projections, and revision annotations in
+one patch. Old pods keep their previous config and projections during rollout.
+Grid waits until no old replicas remain before reusing the inactive slot or
+pruning obsolete mounts. This also lets a new Deployment become ready before
+Grid replaces the bootstrap config.
 
 The operator publishes a reference-only ConfigMap named
 `grid-mount-requirements-<first 16 hex characters of SHA-256(configMapName)>`,
 with its document under `mount-requirements.json`. It verifies every
 referenced Secret and required key in the gateway namespace, and adds only its
-reserved volumes and the selected container's mounts. It waits for those mounts
-to reach available pods before applying the matching Praxis configuration.
-Then it rolls the Deployment for config changes and Secret resource-version
-changes. When a reference is removed, the old mount remains until pods with the
-new config are ready, then Grid removes only mounts recorded as Grid-owned.
+reserved volumes and the selected container's mounts. It stages the matching
+Praxis configuration and Secret mounts in the same Pod revision, including for
+Secret reference and key changes. When a reference is removed, the old mount
+remains until pods with the new config are ready, then Grid removes only mounts
+recorded as Grid-owned.
 If the last provider disappears, the operator distributes an empty authoritative
 routing overlay and renders the generated consumer config as a 503-only response
 with no `intelligent_route` filter. For delegated mounts, the empty overlay is
@@ -206,8 +209,11 @@ identity Secret references are required only for delegated mounts.
 Disabling mount reconciliation or deleting the `GridNetwork` does not remove
 previously Grid-owned Deployment mounts. Hand ownership back to the Deployment
 manager or remove those mounts explicitly after moving the gateway off the
-generated configuration. Do not treat disabling the feature as credential
-revocation; revoke or rotate the Secret and verify the Deployment separately.
+generated configuration. Before disabling delegation, move the Deployment's
+config volume back to `consumerConfig.configMapName` and wait for its rollout;
+the alternate slot is only maintained while delegation is enabled. Do not
+treat disabling the feature as credential revocation; revoke or rotate the
+Secret and verify the Deployment separately.
 
 `consumerConfigStatus[].phase: Rendered` means the config map was rendered and
 applied. It does not mean the gateway has restarted or become ready. With mount
@@ -371,11 +377,12 @@ deployment architecture.
 
 ## Reload and rollout
 
-The operator applies the consumer Praxis `ConfigMap` on every reconcile. Without
-delegated mount reconciliation, the consumer gateway pod is not automatically
-restarted when the complete generated Praxis configuration changes. With
-delegation enabled, Grid waits for required mounts, applies the config, and
-waits for the matching Deployment rollout.
+Without delegated mount reconciliation, the operator applies the consumer
+Praxis `ConfigMap` on each changed render, but does not automatically restart
+gateway pods. With delegation enabled, Grid alternates between the configured
+ConfigMap and a Grid-managed slot. It writes the inactive slot before one
+Pod-template update switches the config source and required Secret mounts, then
+waits for that Deployment rollout to complete.
 
 A Praxis build with file watching applies supported `praxis.yaml` changes
 after the mounted file refreshes. Invalid replacements retain the running
