@@ -9456,7 +9456,7 @@ mod tests {
             Some(&json!("42")),
             "a concurrent Deployment writer must cause the whole stage to conflict"
         );
-        let mut unversioned = deployment.clone();
+        let mut unversioned = deployment;
         unversioned.metadata.resource_version = None;
         assert!(
             matches!(

@@ -469,11 +469,20 @@ Before enabling delegation on an existing release, set
 Grid serving) `consumerConfig.tlsCertMountPath` to paths that do not overlap
 the current chart mounts. The operator stages its new mounts at those paths,
 switches to a matching generated config in the same Pod-template update, and
-leaves the old Helm mounts in place. Once the status is `Ready`, set
+leaves the old Helm mounts in place. **For populated routes, this handoff is not
+yet supported with the chart-default AI 0.4.0 image.** The current generated
+inline candidates contain `admission_state` and `selection_group`, which the
+tested Praxis image rejects. Wait for [Grid #270](https://github.com/praxis-proxy/grid/pull/270),
+a compatible image containing [Praxis AI #1539](https://github.com/praxis-proxy/ai/pull/1539),
+and qualification of the unmodified generated config before enabling this
+handoff for populated routes. A `Ready` mount status alone does not prove that
+Praxis is serving the generated route.
+
+After those prerequisites are met and the status is `Ready`, set
 `mountReconciliation.releaseHelmMounts: true` and run
 the Helm upgrade. Helm then removes only the selected old mounts; other
 credential mounts remain Helm-managed. Keep this value false until the Ready
-status confirms that the generated config is active.
+status and a Praxis request confirm that the generated config is active.
 
 For a new install, create `praxis-consumer-config` with a valid bootstrap
 `praxis.yaml` before installing the gateway. After the bootstrap Deployment is

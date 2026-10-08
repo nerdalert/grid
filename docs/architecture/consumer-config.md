@@ -170,7 +170,15 @@ Pod template's config source, Secret projections, and revision annotations in
 one patch. Old pods keep their previous config and projections during rollout.
 Grid waits until no old replicas remain before reusing the inactive slot or
 pruning obsolete mounts. This also lets a new Deployment become ready before
-Grid replaces the bootstrap config.
+Grid replaces the bootstrap config. This verifies the Kubernetes rollout, not
+Praxis acceptance of populated routes. The current generated inline candidates
+include `admission_state` and `selection_group`, which the tested Praxis image
+rejects. Populated-route use requires the versioned-overlay config in
+[Grid #270](https://github.com/praxis-proxy/grid/pull/270), a compatible image
+containing [Praxis AI #1539](https://github.com/praxis-proxy/ai/pull/1539), and
+an unmodified generated-config request probe. Until then, do not release
+Helm-owned mounts for a populated route based on Deployment or mount `Ready`
+status alone.
 
 The operator publishes a reference-only ConfigMap named
 `grid-mount-requirements-<first 16 hex characters of SHA-256(configMapName)>`,
