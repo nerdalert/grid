@@ -1053,13 +1053,15 @@ pub enum TransportMode {
 #[schemars(extend("x-kubernetes-validations" = [{
     "rule": "self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null",
     "message": "caSecretRef is only valid for tls transport"
+}, {
+    "rule": "self.mode == 'plaintext' || !has(self.sni) || self.sni == null || self.sni.size() > 0",
+    "message": "an explicitly empty sni is only valid for plaintext transport"
 }]))]
 pub struct EndpointTransport {
     /// Transport mode: `mutual_tls`, `tls`, or explicit `plaintext`.
     pub mode: TransportMode,
 
     /// TLS Server Name Indication, required when mode is `mutual_tls` or `tls`.
-    #[schemars(length(min = 1))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
 
@@ -2159,10 +2161,12 @@ mod tests {
             transport_properties.contains_key("caSecretRef"),
             "CRD schema must include optional custom CA Secret reference"
         );
-        assert_eq!(
-            transport_properties.get("sni").and_then(|sni| sni.get("minLength")),
-            Some(&serde_json::json!(1)),
-            "an explicitly empty SNI must fail admission"
+        assert!(
+            transport_properties
+                .get("sni")
+                .and_then(|sni| sni.get("minLength"))
+                .is_none(),
+            "plaintext transport must admit an explicitly empty SNI"
         );
         assert_eq!(
             endpoint_properties
@@ -2172,6 +2176,15 @@ mod tests {
                 "self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null"
             )),
             "custom CA references must be admitted only for tls transport"
+        );
+        assert_eq!(
+            endpoint_properties
+                .get("transport")
+                .and_then(|transport| transport.pointer("/x-kubernetes-validations/1/rule")),
+            Some(&serde_json::json!(
+                "self.mode == 'plaintext' || !has(self.sni) || self.sni == null || self.sni.size() > 0"
+            )),
+            "explicitly empty SNI must be admitted only for plaintext transport"
         );
     }
 
