@@ -2813,9 +2813,9 @@ fn capacity_publication_diagnostic(logs: &str, network: &str, provider: &str) ->
             .flatten()
             .and_then(|value| value.parse::<u32>().ok())
         })
-        .collect::<Vec<_>>();
+        .count();
     format!(
-        "publication_lines={publication_lines}, network_matches={network_matches}, provider_matches={provider_matches}, parseable_capacity_weights={parseable_capacity_weights:?}"
+        "publication_lines={publication_lines}, network_matches={network_matches}, provider_matches={provider_matches}, parseable_capacity_weights={parseable_capacity_weights}"
     )
 }
 
@@ -3116,6 +3116,7 @@ mod static_phase_policy_tests {
         assert!(diagnostic.contains("publication_lines=1"));
         assert!(diagnostic.contains("network_matches=1"));
         assert!(diagnostic.contains("provider_matches=0"));
+        assert!(diagnostic.contains("parseable_capacity_weights=0"));
     }
 }
 
