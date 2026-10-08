@@ -597,7 +597,7 @@ fn readiness_entry<'provider>(
     let ready = ready_sample(&verdict);
     let endpoints = ctx.readiness.ready_endpoints(&key).map(|count| signals::Observation {
         metric: readiness::READY_ENDPOINTS_SIGNAL.to_owned(),
-        labels: std::collections::BTreeMap::new(),
+        labels: BTreeMap::new(),
         value: count,
         timestamp_ms: None,
     });
@@ -635,7 +635,7 @@ fn published_signals(
 fn ready_sample(verdict: &readiness::Verdict) -> signals::Observation {
     signals::Observation {
         metric: readiness::READY_SIGNAL.to_owned(),
-        labels: std::collections::BTreeMap::new(),
+        labels: BTreeMap::new(),
         value: if verdict.reason.excludes() { 0.0 } else { 1.0 },
         timestamp_ms: None,
     }
@@ -716,7 +716,7 @@ async fn apply_ready_condition(
 fn ready_condition_patch<'provider>(
     provider: &'provider InferenceProvider,
     verdict: &readiness::Verdict,
-) -> Option<(&'provider str, serde_json::Value)> {
+) -> Option<(&'provider str, Value)> {
     let name = provider.metadata.name.as_deref()?;
     let status = provider.status.as_ref();
     let current = status.map_or(&[][..], |status| status.conditions.as_slice());
@@ -5871,7 +5871,7 @@ mod tests {
     fn a_provider_not_ready_publishes_ready_zero_without_a_fresh_scrape() {
         let ready = |value: f64| signals::Observation {
             metric: readiness::READY_SIGNAL.to_owned(),
-            labels: std::collections::BTreeMap::new(),
+            labels: BTreeMap::new(),
             value,
             timestamp_ms: None,
         };
@@ -5890,7 +5890,7 @@ mod tests {
 
 
     #[expect(clippy::expect_used, reason = "test fixture")]
-    fn provider_with_status(status: &serde_json::Value) -> InferenceProvider {
+    fn provider_with_status(status: &Value) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
@@ -5907,7 +5907,7 @@ mod tests {
         .expect("provider")
     }
 
-    fn ready_condition_json(status: &str, reason: &str) -> serde_json::Value {
+    fn ready_condition_json(status: &str, reason: &str) -> Value {
         serde_json::json!({
             "type": "Ready", "status": status, "reason": reason, "message": "m",
             "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
