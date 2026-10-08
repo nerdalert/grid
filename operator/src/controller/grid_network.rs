@@ -2406,7 +2406,7 @@ async fn reconcile_routing_overlay_inner(
             .await
             {
                 Ok(outcome) => {
-                    if outcome.config_applied {
+                    if outcome.config_applied && (!credential_bearing || cc.supports_projected_credentials) {
                         consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
                     }
                     if let Some(status) = outcome.mount_status {

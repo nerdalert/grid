@@ -95,7 +95,7 @@ pub(crate) struct Topology {
     load_window_ms: i64,
 
     /// Explicitly authenticated provider-gateway hop clusters.
-    provider_hop_clusters: BTreeSet<String>,
+    provider_hop_clusters: Arc<BTreeSet<String>>,
 }
 
 impl Topology {
@@ -117,7 +117,7 @@ impl Topology {
             base: Arc::from(base),
             local_site: Arc::from(config.local_site.as_str()),
             load_window_ms: config.load_window_ms,
-            provider_hop_clusters,
+            provider_hop_clusters: Arc::new(provider_hop_clusters),
         })
     }
 
@@ -148,7 +148,7 @@ impl Topology {
             Arc::clone(&self.local_site),
             &mut inputs,
         );
-        ordered.provider_hop_clusters = Arc::new(self.provider_hop_clusters.clone());
+        ordered.provider_hop_clusters = Arc::clone(&self.provider_hop_clusters);
         // Praxis demotes a cluster only once it has reported health. Without a registry the
         // gateway knows nothing about backends, so it demotes nothing rather than guessing.
         let ordered = if health.observed() {
@@ -262,7 +262,7 @@ impl Control {
             Arc::clone(&topology.local_site),
         )
         .published(&mut gauged.published);
-        cold_start.provider_hop_clusters = Arc::new(topology.provider_hop_clusters.clone());
+        cold_start.provider_hop_clusters = Arc::clone(&topology.provider_hop_clusters);
         Ok(Self {
             store: Arc::new(LoadStore::with_combine(
                 Duration::from_secs(config.window_secs),
@@ -493,8 +493,6 @@ pub(crate) fn load_tag_key(affinity: &AffinitySettings) -> Result<Option<TagKey>
 
 /// The topology of `config`, refusing what no retry can fix: a bad candidate, peer, or duplicate site.
 fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> {
-    validate_local_site(&config.local_site)?;
-    validate_serving_candidates(config.candidates.clone())?;
     let topology = Topology::from_config(config)?;
     let mut sites = std::collections::HashSet::with_capacity(config.peers.len());
     for peer in &config.peers {

@@ -61,7 +61,7 @@ enum RouteDecision {
 }
 
 /// Resolve the empty revision before preserving a prior filter's selection.
-fn route_decision(snapshot: &RouteSnapshot, _model: &str, earlier_selected: bool) -> RouteDecision {
+fn route_decision(snapshot: &RouteSnapshot, earlier_selected: bool) -> RouteDecision {
     if snapshot.candidates.is_empty() {
         RouteDecision::NoRoute
     } else if earlier_selected {
@@ -516,7 +516,7 @@ impl HttpFilter for GridSiteRouteFilter {
                 .push(http::header::HeaderName::from_static(name));
         }
         let snapshot = self.snapshot.load();
-        match route_decision(&snapshot, "", ctx.cluster.is_some() || ctx.upstream.is_some()) {
+        match route_decision(&snapshot, ctx.cluster.is_some() || ctx.upstream.is_some()) {
             RouteDecision::NoRoute => {
                 return Ok(refuse(Refused::NoRoute, "", self.turn.fetch_add(1, Ordering::Relaxed)));
             },
@@ -1927,15 +1927,12 @@ mod tests {
     #[test]
     fn empty_snapshot_rejects_even_with_a_preselected_cluster() {
         let empty = RouteSnapshot::from_static(Vec::new(), Arc::from("local"));
-        assert!(matches!(route_decision(&empty, "llama", true), RouteDecision::NoRoute));
+        assert!(matches!(route_decision(&empty, true), RouteDecision::NoRoute));
 
         let active = RouteSnapshot::from_static(
             one("llama", "east", "pool-a", AdmissionState::NewAndExisting),
             Arc::from("local"),
         );
-        assert!(matches!(
-            route_decision(&active, "llama", true),
-            RouteDecision::KeepEarlier
-        ));
+        assert!(matches!(route_decision(&active, true), RouteDecision::KeepEarlier));
     }
 }
