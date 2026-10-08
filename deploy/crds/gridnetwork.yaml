@@ -264,7 +264,7 @@ spec:
                                     - message: caSecretRef is only valid for tls transport
                                       rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
                                     - message: an explicitly empty sni is only valid for plaintext transport
-                                      rule: self.mode == 'plaintext' || !has(self.sni) || self.sni == null || self.sni.size() > 0
+                                      rule: self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0
                               required:
                                 - address
                                 - cluster

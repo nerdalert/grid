@@ -1054,7 +1054,7 @@ pub enum TransportMode {
     "rule": "self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null",
     "message": "caSecretRef is only valid for tls transport"
 }, {
-    "rule": "self.mode == 'plaintext' || !has(self.sni) || self.sni == null || self.sni.size() > 0",
+    "rule": "self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0",
     "message": "an explicitly empty sni is only valid for plaintext transport"
 }]))]
 pub struct EndpointTransport {
@@ -2201,7 +2201,7 @@ mod tests {
                 .get("transport")
                 .and_then(|transport| transport.pointer("/x-kubernetes-validations/1/rule")),
             Some(&serde_json::json!(
-                "self.mode == 'plaintext' || !has(self.sni) || self.sni == null || self.sni.size() > 0"
+                "self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0"
             )),
             "explicitly empty SNI must be admitted only for plaintext transport"
         );

@@ -3876,7 +3876,7 @@ fn mount_reconciliation_status_error(
             "gateway mount reconciliation failed".to_owned(),
         ),
     };
-    let phase = if matches!(reason, "MissingSecret" | "MissingSecretKey" | "SecretNamespaceMismatch") {
+    let phase = if matches!(reason, "MissingSecret" | "MissingSecretKey") {
         MountReconciliationPhase::WaitingForSecret
     } else {
         MountReconciliationPhase::Error
@@ -9144,6 +9144,21 @@ mod tests {
         let serialized = serde_json::to_string(&status).expect("serialize status");
         assert!(!serialized.contains("deploymentName"));
         assert!(!serialized.contains("private-key"));
+    }
+
+    #[test]
+    fn secret_namespace_mismatch_requires_a_spec_change() {
+        let gateway = make_gw_ref("inference-gw", "praxis-system");
+        for (reason, expected_phase) in [
+            ("MissingSecret", MountReconciliationPhase::WaitingForSecret),
+            ("MissingSecretKey", MountReconciliationPhase::WaitingForSecret),
+            ("SecretNamespaceMismatch", MountReconciliationPhase::Error),
+        ] {
+            let error = OperatorError::MountReconciliation(mount_failure(reason, "test failure"));
+            let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
+            assert_eq!(status.phase, expected_phase, "incorrect phase for {reason}");
+            assert_eq!(status.reason, reason, "status must retain the specific failure reason");
+        }
     }
 
     #[test]

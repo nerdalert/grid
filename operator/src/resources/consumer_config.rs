@@ -554,7 +554,7 @@ pub(crate) fn render_consumer_config(
                 .is_some_and(|transport| transport.mode == TransportMode::MutualTls)
     });
     if needs_mutual_tls {
-        validate_absolute_normalized_path(tls_cert_mount_path)?;
+        validate_absolute_normalized_path(&tls_file_path(tls_cert_mount_path, "ca.crt"))?;
     }
     if needs_mutual_tls && delegated_mounts {
         let ca_ref = tls
@@ -572,7 +572,7 @@ pub(crate) fn render_consumer_config(
             &ca_ref.namespace,
             &ca_ref.name,
             "ca.crt",
-            &format!("{tls_cert_mount_path}/ca.crt"),
+            &tls_file_path(tls_cert_mount_path, "ca.crt"),
         )?;
         for key in ["tls.crt", "tls.key"] {
             add_requirement(
@@ -582,7 +582,7 @@ pub(crate) fn render_consumer_config(
                 &site_ref.namespace,
                 &site_ref.name,
                 key,
-                &format!("{tls_cert_mount_path}/{key}"),
+                &tls_file_path(tls_cert_mount_path, key),
             )?;
         }
     }
@@ -692,6 +692,11 @@ fn validate_absolute_normalized_path(path: &str) -> Result<(), ConsumerConfigErr
         return Err(ConsumerConfigError::InvalidMountPath { path: path.to_owned() });
     }
     Ok(())
+}
+
+/// Keep rendered TLS paths identical to projected mount paths when the directory has a trailing slash.
+fn tls_file_path(mount_dir: &str, key: &str) -> String {
+    format!("{}/{key}", mount_dir.trim_end_matches('/'))
 }
 
 /// Build the stable in-container path for a custom backend CA Secret key.
@@ -995,10 +1000,12 @@ fn render_cluster_entry(
                 })?;
             let trimmed_sni = raw_sni.trim();
             let quoted_sni = yaml_scalar(trimmed_sni).unwrap_or_else(|_| "\"\"".to_owned());
-            let ca_path = yaml_scalar(&format!("{tls_cert_mount_path}/ca.crt")).unwrap_or_else(|_| "\"\"".to_owned());
+            let ca_path =
+                yaml_scalar(&tls_file_path(tls_cert_mount_path, "ca.crt")).unwrap_or_else(|_| "\"\"".to_owned());
             let cert_path =
-                yaml_scalar(&format!("{tls_cert_mount_path}/tls.crt")).unwrap_or_else(|_| "\"\"".to_owned());
-            let key_path = yaml_scalar(&format!("{tls_cert_mount_path}/tls.key")).unwrap_or_else(|_| "\"\"".to_owned());
+                yaml_scalar(&tls_file_path(tls_cert_mount_path, "tls.crt")).unwrap_or_else(|_| "\"\"".to_owned());
+            let key_path =
+                yaml_scalar(&tls_file_path(tls_cert_mount_path, "tls.key")).unwrap_or_else(|_| "\"\"".to_owned());
             Ok(format!(
                 "          - name: {quoted_name}\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  tls:\n\
@@ -1334,7 +1341,7 @@ mod tests {
             &overlay,
             MOUNT_BASE,
             &[endpoint],
-            "/etc/praxis/tls",
+            "/tls/",
             8080,
             &tls,
             "gateway",
@@ -1345,8 +1352,8 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(rendered.requirements.len(), 2);
-        assert!(rendered.config_yaml.contains("/etc/praxis/tls/ca.crt"));
-        assert!(rendered.config_yaml.contains("/etc/praxis/tls/tls.key"));
+        assert!(rendered.config_yaml.contains("/tls/ca.crt"));
+        assert!(rendered.config_yaml.contains("/tls/tls.key"));
         let document = MountRequirementsDocument {
             schema_version: "v1".to_owned(),
             network: "grid-a".to_owned(),
@@ -2777,11 +2784,17 @@ mod tests {
     fn custom_tls_cert_mount_path_used_in_cluster_entry() {
         let endpoints = [mtls_ep("site-a", "10.0.0.1:8080", "site-a.grid.internal")];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "site-a", true)]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/custom/tls/path", 8080).unwrap();
-        assert!(
-            yaml.contains("ca_path: \"/custom/tls/path/ca.crt\""),
-            "custom TLS path must be used"
-        );
+        for (mount_dir, ca_path) in [
+            ("/custom/tls/path", "/custom/tls/path/ca.crt"),
+            ("/tls", "/tls/ca.crt"),
+            ("/etc/praxis/tls/", "/etc/praxis/tls/ca.crt"),
+        ] {
+            let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, mount_dir, 8080).unwrap();
+            assert!(
+                yaml.contains(&format!("ca_path: \"{ca_path}\"")),
+                "TLS directory {mount_dir} must render CA path {ca_path}"
+            );
+        }
     }
 
     #[test]
