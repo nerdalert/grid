@@ -3102,10 +3102,15 @@ mod static_phase_policy_tests {
 
     #[test]
     fn parses_operator_capacity_record_scoped_by_network_and_provider() {
-        let logs = "2026-01-01T00:00:00Z INFO network=grid-static-weighted-123 provider_id=vcr-provider-a-provider capacity_weight=50 published local provider CRDT capacity";
+        let logs = concat!(
+            "2026-01-01T00:00:00Z INFO operator::controller::grid_network: published local provider CRDT capacity network=\"grid-static-weighted-123\" provider_id=\"vcr-provider-a-provider\" capacity_weight=50\n",
+            "2026-01-01T00:00:01Z INFO operator::controller::grid_network: published local provider CRDT capacity network=\"grid-static-weighted-123\" provider_id=\"vcr-provider-b-provider\" capacity_weight=20\n",
+            "2026-01-01T00:00:02Z INFO operator::controller::grid_network: published local provider CRDT capacity network=\"grid-other\" provider_id=\"vcr-provider-a-provider\" capacity_weight=30\n",
+        );
         assert_eq!(
             parse_local_crdt_capacity(logs, "grid-static-weighted-123", "vcr-provider-a-provider"),
-            Some(50)
+            Some(50),
+            "newer records for another provider or network must not replace the matching capacity"
         );
     }
 
@@ -3113,9 +3118,18 @@ mod static_phase_policy_tests {
     fn capacity_diagnostic_distinguishes_missing_provider_record() {
         let logs = "2026-01-01T00:00:00Z INFO network=grid-static-weighted-123 provider_id=vcr-provider-a-provider capacity_weight=50 published local provider CRDT capacity";
         let diagnostic = capacity_publication_diagnostic(logs, "grid-static-weighted-123", "vcr-provider-b-provider");
-        assert!(diagnostic.contains("publication_lines=1"));
-        assert!(diagnostic.contains("network_matches=1"));
-        assert!(diagnostic.contains("provider_matches=0"));
+        assert!(
+            diagnostic.contains("publication_lines=1"),
+            "diagnostic should count publication lines"
+        );
+        assert!(
+            diagnostic.contains("network_matches=1"),
+            "diagnostic should count matching networks"
+        );
+        assert!(
+            diagnostic.contains("provider_matches=0"),
+            "diagnostic should report no matching provider"
+        );
         assert!(
             diagnostic.contains("parseable_capacity_weights=0"),
             "diagnostic should report zero parseable capacity weights"
