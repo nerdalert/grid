@@ -3610,7 +3610,7 @@ fn grid_network_recovered_after_restart(
     }
 
     Ok(format!(
-        "{cluster} GridNetwork resourceVersion={previous_resource_version}->{resource_version}, connectedSites={connected_sites}, phase={phase}"
+        "{cluster} GridNetwork generation={generation}, connectedSites={connected_sites}, phase={phase}"
     ))
 }
 
@@ -3700,11 +3700,8 @@ fn post_restart_edge_publication_evidence(
         "edge published a new semantic revision"
     };
     Ok(format!(
-        "{edge}: {publication}={}, ConfigMap resourceVersion={}, GridNetwork resourceVersion={}->{}, candidate_ids={:?}",
+        "{edge}: {publication}={}, candidate_ids={:?}",
         safe_truncate_str(&current.revision, 16),
-        current.resource_version,
-        marker_resource_version,
-        current.network_resource_version,
         current.candidate_ids
     ))
 }
@@ -4283,7 +4280,7 @@ fn edge_gateway_pod_logs(
             pod_name,
             "-c",
             container_name,
-            "--tail=1000",
+            "--tail=-1",
         ])
         .output()?;
     if !output.status.success() {
@@ -7072,7 +7069,7 @@ clusters:
 
         assert!(matches!(
             grid_network_recovered_after_restart("east-edge", &network, "41"),
-            Ok(evidence) if evidence.contains("resourceVersion=41->42")
+            Ok(evidence) if evidence.contains("generation=3") && !evidence.contains("resourceVersion")
         ));
 
         let same_resource_version = grid_network_recovered_after_restart("east-edge", &network, "42");
@@ -7125,6 +7122,25 @@ clusters:
             post_restart_edge_publication_evidence("east-edge", "new-revision", "55", &complete),
             Err(error) if error == "candidate set is not fully fresh"
         ));
+    }
+
+    #[test]
+    fn post_restart_semantic_snapshot_ignores_resource_version_churn() {
+        let mut complete = CurrentEdgeOverlay {
+            resource_version: "52".to_owned(),
+            revision: "new-revision".to_owned(),
+            candidate_ids: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            all_candidates_fresh: true,
+            network_resource_version: "56".to_owned(),
+        };
+        let stable_evidence = post_restart_edge_publication_evidence("east-edge", "old-revision", "55", &complete);
+        complete.network_resource_version = "57".to_owned();
+        complete.resource_version = "53".to_owned();
+        assert_eq!(
+            stable_evidence.ok(),
+            post_restart_edge_publication_evidence("east-edge", "old-revision", "55", &complete).ok(),
+            "status resource version churn must not reset semantic stability"
+        );
     }
 
     #[test]
