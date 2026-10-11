@@ -89,6 +89,7 @@ compatible Praxis AI gateway image from its repository:
 cargo build -p forge
 IMAGE_TAG="grid-static-weighted-$(date -u +%Y%m%d%H%M%S)"
 docker build -f deploy/operator/Containerfile -t "grid-operator:${IMAGE_TAG}" .
+docker build -f overlay-sync/Containerfile -t "grid-overlay-sync:${IMAGE_TAG}" .
 
 # From the compatible Praxis AI repository root.
 docker build -f Containerfile -t "praxis-ai:${IMAGE_TAG}" .
@@ -100,10 +101,12 @@ the local container store so the runner can load it into the run-owned Kind
 clusters:
 
 ```console
-docker pull ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
+docker pull ghcr.io/llm-d/llm-d-inference-sim@sha256:7f3a1f72875c5dd5d00299ad358dc1f6e17041a5124609a43aa17ad318bbed32
+docker tag ghcr.io/llm-d/llm-d-inference-sim@sha256:7f3a1f72875c5dd5d00299ad358dc1f6e17041a5124609a43aa17ad318bbed32 ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
 
 export GRID_XTASK_OPERATOR_IMAGE="grid-operator:${IMAGE_TAG}"
 export GRID_XTASK_GATEWAY_IMAGE="praxis-ai:${IMAGE_TAG}"
+export GRID_XTASK_OVERLAY_SYNC_IMAGE="grid-overlay-sync:${IMAGE_TAG}"
 export GRID_XTASK_SIM_IMAGE=ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
 export GRID_XTASK_IMAGE_PULL_POLICY=Never
 

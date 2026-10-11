@@ -230,6 +230,10 @@ mod tests {
 
     #[test]
     #[expect(clippy::expect_used, reason = "temporary Forge configuration fixture")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture checks every Forge state isolation property"
+    )]
     fn forge_commands_use_the_resolved_run_state_directory() {
         let temp = tempfile::tempdir().expect("create fixture directory");
         let combined_dir = temp.path().join("grid-combined-site");
@@ -246,22 +250,41 @@ mod tests {
         let combined_state = state_dir_for_config(&combined_config).expect("scope combined state");
         let second_combined_state = state_dir_for_config(&second_combined_config).expect("scope second combined state");
         let glb_state = state_dir_for_config(&glb_config).expect("scope GLB state");
-        assert_ne!(combined_state, second_combined_state);
-        assert_ne!(combined_state, glb_state);
+        assert_ne!(
+            combined_state, second_combined_state,
+            "distinct combined runs need distinct Forge state"
+        );
+        assert_ne!(
+            combined_state, glb_state,
+            "different topologies need distinct Forge state"
+        );
         assert_eq!(
             combined_state,
-            state_dir_for_config(&combined_config).expect("repeat combined state")
+            state_dir_for_config(&combined_config).expect("repeat combined state"),
+            "one resolved config must always select the same state"
         );
 
         let forge = command("praxis-forge", &combined_config).expect("build scoped Forge command");
-        assert_eq!(forge.get_args().next(), Some(OsStr::new("--state-dir")));
-        assert_eq!(forge.get_args().nth(1), Some(combined_state.as_os_str()));
+        assert_eq!(
+            forge.get_args().next(),
+            Some(OsStr::new("--state-dir")),
+            "Forge must receive a state argument"
+        );
+        assert_eq!(
+            forge.get_args().nth(1),
+            Some(combined_state.as_os_str()),
+            "Forge must use this run's state"
+        );
         assert!(
             forge.get_envs().any(|(key, value)| {
                 key == OsStr::new("FORGE_STATE_DIR") && value == Some(combined_state.as_os_str())
-            })
+            }),
+            "Forge must inherit this run's state environment"
         );
-        assert!(combined_state.is_dir());
+        assert!(
+            combined_state.is_dir(),
+            "Forge state directory must exist before execution"
+        );
     }
 
     #[test]
@@ -276,8 +299,14 @@ mod tests {
         rewrite_exec_runtime_paths(&mut config, state_dir);
         let rendered = serde_yaml::to_string(&config).expect("render Forge config fixture");
 
-        assert!(rendered.contains("target: .forge/runtime/cluster/config.yaml"));
-        assert!(rendered.contains("command: kubectl apply -f /tmp/grid-run/forge-state/runtime/cluster/config.yaml"));
+        assert!(
+            rendered.contains("target: .forge/runtime/cluster/config.yaml"),
+            "Forge template targets remain relative to state"
+        );
+        assert!(
+            rendered.contains("command: kubectl apply -f /tmp/grid-run/forge-state/runtime/cluster/config.yaml"),
+            "shell commands use the resolved run state path"
+        );
     }
 
     #[test]

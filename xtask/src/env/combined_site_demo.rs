@@ -7543,12 +7543,9 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
         },
     };
 
-    // If setup preparation failed before a context existed, collect whatever image
-    // evidence is still available. In deployed cases this was captured before teardown.
-    let images = match image_evidence {
-        Some(images) => images,
-        None => record_image_evidence_collection(collect_image_evidence(), &mut image_evidence_errors, &mut run_error),
-    };
+    // Preparation failure created no run-owned clusters. Deployed cases captured
+    // image evidence before teardown.
+    let images = image_evidence.unwrap_or_default();
     let external_provider_evidence = if let Some(desc) = &ext_descriptor {
         Some(collect_external_provider_evidence(
             desc,
@@ -8100,23 +8097,43 @@ mod tests {
         let valid = b"HTTP/1.1 200 OK\r\nx-grid-combined-provider-gateway: west\r\nx-ai-demo-provider-gateway: west\r\nx-ai-inference-provider: vcr-backend\r\n";
         let missing =
             b"HTTP/1.1 200 OK\r\nx-grid-combined-provider-gateway: west\r\nx-ai-inference-provider: vcr-backend\r\n";
-        assert!(primary_response_is_trusted(valid));
-        assert!(!primary_response_is_trusted(missing));
+        assert!(
+            primary_response_is_trusted(valid),
+            "both provider attribution headers establish trusted response"
+        );
+        assert!(
+            !primary_response_is_trusted(missing),
+            "a missing provider gateway header must fail attribution"
+        );
     }
 
     #[test]
     fn response_status_reads_only_http_status_lines() {
         let output = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\nHTTP/1.1 503 body text";
-        assert_eq!(response_status(output), Some(200));
-        assert_eq!(response_status(b"curl: (28) timeout"), None);
+        assert_eq!(
+            response_status(output),
+            Some(200),
+            "only the response status line counts"
+        );
+        assert_eq!(
+            response_status(b"curl: (28) timeout"),
+            None,
+            "curl errors contain no HTTP response"
+        );
     }
 
     #[test]
     fn curl_zero_status_means_no_response_and_does_not_pass_negative_probe() {
-        assert!(!curl_received_http_response("000"));
-        assert!(!negative_probe_status_is_rejected("000"));
-        assert!(curl_received_http_response("403"));
-        assert!(negative_probe_status_is_rejected("403"));
+        assert!(!curl_received_http_response("000"), "curl 000 means no HTTP response");
+        assert!(
+            !negative_probe_status_is_rejected("000"),
+            "no response cannot prove denial"
+        );
+        assert!(curl_received_http_response("403"), "403 is an observed HTTP response");
+        assert!(
+            negative_probe_status_is_rejected("403"),
+            "403 proves the negative probe was denied"
+        );
     }
 
     #[test]
@@ -8134,10 +8151,20 @@ mod tests {
             images.get("west_operator").map(String::as_str),
             Some("grid-operator:test")
         );
-        assert_eq!(image_evidence_errors, ["central/provider-gateway: kubectl unavailable"]);
+        assert_eq!(
+            image_evidence_errors,
+            ["central/provider-gateway: kubectl unavailable"],
+            "partial image collection errors must remain visible"
+        );
         let run_error = run_error.unwrap_or_default();
-        assert!(run_error.contains("runtime proofs failed: routing"));
-        assert!(run_error.contains("image evidence collection failed"));
+        assert!(
+            run_error.contains("runtime proofs failed: routing"),
+            "the original runtime failure must remain"
+        );
+        assert!(
+            run_error.contains("image evidence collection failed"),
+            "image collection failure must also appear"
+        );
     }
 
     #[test]

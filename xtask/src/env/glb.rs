@@ -183,11 +183,11 @@ const CLIENT_BEARER_TOKEN: &str = "test-token";
 /// server identity with a site-specific SNI. All identities are signed by the
 /// same demo CA and name their own site in the organization, which
 /// `peer_identity_trust` checks independently in the provider pipeline.
-pub(crate) fn prepare_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
-    let demo_root = super::demo_root(Path::new("tests/e2e/topologies/grid-glb-demo/forge.yaml"));
-    let forge_state_dir = Path::new(".forge");
-    stage_provider_boundary_with_mode_and_external(IngressMode::Global, None, &demo_root, forge_state_dir)
-        .and_then(|()| install_provider_boundary_with_mode_and_external(IngressMode::Global, None, forge_state_dir))
+pub(crate) fn prepare_provider_boundary(forge_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let demo_root = super::demo_root(forge_config);
+    let forge_state_dir = super::forge_config::state_dir_for_config(forge_config)?;
+    stage_provider_boundary_with_mode_and_external(IngressMode::Global, None, &demo_root, &forge_state_dir)
+        .and_then(|()| install_provider_boundary_with_mode_and_external(IngressMode::Global, None, &forge_state_dir))
 }
 
 /// Generate identities for an ingress mode and optional external provider.
@@ -3381,6 +3381,21 @@ pub(crate) fn reset_edge_overlay_observation_markers() -> Result<BTreeMap<String
 
             let context = kubectl_context(edge);
             let patch = serde_json::json!([
+                {
+                    "op": "test",
+                    "path": format!("/status/overlayStatus/{overlay_index}/gatewayName"),
+                    "value": "edge-gateway"
+                },
+                {
+                    "op": "test",
+                    "path": format!("/status/overlayStatus/{overlay_index}/namespace"),
+                    "value": GRID_SYSTEM_NS
+                },
+                {
+                    "op": "test",
+                    "path": "/status/observedGeneration",
+                    "value": generation
+                },
                 {
                     "op": "replace",
                     "path": "/status/observedGeneration",

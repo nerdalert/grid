@@ -575,8 +575,14 @@ mod tests {
         })
         .unwrap_or_else(|_| std::process::abort());
 
-        assert_eq!(attempts, 2);
-        assert_eq!(evidence, "east=east-edge, west=west-edge");
+        assert_eq!(
+            attempts, 2,
+            "the overlay check should retry once after a transient empty view"
+        );
+        assert_eq!(
+            evidence, "east=east-edge, west=west-edge",
+            "the retry should return complete edge evidence"
+        );
     }
 
     #[test]
@@ -588,8 +594,14 @@ mod tests {
         .map(|error| error.to_string())
         .unwrap_or_default();
 
-        assert!(error.contains("did not converge"));
-        assert!(error.contains("east-edge overlay has no candidates"));
+        assert!(
+            error.contains("did not converge"),
+            "timeout must identify failed convergence"
+        );
+        assert!(
+            error.contains("east-edge overlay has no candidates"),
+            "timeout must retain the last observed failure"
+        );
     }
 
     #[test]

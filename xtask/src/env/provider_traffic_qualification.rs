@@ -5855,7 +5855,7 @@ fn node_image_config_digest(
     node: &str,
     container_id: &str,
     image_id: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let runtime_container_id = crictl_container_id_from_pod_container_id(container_id)?;
     let output = Command::new("docker")
         .args(["exec", node, "crictl", "inspect", runtime_container_id])
@@ -5875,7 +5875,7 @@ fn image_config_digest_from_crictl_container_inspect(
     inspect_output: &[u8],
     expected_container_id: &str,
     pod_image_id: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let details: serde_json::Value = serde_json::from_slice(inspect_output)?;
     let status = details
         .get("status")
@@ -5902,8 +5902,9 @@ fn image_config_digest_from_crictl_container_inspect(
     status
         .get("imageId")
         .and_then(serde_json::Value::as_str)
+        .filter(|digest| !digest.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| "crictl container inspection has no status.imageId config digest".into())
+        .map_or(Ok(None), |digest| Ok(Some(digest)))
 }
 
 /// Whether the node's CRI config digest identifies the expected local image.
@@ -5911,9 +5912,16 @@ fn image_config_digest_matches(expected: &str, observed: &str) -> bool {
     expected == observed
 }
 
-/// Use the Ready Pod's immutable image identity when CRI omits its optional config digest.
+/// Return a bare Ready Pod image ID when it identifies the config digest.
+fn pod_image_config_digest(pod_image_id: &str) -> Option<&str> {
+    crictl_image_reference_from_pod_image_id(pod_image_id)
+        .ok()
+        .filter(|image_id| image_id.starts_with("sha256:"))
+}
+
+/// Whether the Ready Pod's bare image ID identifies the expected config digest.
 fn pod_image_id_matches_config_digest(pod_image_id: &str, expected: &str) -> bool {
-    crictl_image_reference_from_pod_image_id(pod_image_id).is_ok_and(|image_id| image_id == expected)
+    pod_image_config_digest(pod_image_id) == Some(expected)
 }
 
 /// Prefer the inspected config digest, but compare the Pod's immutable imageID when CRI omits it.
@@ -6099,10 +6107,10 @@ pub(super) fn deployment_runtime_image_evidence(
                 let node_config_digest = expected
                     .map(|_| node_image_config_digest(node_name, container_id, image_id))
                     .transpose()
-                    .map_err(|error| error.to_string())?;
-                let pod_image_id_matches_expected = expected.is_some_and(|expected| {
-                    pod_image_id_matches_config_digest(image_id, expected)
-                });
+                    .map_err(|error| error.to_string())?
+                    .flatten();
+                let pod_config_digest = expected.and_then(|_| pod_image_config_digest(image_id));
+                let pod_image_id_matches_expected = expected.is_some_and(|expected| pod_config_digest == Some(expected));
                 if let Some(expected) = expected
                     && !ready_pod_image_matches_config_digest(
                         expected,
@@ -6110,7 +6118,15 @@ pub(super) fn deployment_runtime_image_evidence(
                         node_config_digest.as_deref(),
                     )
                 {
-                    let observed = node_config_digest.as_deref().filter(|digest| !digest.is_empty());
+                    let observed = node_config_digest
+                        .as_deref()
+                        .filter(|digest| !digest.is_empty())
+                        .or(pod_config_digest);
+                    if observed.is_none() {
+                        return Err(format!(
+                            "pod {pod_name} on Kind node {node_name}: config digest unavailable for imageID {image_id}; cannot compare it with local config digest {expected}"
+                        ));
+                    }
                     return Err(format!(
                         "pod {pod_name} on Kind node {node_name} runs imageID {image_id} with config digest {observed:?}, but the requested image {requested_image} resolves locally to config digest {expected}"
                     ));
@@ -6203,7 +6219,7 @@ mod tests {
         let inspect_output = crictl_container_inspection_fixture(container_id, image_id, "sha256:local-config");
         assert_eq!(
             image_config_digest_from_crictl_container_inspect(&inspect_output, container_id, image_id,).ok(),
-            Some("sha256:local-config".to_owned())
+            Some(Some("sha256:local-config".to_owned()))
         );
 
         assert!(
@@ -6234,7 +6250,8 @@ mod tests {
         assert_ne!(runtime_reference, requested_image);
         let config_of_unchanged_ready_pod =
             image_config_digest_from_crictl_container_inspect(&inspect_output, container_id, ready_pod_image_id)
-                .unwrap_or_else(|_| std::process::abort());
+                .unwrap_or_else(|_| std::process::abort())
+                .unwrap_or_else(|| std::process::abort());
         assert!(
             !image_config_digest_matches(expected_config_after_retag, &config_of_unchanged_ready_pod),
             "a retargeted mutable tag must not make the old Ready pod appear to run the new local image"
@@ -6264,8 +6281,54 @@ mod tests {
             "a mutable requested tag retargeted after pod startup must not change the Ready pod's image identity"
         );
         assert!(
+            !pod_image_id_matches_config_digest(
+                "docker-pullable://registry.example/grid@sha256:ready-image-config",
+                expected,
+            ),
+            "a repository manifest digest must not be compared with a config digest"
+        );
+        assert!(
             !ready_pod_image_matches_config_digest(expected, pod_image_id, Some("sha256:conflicting-cri-config")),
             "a nonempty CRI config digest must take precedence and reject a conflict"
+        );
+    }
+
+    #[test]
+    fn pod_image_id_fallback_distinguishes_config_and_manifest_digests() {
+        assert_eq!(
+            pod_image_config_digest("sha256:ready-image-config"),
+            Some("sha256:ready-image-config"),
+            "a bare sha256 image ID is the config digest even when it mismatches the expected digest"
+        );
+        assert_eq!(
+            pod_image_config_digest("docker-pullable://registry.example/grid@sha256:manifest"),
+            None,
+            "a repository manifest digest cannot identify the config digest"
+        );
+    }
+
+    #[test]
+    fn missing_cri_config_digest_is_distinct_from_a_manifest_digest() {
+        let inspect = serde_json::to_vec(&serde_json::json!({
+            "status": {
+                "id": "ready-container",
+                "imageRef": "registry.example/grid@sha256:manifest"
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            image_config_digest_from_crictl_container_inspect(
+                &inspect,
+                "ready-container",
+                "docker-pullable://registry.example/grid@sha256:manifest",
+            )
+            .ok(),
+            Some(None),
+            "CRI may omit the optional config digest"
+        );
+        assert!(
+            !pod_image_id_matches_config_digest("registry.example/grid@sha256:manifest", "sha256:config"),
+            "the repository manifest digest cannot stand in for a config digest"
         );
     }
 

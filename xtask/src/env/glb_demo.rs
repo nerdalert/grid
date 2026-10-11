@@ -314,7 +314,74 @@ pub(crate) fn setup(
     let run_id = format!("{}-{}", format_utc_timestamp(), std::process::id());
     let context = prepare_setup(forge_config, ingress_mode, None, None, &run_id)?;
     deploy_setup(&context)?;
+    eprintln!("Resolved Forge config: {}", context.resolved_config.display());
     Ok(context)
+}
+
+/// Find the run-owned Forge config for a standalone GLB command.
+///
+/// An explicit resolved config selects its run. A source config selects the
+/// only live run in its directory; ambiguity requires an explicit path.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the explicit and discovered run checks belong together"
+)]
+pub(crate) fn standalone_run_config(config: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if config
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.starts_with(".forge.resolved-") && name.ends_with(".yaml"))
+    {
+        if !super::forge_config::state_dir_for_config(config)?
+            .join("state.json")
+            .is_file()
+        {
+            return Err(format!("GLB Forge state is missing for {}", config.display()).into());
+        }
+        return Ok(config.to_path_buf());
+    }
+    let parent = config.parent().unwrap_or_else(|| Path::new("."));
+    let mut runs = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let path = entry?.path();
+        let is_resolved_config = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with(".forge.resolved-") && name.ends_with(".yaml"));
+        if is_resolved_config && resolved_config_has_live_clusters(&path)? {
+            runs.push(path);
+        }
+    }
+    runs.sort();
+    match runs.as_slice() {
+        [run] => Ok(run.clone()),
+        [] => Err(format!(
+            "no live run-scoped GLB Forge state found beside {}; run setup-grid-glb or pass --forge-config with the resolved config",
+            config.display()
+        )
+        .into()),
+        _ => Err(format!(
+            "multiple live GLB Forge runs found beside {}; pass --forge-config with the intended .forge.resolved-*.yaml",
+            config.display()
+        )
+        .into()),
+    }
+}
+
+/// Whether a resolved run still owns any non-gone Forge clusters.
+fn resolved_config_has_live_clusters(config: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let state_file = super::forge_config::state_dir_for_config(config)?.join("state.json");
+    if !state_file.is_file() {
+        return Ok(false);
+    }
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_file)?)?;
+    let clusters = state
+        .get("clusters")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("Forge state {} has no clusters array", state_file.display()))?;
+    Ok(clusters
+        .iter()
+        .any(|cluster| cluster.get("phase").and_then(serde_json::Value::as_str) != Some("gone")))
 }
 
 /// Resolve setup inputs before creating any runtime resources.

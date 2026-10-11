@@ -1148,20 +1148,7 @@ jobs:
                     data: .data
                   }
                 ' --arg parse_errors "${PARSE_ERRORS}" "${RAW_CM}" > "${PARSE_SAFE_CM}"; then
-                if jq '
-                  def redact:
-                    if type == "object" then
-                      with_entries(
-                        if (.key | test("credential|secret|token|authorization|password|private.?key|api.?key"; "i"))
-                        then .value = "[REDACTED]"
-                        else .value |= redact
-                        end
-                      )
-                    elif type == "array" then map(redact)
-                    else .
-                    end;
-                  redact
-                ' "${PARSE_SAFE_CM}" > "${ODIR}/configmap-redacted.json"; then
+                if redact_overlay_json "${PARSE_SAFE_CM}" "${ODIR}/configmap-redacted.json"; then
                 for key in routing-config.json routing-overlay.json; do
                   if jq -e --arg key "${key}" '.data[$key] != null' "${ODIR}/configmap-redacted.json" > /dev/null; then
                     digest=$(jq -S -c --arg key "${key}" '.data[$key]' "${ODIR}/configmap-redacted.json" | sha256sum | awk '{print $1}')
@@ -1256,7 +1243,7 @@ jobs:
                     >> "${ODIR}/mounted-file-observations.jsonl"
                   if jq -e 'type == "object"' "${RAW_MOUNT}" > /dev/null 2>&1; then
                     if redact_overlay_json "${RAW_MOUNT}" "${ODIR}/${pod}-${file}-redacted.json"; then
-                      digest=$(jq -S -c 'def redact: if type == "object" then with_entries(if (.key | test("credential|secret|token|authorization|password|private.?key|api.?key"; "i")) then .value = "[REDACTED]" else .value |= redact end) elif type == "array" then map(redact) else . end; redact' "${RAW_MOUNT}" | sha256sum | awk '{print $1}')
+                      digest=$(jq -S -c . "${ODIR}/${pod}-${file}-redacted.json" | sha256sum | awk '{print $1}')
                       printf '%s  %s/%s\n' "${digest}" "${pod}" "${file}" >> "${ODIR}/mounted-file-sha256.txt"
                     else
                       echo "Mounted file redaction failed; raw payload was not retained" > "${ODIR}/${pod}-${file}-redaction-error.txt"
@@ -1520,7 +1507,7 @@ jobs:
         env:
           TAG: ${{ steps.tags.outputs.tag || 'unknown' }}
           ARTIFACT_PREFIX: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}
-          QUALIFICATION_RESULT: ${{ steps.qualification.outputs.result || 'not-reached' }}
+          QUALIFICATION_RESULT: ${{ steps.qualification.outcome }}
           CLEANUP_RESULT: ${{ steps.cleanup.outputs.result || 'unknown' }}
           RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest || 'unknown' }}
           PR_TITLE: ${{ needs.resolve-source.outputs.title }}
