@@ -883,6 +883,15 @@ fn record_negative_probe_facts(
             .map_or(serde_json::Value::Null, |code| serde_json::json!(code)),
     );
     observed_facts.insert(format!("{prefix}_rejected"), serde_json::Value::Bool(rejected));
+    observed_facts.insert(
+        format!("{prefix}_inconclusive"),
+        serde_json::Value::Bool(
+            status
+                .parse::<u16>()
+                .ok()
+                .is_some_and(|code| (500..=599).contains(&code)),
+        ),
+    );
     if let Some(error) = curl_transport_error(output) {
         observed_facts.insert(format!("{prefix}_transport_error"), serde_json::Value::String(error));
     }
