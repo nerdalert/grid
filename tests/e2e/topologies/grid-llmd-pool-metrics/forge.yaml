@@ -84,6 +84,9 @@ spec:
               repository: "{{ cluster.properties.operatorImageRepo }}"
               tag: "{{ cluster.properties.operatorImageTag }}"
               pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            signals:
+              enabled: true
+              peerIntervalSeconds: "2"
             swim:
               siteName: "pool-a"
               seeds: ""
@@ -119,6 +122,9 @@ spec:
               repository: "{{ cluster.properties.operatorImageRepo }}"
               tag: "{{ cluster.properties.operatorImageTag }}"
               pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            signals:
+              enabled: true
+              peerIntervalSeconds: "2"
             swim:
               siteName: "pool-b"
               seeds: ""

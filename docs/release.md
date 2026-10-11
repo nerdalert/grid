@@ -107,7 +107,7 @@ directory can lose its clusters even when it uses a different config file.
 | Combined-site lifecycle | `cargo xtask env run-grid-combined-site-demo --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-combined-site/forge.yaml` | Release qualification | Combined-site routing, provider add/remove/re-add, session fallback, rollout, trust, or lifecycle changes | [README](../tests/e2e/topologies/grid-combined-site/README.md) |
 | GLB | `cargo xtask env run-grid-glb-demo --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-glb-demo/forge.yaml` | Release qualification | GLB, ingress, edge/provider boundary, mTLS, or network-boundary changes | [README](../tests/e2e/topologies/grid-glb-demo/README.md) |
 | Workload inference / no ingress | `cargo xtask env run-grid-glb-demo --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml --no-ingress --full --teardown --evidence-dir "$EVIDENCE_DIR"` | Reuses `tests/e2e/topologies/grid-glb-demo/forge.yaml`; documented by `tests/e2e/topologies/grid-workload-inference/README.md` | Release qualification | Workload inference, no-ingress routing, or cluster-local workload entry changes | [README](../tests/e2e/topologies/grid-workload-inference/README.md) |
-| llm-d pool metrics pressure and recovery | `cargo xtask env run-grid-llmd-pool-metrics-demo --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml` | Experimental integration qualification | EPP metrics, queue/KV-cache scoring, pressure transitions, recovery, or metrics mTLS changes | [README](../tests/e2e/topologies/grid-llmd-pool-metrics/README.md) |
+| llm-d pool metrics, cross-site signal polling, partition, and recovery | `cargo xtask env run-grid-llmd-pool-metrics-demo --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml` | Experimental standalone qualification; not selectable in triggered CI | EPP metrics, operator peer polling, Grid Gateway site selection, pressure transitions, recovery, or metrics mTLS changes | [README](../tests/e2e/topologies/grid-llmd-pool-metrics/README.md) |
 
 Use the following one-line command stack after setting `IMAGE_TAG` and
 `EVIDENCE_DIR` for each run. The quota qualification additionally requires a
@@ -123,7 +123,7 @@ cargo xtask env run-grid-single-cluster-multi-gateway-qualification --forge-conf
 cargo xtask env run-grid-combined-site-demo --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"
 cargo xtask env run-grid-glb-demo --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"
 cargo xtask env run-grid-glb-demo --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml --no-ingress --full --teardown --evidence-dir "$EVIDENCE_DIR"
-cargo xtask env run-grid-llmd-pool-metrics-demo --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"
+GRID_XTASK_GRID_GATEWAY_IMAGE="${GRID_XTASK_GRID_GATEWAY_IMAGE:?build a source-matched Grid Gateway; see the llm-d README}" cargo xtask env run-grid-llmd-pool-metrics-demo --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"
 ```
 
 The checked-in Praxis configurations for these Kind qualifications explicitly
@@ -204,7 +204,20 @@ notes, run it and report its evidence independently.
 | Combined-site lifecycle | Combined-site bootstrap, trusted round-robin, provider drain and restoration, secondary add/remove/re-add, session fallback, revision convergence, and lifecycle cleanup. | Official compatible Praxis AI image plus local `grid-operator`, `grid-overlay-sync`, `grid-mock-providers`, and VCR images through the overrides above. | Save lifecycle timelines and request attribution under `EVIDENCE_DIR`; a full run is typically on the order of tens of minutes. Run alone and verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-combined-site/README.md) |
 | GLB | Global load-balancing and network-boundary behavior, including provider attribution and the configured ingress path. | Official compatible Praxis AI image plus the topology's required local `grid-operator`, `grid-overlay-sync`, `grid-mock-providers`, and VCR images; use the listed overrides and `Never` pull policy for local images. | Save results under `EVIDENCE_DIR`; use `--quick` for bounded diagnostics or `--full` for qualification. Run alone and verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-glb-demo/README.md) |
 | Workload inference / no ingress | Workload inference through the no-ingress path and its provider/network behavior. This reuses the GLB command with `--no-ingress`; it is not a separate invented CLI command. | Same image set and overrides as GLB, with any optional AI features required by that topology's README. | Save no-ingress evidence under `EVIDENCE_DIR`; use `--quick` for diagnostics or `--full` for qualification. Run alone and verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-workload-inference/README.md) |
-| llm-d pool metrics pressure and recovery | Pool-metrics observation, pressure-aware placement, availability during transitions, and recovery after metrics return below threshold. | Official compatible Praxis AI image plus local `grid-operator`, `grid-overlay-sync`, and the llm-d/EPP images required by its README; `--metrics-mtls` and `--kv-cache` are optional command flags when the topology enables them. | Save metric, overlay, reload, request, and recovery timelines under `EVIDENCE_DIR`; runtime is variable and may be long. Run alone and verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-llmd-pool-metrics/README.md) |
+| llm-d pool metrics, cross-site signal polling, partition, and recovery | Quick mode proves deterministic local metric scoring and recovery. Full mode additionally checks operator-to-operator mTLS signal polling, Grid Gateway polling of its local operator, live pressure selection, stale-signal exclusion with SWIM connected, wrong-pin rejection and recovery, a deployed network partition with request traffic and reconvergence, and response attribution headers. | Full mode also requires `grid-gateway` built from the same Grid checkout and set through `GRID_XTASK_GRID_GATEWAY_IMAGE`; the README gives the build command. | The qualification remains a standalone experiment outside the triggered dropdown. Save signal, route, partition, image, and cleanup evidence under `EVIDENCE_DIR`; verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-llmd-pool-metrics/README.md) |
+
+### Coverage gaps that remain visible
+
+The llm-d qualification separately rejects a wrong peer certificate pin while
+SWIM remains connected, then tests a deployed network partition with both
+operators and the Grid Gateway running. The standalone
+`verify-failover-under-lost-peer` operator check stops an operator process and
+does not cover that deployed boundary.
+
+Geography-first selection after peer auto-discovery remains unqualified.
+Auto-discovered `GridSite` resources do not currently carry region and zone
+from SWIM; a deployed three-tier proof needs that metadata propagation before
+it can assert geography without manually patching discovered resources.
 
 ## Tagging A Release
 
