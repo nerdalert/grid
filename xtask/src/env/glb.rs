@@ -7125,7 +7125,7 @@ clusters:
     }
 
     #[test]
-    fn post_restart_semantic_snapshot_ignores_resource_version_churn() {
+    fn post_restart_edge_evidence_excludes_resource_versions() {
         let mut complete = CurrentEdgeOverlay {
             resource_version: "52".to_owned(),
             revision: "new-revision".to_owned(),
@@ -7139,7 +7139,7 @@ clusters:
         assert_eq!(
             stable_evidence.ok(),
             post_restart_edge_publication_evidence("east-edge", "old-revision", "55", &complete).ok(),
-            "status resource version churn must not reset semantic stability"
+            "edge evidence must exclude resource versions from stability comparisons"
         );
     }
 
