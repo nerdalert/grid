@@ -1,0 +1,208 @@
+name: Temporary llm-d signal validation
+
+# Fork-only validation. The product checkout stays pinned even though this
+# workflow lives in a separate validation commit.
+on:
+  push:
+    branches:
+      - validation/llmd-signal-ci-c5e922a
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  llmd-full:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PRODUCT_SHA: c5e922adfb9536ede0f05f3681441857f3c801c5
+      KIND_VERSION: v0.32.0
+      KUBECTL_VERSION: v1.32.3
+      RUST_VERSION: 1.96.0
+      AI_IMAGE: ghcr.io/praxis-proxy/ai:0.6.0
+      AI_PIN: ghcr.io/praxis-proxy/ai@sha256:45e7f510ad40ffc41b7dadfa0feabd0d201ce43e75f8bd1ebee6c2f020f7f3e3
+      SIM_IMAGE: ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
+      SIM_PIN: ghcr.io/llm-d/llm-d-inference-sim@sha256:7f3a1f72875c5dd5d00299ad358dc1f6e17041a5124609a43aa17ad318bbed32
+      EPP_IMAGE: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
+      EPP_PIN: ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:873179822ab0895a37ea09f2112ca39a6ae50a26612561c8bfad7f9a8c5af6f5
+      SYNC_IMAGE: ghcr.io/praxis-proxy/grid-overlay-sync:v0.1.4
+      SYNC_PIN: ghcr.io/praxis-proxy/grid-overlay-sync@sha256:a3cc31a8b5469dca63a0de406e342bfbbe46dee02fe33721d6bac1943748c711
+      OPERATOR_IMAGE: grid-operator:llmd-validation-c5e922a
+      GRID_GATEWAY_IMAGE: grid-gateway:llmd-validation-c5e922a
+      EVIDENCE_DIR: ${{ github.workspace }}/evidence
+      DIAGNOSTICS_DIR: ${{ github.workspace }}/diagnostics
+
+    steps:
+      - name: Record validation and product revisions
+        run: |
+          mkdir -p "$EVIDENCE_DIR" "$DIAGNOSTICS_DIR"
+          {
+            echo "workflow_sha=${GITHUB_SHA}"
+            echo "product_sha=${PRODUCT_SHA}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+          } | tee "$EVIDENCE_DIR/source-identity.txt"
+
+      - name: Checkout exact product revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: c5e922adfb9536ede0f05f3681441857f3c801c5
+          path: grid
+          persist-credentials: false
+
+      - name: Verify product checkout
+        run: |
+          set -euo pipefail
+          actual=$(git -C grid rev-parse HEAD)
+          test "$actual" = "$PRODUCT_SHA"
+          test -z "$(git -C grid status --porcelain)"
+          printf 'Verified product source: %s\n' "$actual"
+
+      - name: Install Kind, kubectl, and Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          curl -fsSL -o /tmp/kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo '50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54  /tmp/kind' | sha256sum -c
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -fsSL -o /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+          echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum -c
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          {
+            rustc --version
+            cargo --version
+            kind version
+            kubectl version --client
+            docker version --format '{{.Server.Version}}'
+          } | tee "$EVIDENCE_DIR/tool-versions.txt"
+
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/graalvm /usr/local/share/chromium /usr/local/.ghcup 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          df -h /
+
+      - name: Inventory before qualification
+        run: |
+          kind get clusters | sort > "$DIAGNOSTICS_DIR/kind-before.txt"
+          docker network ls --format '{{.Name}} {{.ID}}' | sort > "$DIAGNOSTICS_DIR/networks-before.txt"
+
+      - name: Build source-matched Grid images
+        run: |
+          set -euo pipefail
+          docker build -f grid/deploy/operator/Containerfile -t "$OPERATOR_IMAGE" --label "org.opencontainers.image.revision=$PRODUCT_SHA" grid
+          docker build -f grid/deploy/gateway/Containerfile -t "$GRID_GATEWAY_IMAGE" --label "org.opencontainers.image.revision=$PRODUCT_SHA" grid
+          for image in "$OPERATOR_IMAGE" "$GRID_GATEWAY_IMAGE"; do
+            test "$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$PRODUCT_SHA"
+          done
+
+      - name: Materialize pinned external images
+        run: |
+          set -euo pipefail
+          while read -r pinned tagged; do
+            docker pull "$pinned"
+            expected=${pinned##*@}
+            docker image inspect --format='{{join .RepoDigests "\n"}}' "$pinned" | grep -Fqx "${pinned%@*}@${expected}"
+            docker tag "$pinned" "$tagged"
+            test "$(docker image inspect --format='{{.Id}}' "$pinned")" = "$(docker image inspect --format='{{.Id}}' "$tagged")"
+          done <<EOF
+          $AI_PIN $AI_IMAGE
+          $SIM_PIN $SIM_IMAGE
+          $EPP_PIN $EPP_IMAGE
+          $SYNC_PIN $SYNC_IMAGE
+          EOF
+
+      - name: Record image identities
+        run: |
+          set -euo pipefail
+          for image in "$OPERATOR_IMAGE" "$GRID_GATEWAY_IMAGE" "$AI_IMAGE" "$SIM_IMAGE" "$EPP_IMAGE" "$SYNC_IMAGE"; do
+            docker image inspect --format='{{join .RepoTags ","}}\t{{.Id}}\t{{join .RepoDigests ","}}\t{{with .Config.Labels}}{{index . "org.opencontainers.image.revision"}}{{end}}' "$image"
+          done | tee "$EVIDENCE_DIR/image-manifest.txt"
+
+      - name: Run full llm-d qualification
+        id: qualification
+        env:
+          GRID_XTASK_OPERATOR_IMAGE: ${{ env.OPERATOR_IMAGE }}
+          GRID_XTASK_GRID_GATEWAY_IMAGE: ${{ env.GRID_GATEWAY_IMAGE }}
+          GRID_XTASK_GATEWAY_IMAGE: ${{ env.AI_IMAGE }}
+          GRID_XTASK_SIM_IMAGE: ${{ env.SIM_IMAGE }}
+          GRID_XTASK_EPP_IMAGE: ${{ env.EPP_IMAGE }}
+          GRID_XTASK_OVERLAY_SYNC_IMAGE: ${{ env.SYNC_IMAGE }}
+          GRID_XTASK_IMAGE_PULL_POLICY: Never
+        run: |
+          set -uo pipefail
+          cd grid
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA" || exit 1
+          ./scripts/forge.sh install || exit 1
+          timeout --signal=TERM --kill-after=30s 75m cargo xtask env run-grid-llmd-pool-metrics-demo \
+            --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml \
+            --full --teardown --keep-on-failure --evidence-dir "$EVIDENCE_DIR" \
+            2>&1 | tee "$EVIDENCE_DIR/xtask.log"
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > "$EVIDENCE_DIR/xtask-exit-status.txt"
+          exit "$result"
+
+      - name: Capture failure diagnostics before cleanup
+        if: always()
+        run: |
+          set +e
+          mkdir -p "$DIAGNOSTICS_DIR"
+          if [[ ! -f "$DIAGNOSTICS_DIR/kind-before.txt" ]]; then
+            echo 'Initial Kind inventory unavailable; refusing to infer run ownership' > "$DIAGNOSTICS_DIR/inventory-unavailable.txt"
+            exit 1
+          fi
+          kind get clusters | sort > "$DIAGNOSTICS_DIR/kind-before-cleanup.txt"
+          docker network ls --format '{{.Name}} {{.ID}}' | sort > "$DIAGNOSTICS_DIR/networks-before-cleanup.txt"
+          comm -13 "$DIAGNOSTICS_DIR/kind-before.txt" "$DIAGNOSTICS_DIR/kind-before-cleanup.txt" | while read -r cluster; do
+            [[ "$cluster" == grid-llmd-pm-* ]] || continue
+            kubectl --context "kind-$cluster" -n grid-system get pods,deployments,services -o wide > "$DIAGNOSTICS_DIR/${cluster}-workloads.txt" 2>&1
+            kubectl --context "kind-$cluster" -n grid-system get events --sort-by=.lastTimestamp > "$DIAGNOSTICS_DIR/${cluster}-events.txt" 2>&1
+          done
+
+      - name: Clean only this run's clusters and networks
+        if: always()
+        run: |
+          set +e
+          mkdir -p "$DIAGNOSTICS_DIR"
+          if [[ ! -f "$DIAGNOSTICS_DIR/kind-before.txt" || ! -f "$DIAGNOSTICS_DIR/networks-before.txt" ]]; then
+            echo 'Initial inventory unavailable; refusing cleanup without ownership baseline' > "$DIAGNOSTICS_DIR/cleanup-refused.txt"
+            echo 1 > "$DIAGNOSTICS_DIR/cleanup-exit-status.txt"
+            exit 1
+          fi
+          cleanup_failed=0
+          kind get clusters | sort > "$DIAGNOSTICS_DIR/kind-during-cleanup.txt"
+          while read -r cluster; do
+            [[ "$cluster" == grid-llmd-pm-* ]] || continue
+            kind delete cluster --name "$cluster" || cleanup_failed=1
+          done < <(comm -13 "$DIAGNOSTICS_DIR/kind-before.txt" "$DIAGNOSTICS_DIR/kind-during-cleanup.txt")
+          docker network ls --format '{{.Name}} {{.ID}}' | sort > "$DIAGNOSTICS_DIR/networks-during-cleanup.txt"
+          while read -r name id; do
+            [[ "$name" == grid-llmd-pm-*-net ]] || continue
+            docker network rm "$id" || cleanup_failed=1
+          done < <(comm -13 "$DIAGNOSTICS_DIR/networks-before.txt" "$DIAGNOSTICS_DIR/networks-during-cleanup.txt")
+          kind get clusters | sort > "$DIAGNOSTICS_DIR/kind-after.txt"
+          docker network ls --format '{{.Name}} {{.ID}}' | sort > "$DIAGNOSTICS_DIR/networks-after.txt"
+          if comm -13 "$DIAGNOSTICS_DIR/kind-before.txt" "$DIAGNOSTICS_DIR/kind-after.txt" | grep -q '^grid-llmd-pm-'; then cleanup_failed=1; fi
+          if comm -13 "$DIAGNOSTICS_DIR/networks-before.txt" "$DIAGNOSTICS_DIR/networks-after.txt" | grep -q '^grid-llmd-pm-.*-net '; then cleanup_failed=1; fi
+          printf '%s\n' "$cleanup_failed" > "$DIAGNOSTICS_DIR/cleanup-exit-status.txt"
+          exit "$cleanup_failed"
+
+      - name: Upload attempt evidence
+        if: always()
+        uses: actions/upload-artifact@604373da6381bf24206979c74d06a550515ad2156 # v5.0.0
+        with:
+          name: llmd-signal-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: |
+            evidence/**/evidence.json
+            evidence/**/timeline.jsonl
+            evidence/image-manifest.txt
+            evidence/source-identity.txt
+            evidence/tool-versions.txt
+            evidence/xtask-exit-status.txt
+            evidence/xtask.log
+            diagnostics/*.txt
+          if-no-files-found: error
