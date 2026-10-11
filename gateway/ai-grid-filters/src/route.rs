@@ -465,15 +465,12 @@ fn finish_route_response_headers(
 }
 
 /// Set trusted response attribution for the site and cluster selected by Grid.
-fn set_route_attribution_headers(
-    headers: &mut http::HeaderMap,
-    site: &str,
-    cluster: &str,
-) -> Result<(), FilterError> {
+fn set_route_attribution_headers(headers: &mut http::HeaderMap, site: &str, cluster: &str) -> Result<(), FilterError> {
     let site = http::HeaderValue::from_str(site)
         .map_err(|error| -> FilterError { format!("grid_site_route: invalid selected site header: {error}").into() })?;
-    let cluster = http::HeaderValue::from_str(cluster)
-        .map_err(|error| -> FilterError { format!("grid_site_route: invalid selected backend header: {error}").into() })?;
+    let cluster = http::HeaderValue::from_str(cluster).map_err(|error| -> FilterError {
+        format!("grid_site_route: invalid selected backend header: {error}").into()
+    })?;
     headers.insert(http::header::HeaderName::from_static(ROUTE_SITE_HEADER), site);
     headers.insert(http::header::HeaderName::from_static(ROUTE_BACKEND_HEADER), cluster);
     Ok(())
