@@ -91,6 +91,30 @@ jobs:
           kind get clusters | sort > "$DIAGNOSTICS_DIR/kind-before.txt"
           docker network ls --format '{{.Name}} {{.ID}}' | sort > "$DIAGNOSTICS_DIR/networks-before.txt"
 
+      - name: Configure run-owned Docker subnet for reversible partition
+        run: |
+          set -euo pipefail
+          real_docker=$(command -v docker)
+          wrapper_dir="$RUNNER_TEMP/grid-llmd-docker-bin"
+          mkdir -p "$wrapper_dir"
+          cat > "$wrapper_dir/docker" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "${1:-}" == "network" && "${2:-}" == "create" ]]; then
+            network_name="${@: -1}"
+            if [[ "$network_name" == grid-llmd-pm-*-net ]]; then
+              printf 'Applied subnet 10.253.0.0/16 to run-owned network %s\n' "$network_name" >> "$EVIDENCE_DIR/docker-network-subnet-override.txt"
+              "${GRID_VALIDATION_REAL_DOCKER:?}" network create --subnet 10.253.0.0/16 "${@:3}"
+              "${GRID_VALIDATION_REAL_DOCKER}" network inspect "$network_name" --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' >> "$EVIDENCE_DIR/docker-network-subnet-override.txt"
+              exit 0
+            fi
+          fi
+          exec "${GRID_VALIDATION_REAL_DOCKER:?}" "$@"
+          EOF
+          chmod +x "$wrapper_dir/docker"
+          echo "GRID_VALIDATION_REAL_DOCKER=$real_docker" >> "$GITHUB_ENV"
+          echo "$wrapper_dir" >> "$GITHUB_PATH"
+
       - name: Build source-matched Grid images
         run: |
           set -euo pipefail
