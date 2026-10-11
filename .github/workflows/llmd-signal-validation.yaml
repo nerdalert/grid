@@ -162,6 +162,8 @@ jobs:
           cd grid
           test "$(git rev-parse HEAD)" = "$PRODUCT_SHA" || exit 1
           ./scripts/forge.sh install || exit 1
+          # GitHub's bash shell starts with errexit; keep going long enough to save the xtask pipeline status.
+          set +e
           timeout --signal=TERM --kill-after=30s 75m cargo xtask env run-grid-llmd-pool-metrics-demo \
             --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml \
             --full --teardown --keep-on-failure --evidence-dir "$EVIDENCE_DIR" \
