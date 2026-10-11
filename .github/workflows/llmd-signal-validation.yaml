@@ -227,6 +227,7 @@ jobs:
             evidence/source-identity.txt
             evidence/tool-versions.txt
             evidence/xtask-exit-status.txt
+            evidence/docker-network-subnet-override.txt
             evidence/xtask.log
             diagnostics/*.txt
           if-no-files-found: error
