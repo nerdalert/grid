@@ -120,7 +120,7 @@ jobs:
         run: |
           set -euo pipefail
           for image in "$OPERATOR_IMAGE" "$GRID_GATEWAY_IMAGE" "$AI_IMAGE" "$SIM_IMAGE" "$EPP_IMAGE" "$SYNC_IMAGE"; do
-            docker image inspect --format='{{join .RepoTags ","}}\t{{.Id}}\t{{join .RepoDigests ","}}\t{{with .Config.Labels}}{{index . "org.opencontainers.image.revision"}}{{end}}' "$image"
+            docker image inspect "$image" | jq -er '.[0] | [((.RepoTags // []) | join(",")), (.Id // ""), ((.RepoDigests // []) | join(",")), ((.Config.Labels // {})["org.opencontainers.image.revision"] // "")] | @tsv'
           done | tee "$EVIDENCE_DIR/image-manifest.txt"
 
       - name: Run full llm-d qualification
