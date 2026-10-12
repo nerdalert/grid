@@ -5,7 +5,7 @@ name: Temporary llm-d signal validation
 on:
   push:
     branches:
-      - validation/llmd-signal-ci-c5e922a
+      - validation/llmd-signal-ci-c14adc4
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      PRODUCT_SHA: c5e922adfb9536ede0f05f3681441857f3c801c5
+      PRODUCT_SHA: c14adc4a5403498a93098938583cbab4a6a4268b
       KIND_VERSION: v0.32.0
       KUBECTL_VERSION: v1.32.3
       RUST_VERSION: 1.96.0
@@ -28,8 +28,8 @@ jobs:
       EPP_PIN: ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:873179822ab0895a37ea09f2112ca39a6ae50a26612561c8bfad7f9a8c5af6f5
       SYNC_IMAGE: ghcr.io/praxis-proxy/grid-overlay-sync:v0.1.4
       SYNC_PIN: ghcr.io/praxis-proxy/grid-overlay-sync@sha256:a3cc31a8b5469dca63a0de406e342bfbbe46dee02fe33721d6bac1943748c711
-      OPERATOR_IMAGE: grid-operator:llmd-validation-c5e922a
-      GRID_GATEWAY_IMAGE: grid-gateway:llmd-validation-c5e922a
+      OPERATOR_IMAGE: grid-operator:llmd-validation-c14adc4
+      GRID_GATEWAY_IMAGE: grid-gateway:llmd-validation-c14adc4
       EVIDENCE_DIR: ${{ github.workspace }}/evidence
       DIAGNOSTICS_DIR: ${{ github.workspace }}/diagnostics
 
@@ -47,7 +47,7 @@ jobs:
       - name: Checkout exact product revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: c5e922adfb9536ede0f05f3681441857f3c801c5
+          ref: c14adc4a5403498a93098938583cbab4a6a4268b
           path: grid
           persist-credentials: false
 
