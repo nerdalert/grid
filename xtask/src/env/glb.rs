@@ -3615,6 +3615,7 @@ fn grid_network_recovered_after_restart(
 }
 
 /// Current content-addressed identity and Kubernetes version for one edge overlay.
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CurrentEdgeOverlay {
     /// Kubernetes resource version returned with the current `ConfigMap`.
     resource_version: String,
@@ -4909,6 +4910,14 @@ fn check_invalid_overlay_protection(edge: &str) -> Result<String, Box<dyn std::e
         .and_then(serde_json::Value::as_str)
         .ok_or("valid envelope missing revision.value")?
         .to_owned();
+    let previous_config_map = edge_overlay_configmap_json(edge)?;
+    let previous_config_map_resource_version = previous_config_map
+        .pointer("/metadata/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("valid overlay ConfigMap has no resourceVersion")?
+        .to_owned();
+    let previous_network_resource_version = grid_network_resource_version(edge)?;
+    let expected_candidates = edge_candidate_count()?;
     let mut invalid_document = valid_document;
     invalid_document["content_digest"]["value"] = serde_json::Value::String("0".repeat(64));
     let invalid_envelope = serde_json::to_string_pretty(&invalid_document)?;
@@ -4938,7 +4947,39 @@ fn check_invalid_overlay_protection(edge: &str) -> Result<String, Box<dyn std::e
 
     let recovery = restore.and_then(|()| {
         kubectl::wait_for_rollout_ns(&kubectl_context(edge), "edge-gateway", GRID_SYSTEM_NS, edge)?;
-        wait_for_data_plane_convergence("edge recovery after valid overlay restore", check_inference_routed)
+        let publication = wait_for_restored_overlay_publication(
+            edge,
+            &valid_revision,
+            &previous_config_map_resource_version,
+            &previous_network_resource_version,
+            expected_candidates,
+        )?;
+        eprintln!(
+            "  published → {edge}: revision={}, ConfigMap resourceVersion={}, GridNetwork resourceVersion={}",
+            safe_truncate_str(&publication.revision, 16),
+            publication.resource_version,
+            publication.network_resource_version
+        );
+        let projection = wait_for_stable_restored_projection(
+            edge,
+            "east-provider",
+            &valid_revision,
+            EDGE_OVERLAY_PROJECTION_TIMEOUT,
+            EDGE_ACCEPTANCE_POLL,
+            edge_mounted_overlay_observation,
+        )?;
+        eprintln!(
+            "  projected → {edge}: revision={} (pod {}, restarts {})",
+            safe_truncate_str(&projection.mounted_revision, 16),
+            safe_truncate_str(&projection.identity.uid, 12),
+            projection.identity.restart_count
+        );
+        verify_edge_serving_revision(edge, &valid_revision)?;
+        let routed =
+            wait_for_data_plane_convergence("edge recovery after valid overlay restore", check_inference_routed)?;
+        Ok(format!(
+            "restored revision published, mounted, and serving; request recovery: {routed}"
+        ))
     });
 
     match (proof, recovery) {
@@ -5159,6 +5200,170 @@ fn wait_for_candidate_admission(
         thread::sleep(Duration::from_secs(1));
     }
     Err(format!("timeout waiting for {provider} admission_state={expected} on {edge}; observed={observed:?}").into())
+}
+
+/// Wait until the operator republishes the expected complete overlay after restoration.
+#[expect(
+    clippy::too_many_lines,
+    reason = "publication identity, status, stability, and timeout diagnostics are one barrier"
+)]
+fn wait_for_restored_overlay_publication(
+    edge: &str,
+    expected_revision: &str,
+    previous_config_map_resource_version: &str,
+    previous_network_resource_version: &str,
+    expected_candidates: usize,
+) -> Result<CurrentEdgeOverlay, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + PROVIDER_STATE_WAIT;
+    let mut previous: Option<CurrentEdgeOverlay> = None;
+    let mut last_observation: String;
+
+    loop {
+        match read_current_edge_overlay(edge, expected_candidates) {
+            Ok(current) => match restored_overlay_publication_evidence(
+                edge,
+                expected_revision,
+                previous_config_map_resource_version,
+                previous_network_resource_version,
+                expected_candidates,
+                &current,
+            ) {
+                Ok(_) => {
+                    if previous.as_ref() == Some(&current) {
+                        return Ok(current);
+                    }
+                    last_observation = format!(
+                        "revision={}, ConfigMap resourceVersion={}, GridNetwork resourceVersion={}",
+                        safe_truncate_str(&current.revision, 16),
+                        current.resource_version,
+                        current.network_resource_version,
+                    );
+                    previous = Some(current);
+                },
+                Err(error) => {
+                    last_observation = error;
+                    previous = None;
+                },
+            },
+            Err(error) => {
+                last_observation = safe_truncate_str(&error.to_string(), 220);
+                previous = None;
+            },
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{edge} did not publish a stable restored overlay within {PROVIDER_STATE_WAIT:?}: {last_observation}"
+            )
+            .into());
+        }
+        thread::park_timeout(Duration::from_secs(1));
+    }
+}
+
+/// Require a fresh operator publication of the exact complete restored revision.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the expected restored revision and both freshness markers define one publication predicate"
+)]
+fn restored_overlay_publication_evidence(
+    edge: &str,
+    expected_revision: &str,
+    previous_config_map_resource_version: &str,
+    previous_network_resource_version: &str,
+    expected_candidates: usize,
+    current: &CurrentEdgeOverlay,
+) -> Result<String, String> {
+    if current.revision != expected_revision {
+        return Err(format!(
+            "{edge} distributed revision is {}, expected restored revision {}",
+            safe_truncate_str(&current.revision, 16),
+            safe_truncate_str(expected_revision, 16)
+        ));
+    }
+    if current.resource_version == previous_config_map_resource_version {
+        return Err(format!(
+            "{edge} overlay ConfigMap resourceVersion is unchanged ({})",
+            current.resource_version
+        ));
+    }
+    if current.network_resource_version == previous_network_resource_version {
+        return Err(format!(
+            "{edge} GridNetwork has not observed the restored publication ({})",
+            current.network_resource_version
+        ));
+    }
+    if current.candidate_ids.len() != expected_candidates {
+        return Err(format!(
+            "{edge} restored publication has {} candidates, expected {expected_candidates}",
+            current.candidate_ids.len()
+        ));
+    }
+    if !current.all_candidates_fresh {
+        return Err(format!("{edge} restored publication contains stale candidates"));
+    }
+    Ok(format!(
+        "{edge}: revision={} with {expected_candidates} fresh candidates",
+        safe_truncate_str(&current.revision, 16)
+    ))
+}
+
+/// Wait until the restored `ConfigMap` revision is stably projected into the ready gateway pod.
+#[expect(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "the bounded projection barrier keeps revision and pod diagnostics together"
+)]
+fn wait_for_stable_restored_projection(
+    edge: &str,
+    provider: &str,
+    expected_revision: &str,
+    timeout: Duration,
+    interval: Duration,
+    mut observe: impl FnMut(&str, &str) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>>,
+) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut previous: Option<EdgeMountedOverlayObservation> = None;
+    let mut last_observation: String;
+
+    loop {
+        match observe(edge, provider) {
+            Ok(observation) => {
+                last_observation = format!(
+                    "provider_present={}, distributed_revision={}, mounted_revision={}, pod={}/restarts:{}",
+                    observation.provider_present,
+                    safe_truncate_str(&observation.distributed_revision, 16),
+                    safe_truncate_str(&observation.mounted_revision, 16),
+                    safe_truncate_str(&observation.identity.uid, 12),
+                    observation.identity.restart_count,
+                );
+                if observation.provider_present
+                    && observation.distributed_revision == expected_revision
+                    && observation.mounted_revision == expected_revision
+                {
+                    if previous.as_ref() == Some(&observation) {
+                        return Ok(observation);
+                    }
+                    previous = Some(observation);
+                } else {
+                    previous = None;
+                }
+            },
+            Err(error) => {
+                last_observation = safe_truncate_str(&error.to_string(), 220);
+                previous = None;
+            },
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{edge} restored overlay was not stably projected within {timeout:?}: {last_observation}"
+            )
+            .into());
+        }
+        thread::park_timeout(interval);
+    }
 }
 
 /// Wait until the `ConfigMap` withdrawal reaches the mounted edge overlay twice.
@@ -7122,6 +7327,110 @@ clusters:
             post_restart_edge_publication_evidence("east-edge", "new-revision", "55", &complete),
             Err(error) if error == "candidate set is not fully fresh"
         ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the assertions distinguish a valid restored publication from stale or incomplete state"
+    )]
+    fn restored_publication_requires_new_exact_fresh_overlay_and_status() {
+        let mut complete = CurrentEdgeOverlay {
+            resource_version: "52".to_owned(),
+            revision: "restored-revision".to_owned(),
+            candidate_ids: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            all_candidates_fresh: true,
+            network_resource_version: "56".to_owned(),
+        };
+
+        assert!(matches!(
+            restored_overlay_publication_evidence("east-edge", "restored-revision", "51", "55", 3, &complete),
+            Ok(evidence) if evidence.contains("3 fresh candidates")
+        ));
+        assert!(matches!(
+            restored_overlay_publication_evidence("east-edge", "wrong-revision", "51", "55", 3, &complete),
+            Err(error) if error.contains("expected restored revision")
+        ));
+
+        complete.resource_version = "51".to_owned();
+        assert!(matches!(
+            restored_overlay_publication_evidence("east-edge", "restored-revision", "51", "55", 3, &complete),
+            Err(error) if error.contains("ConfigMap resourceVersion is unchanged")
+        ));
+
+        complete.resource_version = "52".to_owned();
+        complete.network_resource_version = "55".to_owned();
+        assert!(matches!(
+            restored_overlay_publication_evidence("east-edge", "restored-revision", "51", "55", 3, &complete),
+            Err(error) if error.contains("has not observed the restored publication")
+        ));
+
+        complete.network_resource_version = "56".to_owned();
+        complete.all_candidates_fresh = false;
+        assert!(matches!(
+            restored_overlay_publication_evidence("east-edge", "restored-revision", "51", "55", 3, &complete),
+            Err(error) if error.contains("stale candidates")
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the sequence proves stale projection is ignored until the exact stable revision is mounted"
+    )]
+    fn restored_projection_waits_for_matching_revision_and_stable_gateway_pod() {
+        let observations = [
+            EdgeMountedOverlayObservation {
+                provider_present: true,
+                distributed_revision: "restored".to_owned(),
+                mounted_revision: "withdrawal".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-a".to_owned(),
+                    restart_count: 0,
+                },
+            },
+            EdgeMountedOverlayObservation {
+                provider_present: true,
+                distributed_revision: "restored".to_owned(),
+                mounted_revision: "restored".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-a".to_owned(),
+                    restart_count: 0,
+                },
+            },
+            EdgeMountedOverlayObservation {
+                provider_present: true,
+                distributed_revision: "restored".to_owned(),
+                mounted_revision: "restored".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-a".to_owned(),
+                    restart_count: 0,
+                },
+            },
+        ];
+        let attempts = std::cell::Cell::new(0);
+        let result = wait_for_stable_restored_projection(
+            "east-edge",
+            "east-provider",
+            "restored",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_, _| {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                observations
+                    .get(attempt)
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::other("test observation sequence exhausted").into())
+            },
+        );
+
+        assert!(result.is_ok(), "expected stable restored projection: {result:?}");
+        let observed = result.unwrap_or_else(|_| std::process::abort());
+        assert_eq!(observed.distributed_revision, "restored");
+        assert_eq!(observed.mounted_revision, "restored");
+        assert_eq!(observed.identity.uid, "pod-a");
+        assert_eq!(attempts.get(), observations.len());
     }
 
     #[test]
