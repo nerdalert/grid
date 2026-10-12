@@ -163,46 +163,41 @@ flush Valkey to simulate recovery.
 ## Gateway Build Features
 
 The Praxis AI gateway image must enable the optional token quota filter used
-by this topology. Praxis AI 0.4.0 already includes the Basic Auth filter:
+by this topology. Praxis AI 0.6.0 includes the Basic Auth filter:
 
 ```text
 token-rate-limit-filter
 ```
 
 > **Published-image limitation:** The standard
-> `ghcr.io/praxis-proxy/ai:0.4.0` image includes Basic Auth but does not contain
+> `ghcr.io/praxis-proxy/ai:0.6.0` image includes Basic Auth but does not contain
 > the optional `token-rate-limit-filter`, so it cannot run this qualification.
-> The standard image depends on Praxis core 0.7.0; that is distinct from the
-> Praxis AI image version 0.4.0. AGN publishes no alternate AI rollup.
+> The standard image builds `full,store-sqlite`; the quota filter is an
+> experimental opt-in feature and is not included in that released image.
 
 For a separate custom-image qualification, enable `token-rate-limit-filter`
 while building AI from its own clean source tree and committed lockfile. Basic
 Auth stores the qualification credential in configuration and is not the
 production identity mechanism proposed in issue #101.
 
-AI v0.4.0's `Containerfile` does not expose a Cargo-feature build argument.
-Prepare a temporary Containerfile outside the AI worktree that adds the exact
-feature expression to both build-stage `cargo build` commands, then label the
-result so the qualification can verify its contract before creating clusters:
+The v0.6.0 `Containerfile` exposes the `PRAXIS_AI_FEATURES` build argument.
+Build a separate image with the quota feature enabled, then label the result
+so the qualification can verify its contract before creating clusters:
 
 ```bash
 AI_REPO=/path/to/clean/praxis-proxy-ai
-BUILD_DIR="$EVIDENCE_DIR/ai-image"
-mkdir -p "$BUILD_DIR"
-sed 's/cargo build --release -p praxis-ai-proxy/cargo build --release -p praxis-ai-proxy --features token-rate-limit-filter/' \
-  "$AI_REPO/Containerfile" > "$BUILD_DIR/Containerfile"
-
 docker build \
-  --file "$BUILD_DIR/Containerfile" \
+  --file "$AI_REPO/Containerfile" \
+  --build-arg 'PRAXIS_AI_FEATURES=full,store-sqlite,token-rate-limit-filter' \
   --label 'org.praxis-proxy.ai.features=token-rate-limit-filter,praxis-filter/basic-auth-filter' \
   --tag "praxis-ai:$IMAGE_TAG" \
   "$AI_REPO"
 ```
 
-The temporary file is build input, not an AI source change. Do not add a Praxis
-path dependency or compose source from another checkout. The label is an early
-provenance check; gateway configuration loading remains the authoritative check
-that both filters are registered in the binary.
+Keep the custom build on the clean AI source tree and its committed lockfile.
+Do not add a Praxis path dependency or compose source from another checkout.
+The label is an early provenance check; gateway configuration loading remains
+the authoritative check that both filters are registered in the binary.
 
 ## Running the qualification
 

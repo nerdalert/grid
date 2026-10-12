@@ -124,6 +124,12 @@ The complete environment is in [`forge.yaml`](./forge.yaml). Supporting files ar
 | [`resources/common/vcr-provider-workload.yaml`](./resources/common/vcr-provider-workload.yaml) | One attributed VCR backend per provider cluster |
 | [`resources/common/backend-network-policy.yaml`](./resources/common/backend-network-policy.yaml) | Restricts backend access to the provider gateway |
 
+The Forge file uses the released Praxis AI 0.6.0 image by default. The xtask
+qualification deliberately overrides that value with its local
+`praxis-ai:provider-traffic-qualification` image so source validation can build
+the gateway from a clean AI checkout. Release validation can select the
+published image explicitly with `GRID_XTASK_GATEWAY_IMAGE` after pulling it.
+
 ## Run the proof
 
 Prerequisites include Docker, Kind, `kubectl`, Helm, OpenSSL, and `praxis-forge`. Build the source images below before using the default `Never` pull policy.

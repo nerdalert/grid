@@ -149,14 +149,23 @@ export GRID_XTASK_SIM_IMAGE=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
 export GRID_XTASK_IMAGE_PULL_POLICY=Never
 ```
 
+The released Praxis AI image used by release-compatible Kind qualifications
+is `ghcr.io/praxis-proxy/ai:0.6.0`. It was published from source revision
+`75e8662d8a4705391e7cce6e79c08e4e9cd826a0` with manifest digest
+`sha256:45e7f510ad40ffc41b7dadfa0feabd0d201ce43e75f8bd1ebee6c2f020f7f3e3`.
+CI pins that digest and records the resolved image identity in its evidence.
+The static-weighted qualification's corresponding image pin is maintained in
+its dedicated qualification change.
+
 In the current qualification tooling, `GRID_XTASK_GATEWAY_IMAGE` names the
 Praxis AI gateway image used by the fixtures. It does not refer to the
 project-owned `grid-gateway` operand.
 
 The distributed token-quota qualification requires the optional Praxis AI
-`token-rate-limit-filter`. Praxis AI 0.4.0 already includes Basic Auth; a
-custom quota image only needs to enable the token filter. The qualification's
-image label still declares both available filters:
+`token-rate-limit-filter`. The released Praxis AI 0.6.0 image includes Basic
+Auth but omits that experimental filter; build a separate quota image with the
+token filter enabled. The qualification's image label still declares both
+available filters:
 
 ```text
 token-rate-limit-filter,praxis-filter/basic-auth-filter
@@ -199,7 +208,7 @@ notes, run it and report its evidence independently.
 | Area | Behavior proved | Images and overrides | Evidence, runtime, and cleanup | Feature docs |
 |---|---|---|---|---|
 | Provider traffic selection and round-robin | Grid publishes stable provider candidates and groups; Praxis AI accepts the overlay and returns trusted attribution while eligible providers receive round-robin traffic. | Official compatible Praxis AI gateway image, plus locally built `grid-operator`, `grid-overlay-sync`, `grid-mock-providers`, and VCR images. Use the `GRID_XTASK_*_IMAGE` overrides above when validating unreleased Grid code. | Write to the run's UTC-stamped `EVIDENCE_DIR`; the full run is typically several minutes. Verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-provider-traffic/README.md) |
-| Distributed token quota | Basic Auth precedes admission; Alice's sliding-window budget is shared across consumers; routing spans sites; concurrency, expiry, restart persistence, Valkey fail-closed behavior, recovery, and NetworkPolicy are exercised. | Praxis AI 0.4.0 includes Basic Auth; a custom quota image must enable `token-rate-limit-filter` and declare both available filters in its image label. Use `--image-tag` and the exact image required by the README. | Record structured quota and routing evidence under `EVIDENCE_DIR`; runtime is variable and materially longer than a smoke test. The command attempts cleanup on normal completion or handled failure; do not use `--keep` for release evidence. | [README](../tests/e2e/topologies/grid-token-rate-limit/README.md) |
+| Distributed token quota | Basic Auth precedes admission; Alice's sliding-window budget is shared across consumers; routing spans sites; concurrency, expiry, restart persistence, Valkey fail-closed behavior, recovery, and NetworkPolicy are exercised. | The released Praxis AI 0.6.0 image includes Basic Auth but omits experimental `token-rate-limit-filter`; a custom quota image must enable that feature and declare both available filters in its image label. Use `--image-tag` and the exact image required by the README. | Record structured quota and routing evidence under `EVIDENCE_DIR`; runtime is variable and materially longer than a smoke test. The command attempts cleanup on normal completion or handled failure; do not use `--keep` for release evidence. | [README](../tests/e2e/topologies/grid-token-rate-limit/README.md) |
 | Single-cluster multi-gateway | Two consumer gateways independently accept and serve the same three-provider overlay inside one Kubernetes cluster and one GridSite; attributed round-robin selection, provider withdrawal/restoration, consumer failure/recovery, concurrent traffic, and NetworkPolicy boundaries are exercised. | The fixed `grid-operator:single-cluster-qualification`, `grid-overlay-sync:single-cluster-qualification`, and `praxis-ai:single-cluster-qualification` references are local-development defaults. Release validation should set `GRID_XTASK_OPERATOR_IMAGE`, `GRID_XTASK_OVERLAY_SYNC_IMAGE`, and `GRID_XTASK_GATEWAY_IMAGE` to unique references; set `GRID_XTASK_SIM_IMAGE` as needed. All resolved references are loaded into Kind under `imagePullPolicy: Never`. | The command records timestamped structured evidence and attempts cleanup unless `--keep` is explicitly supplied. It does not claim multi-site SWIM, WAN behavior, or a globally shared round-robin cursor. | [README](../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md) |
 | Combined-site lifecycle | Combined-site bootstrap, trusted round-robin, provider drain and restoration, secondary add/remove/re-add, session fallback, revision convergence, and lifecycle cleanup. | Official compatible Praxis AI image plus local `grid-operator`, `grid-overlay-sync`, `grid-mock-providers`, and VCR images through the overrides above. | Save lifecycle timelines and request attribution under `EVIDENCE_DIR`; a full run is typically on the order of tens of minutes. Run alone and verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-combined-site/README.md) |
 | GLB | Global load-balancing and network-boundary behavior, including provider attribution and the configured ingress path. | Official compatible Praxis AI image plus the topology's required local `grid-operator`, `grid-overlay-sync`, `grid-mock-providers`, and VCR images; use the listed overrides and `Never` pull policy for local images. | Save results under `EVIDENCE_DIR`; use `--quick` for bounded diagnostics or `--full` for qualification. Run alone and verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-glb-demo/README.md) |
