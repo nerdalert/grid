@@ -7729,7 +7729,10 @@ mod tests {
 
     #[test]
     fn default_gateway_image_is_the_published_qualification_image() {
-        assert_eq!(DEFAULT_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.6.0");
+        assert_eq!(
+            DEFAULT_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.6.0",
+            "combined-site qualification must use the published gateway release"
+        );
     }
 
     #[test]
