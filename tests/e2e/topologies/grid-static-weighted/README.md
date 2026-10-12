@@ -81,6 +81,12 @@ a compatible Praxis AI gateway image. Run it in a dedicated checkout and do
 not run concurrent Forge qualifications that share the same state or resource
 names.
 
+The triggered GitHub qualification uses the published
+`ghcr.io/praxis-proxy/ai:0.6.0` image, pinned by its OCI index digest in the
+workflow. The local source-validation instructions below deliberately build a
+Praxis AI image from the companion checkout and pass it as an explicit image
+override.
+
 For source validation, build the Grid operator from this checkout and build a
 compatible Praxis AI gateway image from its repository:
 

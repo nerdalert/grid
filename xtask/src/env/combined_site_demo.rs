@@ -38,6 +38,9 @@ use super::{
 /// Directory where generated TLS certificates are stored.
 const CERTS_DIR: &str = "tests/env/certs";
 
+/// Default published Praxis AI gateway image used by this qualification.
+const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.6.0";
+
 /// Ordered cluster names in the combined-site scenario environment.
 const CLUSTERS: &[&str] = &["west", "central", "east"];
 
@@ -3819,8 +3822,7 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
         return Ok(());
     }
 
-    let gateway =
-        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "ghcr.io/praxis-proxy/ai:0.4.0".to_owned());
+    let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
     let vcr = crate::env::image_overrides::sim_image();
@@ -4729,8 +4731,7 @@ fn materialize_external_provider_stack(
     reason = "Image override application with structured YAML manipulation; nested ifs follow YAML structure hierarchy"
 )]
 fn apply_image_overrides(config: &mut serde_yaml::Value) {
-    let gateway_image =
-        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "ghcr.io/praxis-proxy/ai:0.4.0".to_owned());
+    let gateway_image = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
     let vcr_image = crate::env::image_overrides::sim_image();
@@ -7725,6 +7726,11 @@ fn collect_external_provider_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_gateway_image_is_the_published_qualification_image() {
+        assert_eq!(DEFAULT_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.6.0");
+    }
 
     #[test]
     fn discovery_barrier_rejects_missing_gridsite() {
