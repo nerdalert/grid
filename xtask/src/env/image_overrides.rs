@@ -67,7 +67,7 @@ const DEFAULT_SIM_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
 const DEFAULT_GLB_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
 
 /// Default gateway image for workload-inference demos.
-const DEFAULT_WORKLOAD_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.4.0";
+const DEFAULT_WORKLOAD_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.6.0";
 
 /// Default operator image for workload-inference demos.
 const DEFAULT_WORKLOAD_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
@@ -299,7 +299,7 @@ mod tests {
         assert_eq!(DEFAULT_GLB_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.6.0");
         assert_eq!(DEFAULT_GLB_OPERATOR_IMAGE, "ghcr.io/praxis-proxy/grid-operator:v0.1.4");
         assert_eq!(DEFAULT_IMAGE_PULL_POLICY, "Never");
-        assert_eq!(DEFAULT_WORKLOAD_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.4.0");
+        assert_eq!(DEFAULT_WORKLOAD_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.6.0");
         assert_eq!(
             DEFAULT_WORKLOAD_OPERATOR_IMAGE,
             "ghcr.io/praxis-proxy/grid-operator:v0.1.4"

@@ -5229,7 +5229,10 @@ fn wait_for_restored_overlay_publication(
                 &current,
             ) {
                 Ok(_) => {
-                    if previous.as_ref() == Some(&current) {
+                    if previous
+                        .as_ref()
+                        .is_some_and(|previous| same_semantic_overlay(previous, &current))
+                    {
                         return Ok(current);
                     }
                     last_observation = format!(
@@ -5259,6 +5262,13 @@ fn wait_for_restored_overlay_publication(
         }
         thread::park_timeout(Duration::from_secs(1));
     }
+}
+
+/// Compare overlay content without treating Kubernetes resource-version churn as a change.
+fn same_semantic_overlay(left: &CurrentEdgeOverlay, right: &CurrentEdgeOverlay) -> bool {
+    left.revision == right.revision
+        && left.candidate_ids == right.candidate_ids
+        && left.all_candidates_fresh == right.all_candidates_fresh
 }
 
 /// Require a fresh operator publication of the exact complete restored revision.
@@ -7450,6 +7460,33 @@ clusters:
             post_restart_edge_publication_evidence("east-edge", "old-revision", "55", &complete).ok(),
             "edge evidence must exclude resource versions from stability comparisons"
         );
+    }
+
+    #[test]
+    fn restored_publication_stability_ignores_resource_version_churn() {
+        let previous = CurrentEdgeOverlay {
+            resource_version: "52".to_owned(),
+            revision: "restored-revision".to_owned(),
+            candidate_ids: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            all_candidates_fresh: true,
+            network_resource_version: "56".to_owned(),
+        };
+        let mut current = previous.clone();
+        current.resource_version = "53".to_owned();
+        current.network_resource_version = "57".to_owned();
+
+        assert!(same_semantic_overlay(&previous, &current));
+
+        current.revision = "different-revision".to_owned();
+        assert!(!same_semantic_overlay(&previous, &current));
+        current.revision = previous.revision.clone();
+
+        current.candidate_ids.pop();
+        assert!(!same_semantic_overlay(&previous, &current));
+        current.candidate_ids = previous.candidate_ids.clone();
+
+        current.all_candidates_fresh = false;
+        assert!(!same_semantic_overlay(&previous, &current));
     }
 
     #[test]
