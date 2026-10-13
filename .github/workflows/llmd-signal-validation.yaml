@@ -1,11 +1,14 @@
 name: Temporary llm-d signal validation
 
-# Fork-only validation. The product checkout stays pinned even though this
-# workflow lives in a separate validation commit.
+# Fork-only validation. The workflow SHA and exact product SHA are recorded
+# separately so a validation branch can test a requested product commit.
 on:
-  push:
-    branches:
-      - validation/llmd-signal-ci-c5e922a
+  workflow_dispatch:
+    inputs:
+      product_sha:
+        description: Exact product commit in this fork to qualify
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -16,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      PRODUCT_SHA: c5e922adfb9536ede0f05f3681441857f3c801c5
+      PRODUCT_SHA: ${{ inputs.product_sha }}
       KIND_VERSION: v0.32.0
       KUBECTL_VERSION: v1.32.3
       RUST_VERSION: 1.96.0
@@ -24,12 +27,12 @@ jobs:
       AI_PIN: ghcr.io/praxis-proxy/ai@sha256:45e7f510ad40ffc41b7dadfa0feabd0d201ce43e75f8bd1ebee6c2f020f7f3e3
       SIM_IMAGE: ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
       SIM_PIN: ghcr.io/llm-d/llm-d-inference-sim@sha256:7f3a1f72875c5dd5d00299ad358dc1f6e17041a5124609a43aa17ad318bbed32
-      EPP_IMAGE: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
-      EPP_PIN: ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:873179822ab0895a37ea09f2112ca39a6ae50a26612561c8bfad7f9a8c5af6f5
+      EPP_IMAGE: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0
+      EPP_PIN: ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:39257d24552d16d8f215d3de25cc734fd44af3b282b67032db01aff900c610cf
       SYNC_IMAGE: ghcr.io/praxis-proxy/grid-overlay-sync:v0.1.4
       SYNC_PIN: ghcr.io/praxis-proxy/grid-overlay-sync@sha256:a3cc31a8b5469dca63a0de406e342bfbbe46dee02fe33721d6bac1943748c711
-      OPERATOR_IMAGE: grid-operator:llmd-validation-c5e922a
-      GRID_GATEWAY_IMAGE: grid-gateway:llmd-validation-c5e922a
+      OPERATOR_IMAGE: grid-operator:llmd-validation-${{ inputs.product_sha }}
+      GRID_GATEWAY_IMAGE: grid-gateway:llmd-validation-${{ inputs.product_sha }}
       EVIDENCE_DIR: ${{ github.workspace }}/evidence
       DIAGNOSTICS_DIR: ${{ github.workspace }}/diagnostics
 
@@ -39,6 +42,7 @@ jobs:
           mkdir -p "$EVIDENCE_DIR" "$DIAGNOSTICS_DIR"
           {
             echo "workflow_sha=${GITHUB_SHA}"
+            echo "workflow_ref=${GITHUB_WORKFLOW_REF}"
             echo "product_sha=${PRODUCT_SHA}"
             echo "run_id=${GITHUB_RUN_ID}"
             echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
@@ -47,7 +51,7 @@ jobs:
       - name: Checkout exact product revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: c5e922adfb9536ede0f05f3681441857f3c801c5
+          ref: ${{ inputs.product_sha }}
           path: grid
           persist-credentials: false
 
