@@ -3627,7 +3627,7 @@ fn read_grid_serving_snapshot(context: &str) -> Result<serde_json::Value, Box<dy
         .pointer("/metadata/annotations/grid.praxis-proxy.io~1serving-digest")
         .and_then(serde_json::Value::as_str)
         .ok_or("Grid serving ConfigMap has no serving digest annotation")?;
-    let actual_digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let actual_digest = hex::encode(Sha256::digest(text.as_bytes()));
     if digest != actual_digest {
         return Err(format!("Grid serving digest annotation {digest} differs from content {actual_digest}").into());
     }

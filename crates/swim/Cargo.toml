@@ -12,7 +12,8 @@ aes-gcm = { workspace = true }
 bincode = { workspace = true }
 crdt = { path = "../crdt" }
 foca = { workspace = true }
-rand = { workspace = true }
+# foca 1.x uses rand 0.9's RNG traits, which are incompatible with rand 0.10.
+rand = { version = "0.9.0", features = ["small_rng"] }
 ring = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

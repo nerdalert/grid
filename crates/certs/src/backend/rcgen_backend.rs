@@ -213,8 +213,8 @@ pub(crate) fn verify_message(ca_cert_pem: &str, message: &[u8], signature: &[u8]
     reason = "HMAC takes a key of any length, so construction cannot fail"
 )]
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    use hmac::{Hmac, KeyInit as _, Mac as _};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().into()
 }

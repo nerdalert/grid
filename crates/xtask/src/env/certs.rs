@@ -203,7 +203,7 @@ pub(crate) fn certificate_sha256(cert_path: &Path) -> Result<String, Box<dyn std
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("failed to decode certificate: {}", stderr.trim()).into());
     }
-    Ok(format!("{:x}", Sha256::digest(output.stdout)))
+    Ok(hex::encode(Sha256::digest(output.stdout)))
 }
 
 /// Whether an existing certificate names its own site in the subject organization.

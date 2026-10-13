@@ -1623,9 +1623,9 @@ pub(crate) fn assert_transition_counter_increased(
 /// Panics if the OS random source is unavailable (catastrophic environment failure).
 #[must_use]
 pub(crate) fn generate_swim_key_hex() -> String {
-    use rand::RngCore as _;
+    use rand::RngExt as _;
     let mut key = [0_u8; 32];
-    rand::rng().fill_bytes(&mut key);
+    rand::rng().fill(&mut key);
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -4142,7 +4142,7 @@ impl Drop for TlsFixtureGuard {
 pub(crate) fn pem_fingerprint(cert_pem: &str) -> Result<String, Box<dyn std::error::Error>> {
     use sha2::{Digest as _, Sha256};
     let parsed = pem::parse(cert_pem.trim())?;
-    Ok(format!("{:x}", Sha256::digest(parsed.contents())))
+    Ok(hex::encode(Sha256::digest(parsed.contents())))
 }
 
 /// Create a Kubernetes generic Secret from in-memory PEM strings.
