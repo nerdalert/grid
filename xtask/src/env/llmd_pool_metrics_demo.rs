@@ -75,6 +75,8 @@ const VCR_MODEL: &str = "Qwen/Qwen3-0.6B";
 
 /// Data-plane convergence timeout for overlay propagation.
 const DATA_PLANE_WAIT: Duration = Duration::from_secs(180);
+/// Maximum time to wait for the peer-signals LoadBalancer ingress to be assigned.
+const SIGNALS_LB_INGRESS_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Retry interval for convergence probes.
 const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
@@ -1402,10 +1404,9 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
 // Pressure generator
 // ---------------------------------------------------------------------------
 
-/// Persist a deterministic queue value, then roll the simulator pods so the
-/// value is read from startup configuration rather than an in-memory admin
-/// endpoint. The EPP metric and overlay checks remain the authoritative
-/// downstream observations.
+/// Persist deterministic fake metrics and roll simulator pods from template annotations.
+/// The annotations make KV-cache-only changes alter the pod template and trigger rollout.
+/// The EPP metric and overlay checks remain the authoritative downstream observations.
 fn set_simulator_waiting_requests(
     cluster: &str,
     waiting_requests: u32,
@@ -2079,12 +2080,32 @@ fn read_signals_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error
     read_operator_lb_ip(cluster, "grid-operator-signals")
 }
 
+/// Wait for MetalLB to assign ingress to the operator's peer-signals Service.
+fn wait_for_signals_lb_ip(cluster: &str, timeout: Duration) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error: String;
+    loop {
+        match read_signals_lb_ip(cluster) {
+            Ok(ip) => return Ok(ip),
+            Err(error) => last_error = error.to_string(),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{cluster}: timed out waiting {timeout:?} for grid-operator-signals ingress; last observation: {last_error}"
+            )
+            .into());
+        }
+        eprintln!("[WAIT] {cluster}: grid-operator-signals has no ingress yet: {last_error}");
+        std::thread::park_timeout(Duration::from_secs(2));
+    }
+}
+
 /// Seed SWIM membership by upgrading operators with cross-cluster seeds.
 fn seed_swim_membership() -> Result<(), Box<dyn std::error::Error>> {
     let mut endpoints: Vec<(String, String, String)> = Vec::new();
     for cluster in CLUSTERS {
         let swim_ip = read_swim_lb_ip(cluster)?;
-        let signals_ip = read_signals_lb_ip(cluster)?;
+        let signals_ip = wait_for_signals_lb_ip(cluster, SIGNALS_LB_INGRESS_TIMEOUT)?;
         eprintln!("  {cluster}: SWIM LB IP = {swim_ip}; signals LB IP = {signals_ip}");
         endpoints.push(((*cluster).to_owned(), swim_ip, signals_ip));
     }
@@ -2771,7 +2792,7 @@ fn materialize_config_with_images(
         )?;
 
         // Add TLS secret references to metricsConfig
-        let signal_anchor = "                    healthy: inference_pool_ready_pods";
+        let signal_anchor = "                    healthy: llm_d_epp_ready_endpoints";
         let tls_block = format!(
             "{signal_anchor}\n\
              \x20                 tls:\n\
@@ -4289,11 +4310,27 @@ mod tests {
         let run_prefix = format!("{DEFAULT_CLUSTER_PREFIX}-{}", run_id.to_ascii_lowercase());
         let run_context = format!("kind-{run_prefix}-{{{{ cluster.name }}}}");
 
-        assert!(scoped.contains(&format!("metadata:\n  name: {run_prefix}")));
-        assert!(scoped.contains(&format!("clusterPrefix: {run_prefix}")));
-        assert_eq!(scoped.matches(&run_context).count(), 4);
-        assert!(!scoped.contains(&format!("metadata:\n  name: {DEFAULT_FORGE_ENV_NAME}")));
-        assert!(!scoped.contains(&format!("kind-{DEFAULT_CLUSTER_PREFIX}-{{{{ cluster.name }}}}")));
+        assert!(
+            scoped.contains(&format!("metadata:\n  name: {run_prefix}")),
+            "Forge environment and network names should include the unique run prefix"
+        );
+        assert!(
+            scoped.contains(&format!("clusterPrefix: {run_prefix}")),
+            "Kind cluster names should include the unique run prefix"
+        );
+        assert_eq!(
+            scoped.matches(&run_context).count(),
+            4,
+            "every explicit kubectl context should use the run-scoped clusters"
+        );
+        assert!(
+            !scoped.contains(&format!("metadata:\n  name: {DEFAULT_FORGE_ENV_NAME}")),
+            "the shared default Forge environment must not remain in the scoped config"
+        );
+        assert!(
+            !scoped.contains(&format!("kind-{DEFAULT_CLUSTER_PREFIX}-{{{{ cluster.name }}}}")),
+            "the shared default Kind context must not remain in the scoped config"
+        );
     }
 
     #[test]
@@ -4322,12 +4359,20 @@ mod tests {
             let values = operator.get("values").unwrap_or_else(|| std::process::abort());
             let signals = values.get("signals").unwrap_or_else(|| std::process::abort());
 
-            assert_eq!(signals.get("enabled").and_then(serde_yaml::Value::as_bool), Some(true));
+            assert_eq!(
+                signals.get("enabled").and_then(serde_yaml::Value::as_bool),
+                Some(true),
+                "cross-site qualification must enable operator peer signals"
+            );
             assert_eq!(
                 signals.get("peerIntervalSeconds").and_then(serde_yaml::Value::as_str),
-                Some("2")
+                Some("2"),
+                "cross-site peer signals should poll at the configured two-second interval"
             );
-            assert!(values.get("swim").and_then(|swim| swim.get("signals")).is_none());
+            assert!(
+                values.get("swim").and_then(|swim| swim.get("signals")).is_none(),
+                "signals configuration belongs at the chart root rather than under SWIM"
+            );
         }
     }
 
@@ -4410,27 +4455,46 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
         assert_eq!(
             idle.get(SIMULATOR_WAITING_REQUESTS_ANNOTATION).map(String::as_str),
-            Some("0")
+            Some("0"),
+            "idle configuration should annotate the zero queue value"
         );
         assert_eq!(
             pressured.get(SIMULATOR_WAITING_REQUESTS_ANNOTATION).map(String::as_str),
-            Some("0")
+            Some("0"),
+            "KV-cache pressure must leave queue pressure unchanged"
         );
-        assert_eq!(idle.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str), Some("0"));
+        assert_eq!(
+            idle.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str),
+            Some("0"),
+            "idle configuration should annotate zero KV-cache use"
+        );
         assert_eq!(
             pressured.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str),
-            Some("0.95")
+            Some("0.95"),
+            "KV-cache pressure should be present in the simulator pod template"
         );
-        assert_ne!(idle, pressured);
+        assert_ne!(
+            idle, pressured,
+            "KV-cache-only changes must change pod-template annotations and trigger rollout"
+        );
     }
 
     #[test]
     fn unchanged_simulator_generation_does_not_require_a_rollout() {
-        assert_eq!(simulator_rollout_needed(3, 3), Ok(false));
-        assert_eq!(simulator_rollout_needed(3, 4), Ok(true));
+        assert_eq!(
+            simulator_rollout_needed(3, 3),
+            Ok(false),
+            "an unchanged generation is already current"
+        );
+        assert_eq!(
+            simulator_rollout_needed(3, 4),
+            Ok(true),
+            "a newer generation requires rollout readiness"
+        );
         assert_eq!(
             simulator_rollout_needed(4, 3),
-            Err("generation moved backwards (4 -> 3)".to_owned())
+            Err("generation moved backwards (4 -> 3)".to_owned()),
+            "a generation moving backwards indicates inconsistent rollout evidence"
         );
     }
 
@@ -4739,11 +4803,11 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
                   metricsEndpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
                   signalNames:
-                    healthy: inference_pool_ready_pods
+                    healthy: llm_d_epp_ready_endpoints
 
                   metricsEndpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
                   signalNames:
-                    healthy: inference_pool_ready_pods
+                    healthy: llm_d_epp_ready_endpoints
 
               scoringPolicy:
                 strategy: queueDepth

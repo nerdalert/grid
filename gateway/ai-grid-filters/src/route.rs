@@ -422,6 +422,7 @@ impl GridSiteRouteFilter {
         let Some(state) = ctx.get_filter_state_mut::<RouteState>() else {
             return Ok(());
         };
+        // Keep the selected route after releasing the mutable borrow of filter state in `ctx`.
         let served = state.served.clone();
         // A success means the site took the request, not that it cached the prompt yet:
         // headers can precede scheduling. A site that failed loses the prefix.
