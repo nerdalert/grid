@@ -72,6 +72,10 @@ static RUN_NAME: OnceLock<String> = OnceLock::new();
 const RUN_NAME_PREFIX: &str = "grid258";
 /// Persistent client pod used for all weighted traffic samples.
 const STATIC_CLIENT_POD: &str = "static-weighted-client";
+/// Family-wise false-rejection budget across the three weighted distributions.
+const WEIGHTED_DISTRIBUTION_FAMILY_WISE_ALPHA: f64 = 0.05;
+/// Baseline, changed-weight, and equal-weight distributions are tested.
+const WEIGHTED_DISTRIBUTION_COMPARISONS: f64 = 3.0;
 
 /// Return the current run's Forge prefix, or the topology default in tests.
 fn run_name() -> &'static str {
@@ -282,7 +286,7 @@ struct TrafficSampleEvidence {
     observed_fraction: [f64; 3],
     /// Pearson chi-square statistic for the observed sample.
     chi_square: f64,
-    /// Five-percent critical value for two degrees of freedom.
+    /// Family-wise five-percent critical value after Bonferroni correction.
     chi_square_critical_value: f64,
     /// Whether the sample passed the statistical bound.
     accepted: bool,
@@ -839,10 +843,17 @@ fn chi_square_statistic(expected: [u32; 3], counts: [u32; 3]) -> f64 {
     })
 }
 
-/// Accept a sample when its Pearson statistic is below the five-percent
-/// critical value for two provider categories of freedom.
+/// Return the Bonferroni-adjusted Pearson critical value for two degrees of
+/// freedom across the three configured weighted-distribution comparisons.
+fn weighted_chi_square_critical_value() -> f64 {
+    let per_comparison_alpha = WEIGHTED_DISTRIBUTION_FAMILY_WISE_ALPHA / WEIGHTED_DISTRIBUTION_COMPARISONS;
+    -2.0 * per_comparison_alpha.ln()
+}
+
+/// Accept a sample below the family-wise five-percent critical value for the
+/// baseline, changed-weight, and equal-weight distribution comparisons.
 fn accepts_proportion(expected: [u32; 3], counts: [u32; 3]) -> bool {
-    chi_square_statistic(expected, counts) <= 5.991
+    chi_square_statistic(expected, counts) <= weighted_chi_square_critical_value()
 }
 
 /// Check that Grid, accepted, and serving revisions are identical and known.
@@ -3476,7 +3487,7 @@ fn run_static_phase(
         expected_weights: weights,
         observed_fraction: observed_fraction(counts),
         chi_square: chi_square_statistic(weights, counts),
-        chi_square_critical_value: 5.991,
+        chi_square_critical_value: weighted_chi_square_critical_value(),
         accepted: proof.success && accepts_proportion(weights, counts),
     };
     let evidence = capture_phase_state(
@@ -5148,7 +5159,10 @@ mod tests {
     fn statistical_bounds_and_revision_decisions_are_deterministic() {
         assert!(accepts_proportion([50, 30, 20], [30, 18, 12]));
         assert!(accepts_proportion([1, 1, 1], [20, 21, 19]));
+        assert!(accepts_proportion([50, 30, 20], [20, 24, 16]));
+        assert!(accepts_proportion([1, 1, 1], [15, 30, 15]));
         assert!(!accepts_proportion([50, 30, 20], [60, 0, 0]));
+        assert!((weighted_chi_square_critical_value() - 8.188_689).abs() < 0.000_01);
         assert!(revisions_converged("r2", "r2", "r2"));
         assert!(!revisions_converged("r2", "r1", "r2"));
         assert!(!revisions_converged("unknown", "unknown", "unknown"));
@@ -5249,7 +5263,7 @@ mod tests {
                 expected_weights: [20, 30, 50],
                 observed_fraction: [1.0, 0.0, 0.0],
                 chi_square: 0.0,
-                chi_square_critical_value: 5.991,
+                chi_square_critical_value: weighted_chi_square_critical_value(),
                 accepted: false,
             },
         };
