@@ -35,12 +35,29 @@ chart mode and the `grid_site_route` filter. The run resolves a unique Kind
 cluster prefix and a Forge state directory under `EVIDENCE_DIR`; do not share
 Forge state between simultaneous runs.
 
+Full mode also runs a separate learned-ceiling lifecycle proof after the
+cross-site signal, stale-signal, wrong-pin, and partition proofs have restored
+their state. It teaches a high `(pool-b, llmd-pool-b-provider)` ceiling from
+running-request metrics only while EPP and operator evidence reports zero
+waiting and held work. It then proves the ceiling persists while idle, removes
+that exact pair from the operator-published and Gateway-mounted serving
+topology and verifies the Gateway accepted the removal, then restores the same
+pair under lower load and requires a newly learned ceiling below the old one.
+The proof records the serving revisions and mounted JSON, EPP and relayed
+operator signals, live Gateway metrics and pod UID, actual image identities,
+and attributed responses. It restores the provider policy, simulator settings,
+and run-owned reconcile annotations on both success and failure.
+
 The qualification uses upstream `llm-d-inference-sim` as the inference
-backend. Its startup `fake-metrics.waiting-requests` value is mounted from a
-ConfigMap. The runner updates that persistent configuration and rolls the
-simulator pods, so a restart cannot lose the requested value. The deterministic
-state sequence is `0 -> 9 -> 0` for queue depth and `0.0 -> 0.95 -> 0.0`
-for KV-cache pressure.
+backend. Its startup `fake-metrics` values are mounted from a ConfigMap. The
+runner updates that persistent configuration and rolls the simulator pods, so
+a restart cannot lose the requested values. Existing quick and full proofs use
+the deterministic state sequence `0 -> 9 -> 0` for queue depth and
+`0.0 -> 0.95 -> 0.0` for KV-cache pressure. The new full-mode lifecycle proof
+also changes `running-requests` while keeping waiting requests and KV-cache
+pressure at zero. Pool-B's pinned EPP enables its `flowControl` feature gate so
+the proof can require an explicit zero held-capacity observation; a missing
+held-work metric fails closed.
 
 AGN still performs real EPP metric scraping, score/rank computation, overlay
 publication, overlay-sync projection, Praxis configuration loading, and
@@ -80,6 +97,9 @@ by this topology. For local development, set
 - Full-mode network partition with both sites' operators and the Gateway
   running, traffic probes during loss, stale remote-route exclusion, and
   reconvergence after the run-owned network link is restored
+- Full-mode learned-ceiling persistence while idle, exact published-pair
+  removal and Gateway acceptance, and lower relearning after that same pair
+  returns
 
 ## Coverage boundaries
 

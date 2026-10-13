@@ -866,7 +866,7 @@ fn prepare_poll_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Start one diagnostic port-forward and retry if its local listener exits during startup.
-fn start_ready_port_forward(
+pub(super) fn start_ready_port_forward(
     context: &str,
     service: &str,
     service_port: u16,
@@ -1113,7 +1113,7 @@ fn wait_for_connected_fresh_candidate(
 }
 
 /// GridNetwork.status.connectedSites counts live SWIM members; one peer is healthy here.
-fn has_connected_swim_peer(connected_sites: u64) -> bool {
+pub(super) fn has_connected_swim_peer(connected_sites: u64) -> bool {
     connected_sites >= MIN_CONNECTED_SWIM_MEMBERS
 }
 
@@ -1431,7 +1431,7 @@ fn reused_gateway_config_count_from_text(metrics: &str) -> f64 {
 }
 
 /// Read the GridNetwork's number of active SWIM sites.
-fn read_connected_sites(context: &str) -> Result<u64, Box<dyn std::error::Error>> {
+pub(super) fn read_connected_sites(context: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let network = kubectl_json(context, "get", &format!("gridnetwork/{GRID_NETWORK_NAME}"))?;
     network
         .pointer("/status/connectedSites")
@@ -1763,18 +1763,18 @@ fn wait_for_peer_identity_rejection(
 
 /// A batch of real request attributions from the Grid Gateway.
 #[derive(Default)]
-struct RouteDistribution {
+pub(super) struct RouteDistribution {
     /// Requests attributed to each site.
-    sites: BTreeMap<String, usize>,
+    pub(super) sites: BTreeMap<String, usize>,
     /// Requests attributed to each provider cluster.
-    backends: BTreeMap<String, usize>,
+    pub(super) backends: BTreeMap<String, usize>,
     /// Requests whose response came from the trusted provider gateway at each site.
-    provider_gateways: BTreeMap<String, usize>,
+    pub(super) provider_gateways: BTreeMap<String, usize>,
 }
 
 impl RouteDistribution {
     /// Retain a successful response's provider marker and any Grid attribution headers.
-    fn observe(&mut self, response: &SiteRouteResponse) -> Result<(), String> {
+    pub(super) fn observe(&mut self, response: &SiteRouteResponse) -> Result<(), String> {
         let provider_site = response.provider_site.clone();
         let site = provider_site.clone().or_else(|| response.site.clone()).ok_or_else(|| {
             "Grid Gateway response had neither a trusted provider marker nor x-grid-site attribution".to_owned()
@@ -1900,21 +1900,21 @@ fn route_distribution(
 }
 
 /// One HTTP status and the Grid Gateway's site/backend attribution headers.
-struct SiteRouteResponse {
+pub(super) struct SiteRouteResponse {
     /// HTTP status.
-    status: u16,
+    pub(super) status: u16,
     /// `x-grid-site` value.
-    site: Option<String>,
+    pub(super) site: Option<String>,
     /// `x-grid-backend` value.
-    backend: Option<String>,
+    pub(super) backend: Option<String>,
     /// Site marker set by the trusted provider gateway reached by the request.
-    provider_site: Option<String>,
+    pub(super) provider_site: Option<String>,
     /// Header names captured from the final raw HTTP response header block.
-    raw_header_names: Vec<String>,
+    pub(super) raw_header_names: Vec<String>,
 }
 
 /// Send one sessionless inference request to the local Grid Gateway listener.
-fn send_site_request(port: u16, sequence: usize) -> Result<SiteRouteResponse, Box<dyn std::error::Error>> {
+pub(super) fn send_site_request(port: u16, sequence: usize) -> Result<SiteRouteResponse, Box<dyn std::error::Error>> {
     send_site_request_with_timeout(port, sequence, 15)
 }
 
@@ -2006,12 +2006,12 @@ fn parse_site_route_response(raw: &str) -> SiteRouteResponse {
 }
 
 /// Read an operator's `/metrics` through the run-owned Service.
-fn read_operator_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
+pub(super) fn read_operator_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
     read_metrics_url(port, true)
 }
 
 /// Read the Grid Gateway's TLS-only `/metrics` endpoint.
-fn read_gateway_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
+pub(super) fn read_gateway_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
     read_metrics_url(port, false)
 }
 
@@ -2039,7 +2039,7 @@ fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std
 }
 
 /// Return the counter value matching a metric name and its required labels.
-fn metric_counter(text: &str, name: &str, labels: &[(&str, &str)]) -> f64 {
+pub(super) fn metric_counter(text: &str, name: &str, labels: &[(&str, &str)]) -> f64 {
     sample_value(text, name, labels).unwrap_or(0.0)
 }
 
@@ -2108,7 +2108,7 @@ mod serving_peer_tests {
 }
 
 /// Parse a Prometheus gauge/counter line by metric name and required labels.
-fn sample_value(text: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+pub(super) fn sample_value(text: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
     text.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
         let series = fields.next()?;
@@ -2121,7 +2121,7 @@ fn sample_value(text: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> 
 }
 
 /// Capture the currently running Grid Gateway pod UID.
-fn gateway_pod_uid(context: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(super) fn gateway_pod_uid(context: &str) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
         .args([
             "--context",
