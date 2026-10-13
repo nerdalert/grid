@@ -465,6 +465,7 @@ mod tests {
         assert!(err.to_string().contains("name must be"), "{err}");
     }
 
+    /// RFC 9110 §5.5 excludes CR, LF, and NUL from HTTP field values.
     #[test]
     fn candidate_cluster_rejects_http_header_control_characters() {
         let error = validate_candidates(vec![candidate("inference_model", "llama", "site-a", "gateway\n-a")])

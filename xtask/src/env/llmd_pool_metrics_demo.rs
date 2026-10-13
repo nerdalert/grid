@@ -4303,10 +4303,10 @@ mod tests {
     }
 
     #[test]
-    fn run_scoped_forge_config_updates_every_explicit_kubectl_context() {
+    fn run_scoped_forge_config_updates_every_explicit_kubectl_context() -> Result<(), Box<dyn std::error::Error>> {
         let config = include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml");
         let run_id = "20261011T120000Z-12345";
-        let scoped = scope_forge_config_to_run(config, run_id).unwrap_or_else(|_| std::process::abort());
+        let scoped = scope_forge_config_to_run(config, run_id)?;
         let run_prefix = format!("{DEFAULT_CLUSTER_PREFIX}-{}", run_id.to_ascii_lowercase());
         let run_context = format!("kind-{run_prefix}-{{{{ cluster.name }}}}");
 
@@ -4331,33 +4331,38 @@ mod tests {
             !scoped.contains(&format!("kind-{DEFAULT_CLUSTER_PREFIX}-{{{{ cluster.name }}}}")),
             "the shared default Kind context must not remain in the scoped config"
         );
+        Ok(())
     }
 
     #[test]
-    fn pool_metrics_topology_enables_signal_polling_at_the_chart_root() {
+    fn pool_metrics_topology_enables_signal_polling_at_the_chart_root() -> Result<(), Box<dyn std::error::Error>> {
         let config = include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml");
-        let config: serde_yaml::Value = serde_yaml::from_str(config).unwrap_or_else(|_| std::process::abort());
+        let config: serde_yaml::Value = serde_yaml::from_str(config)?;
         let stacks = config
             .get("spec")
             .and_then(|spec| spec.get("stacks"))
             .and_then(serde_yaml::Value::as_mapping)
-            .unwrap_or_else(|| std::process::abort());
+            .ok_or_else(|| std::io::Error::other("Forge config must contain a spec.stacks mapping"))?;
 
         for stack_name in ["pool-a-operator-base", "pool-b-operator-base"] {
             let stack = stacks
                 .get(serde_yaml::Value::String(stack_name.to_owned()))
                 .and_then(serde_yaml::Value::as_mapping)
-                .unwrap_or_else(|| std::process::abort());
+                .ok_or_else(|| std::io::Error::other(format!("{stack_name} must be a stack mapping")))?;
             let steps = stack
                 .get(serde_yaml::Value::String("steps".to_owned()))
                 .and_then(serde_yaml::Value::as_sequence)
-                .unwrap_or_else(|| std::process::abort());
+                .ok_or_else(|| std::io::Error::other(format!("{stack_name}.steps must be a sequence")))?;
             let operator = steps
                 .iter()
                 .find(|step| step.get("release").and_then(serde_yaml::Value::as_str) == Some("grid-operator"))
-                .unwrap_or_else(|| std::process::abort());
-            let values = operator.get("values").unwrap_or_else(|| std::process::abort());
-            let signals = values.get("signals").unwrap_or_else(|| std::process::abort());
+                .ok_or_else(|| std::io::Error::other(format!("{stack_name} must include a grid-operator release")))?;
+            let values = operator.get("values").ok_or_else(|| {
+                std::io::Error::other(format!("{stack_name} grid-operator release must include values"))
+            })?;
+            let signals = values.get("signals").ok_or_else(|| {
+                std::io::Error::other(format!("{stack_name} grid-operator values must include signals"))
+            })?;
 
             assert_eq!(
                 signals.get("enabled").and_then(serde_yaml::Value::as_bool),
@@ -4374,6 +4379,7 @@ mod tests {
                 "signals configuration belongs at the chart root rather than under SWIM"
             );
         }
+        Ok(())
     }
 
     #[test]
