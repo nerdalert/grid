@@ -220,21 +220,6 @@ Auto-discovered `GridSite` resources do not currently carry region and zone
 from SWIM; a deployed three-tier proof needs that metadata propagation before
 it can assert geography without manually patching discovered resources.
 
-### Coverage gaps that remain visible
-
-The standalone `verify-failover-under-lost-peer` operator check stops an
-operator process. It does not qualify the deployed cross-site network
-partition boundary; that proof remains an unqualified follow-up.
-
-Geography-first selection after peer auto-discovery is not yet qualified.
-Auto-discovered `GridSite` resources do not currently carry region and zone
-from SWIM, so a deployed three-tier geography proof needs metadata propagation
-before it can assert those fields without manually patching the discovered
-resources.
-
-Cross-site signal polling remains a separate, unqualified follow-up; the
-existing llm-d pool-metrics qualification does not prove that signal path.
-
 The optional GLB external-provider proof is a separately configured live check.
 When its protected credential is absent, the runner reports `SKIPPED`; that
 does not count as a passed external-provider qualification.
