@@ -27,6 +27,7 @@ use std::{
 use serde::Serialize;
 
 mod cross_site;
+mod learned_ceiling;
 
 use super::{
     DemoMode, GlbDemoOptions, certs, glb, kubectl, operator,
@@ -114,6 +115,8 @@ const SIMULATOR_DEPLOYMENTS: &[&str] = &["vcr-1", "vcr-2"];
 const SIMULATOR_CONFIGMAP: &str = "vcr-1-config";
 /// Pod template annotation for the simulator's queue metric.
 const SIMULATOR_WAITING_REQUESTS_ANNOTATION: &str = "grid.praxis.fast/fake-waiting-requests";
+/// Pod template annotation for the simulator's running-request metric.
+const SIMULATOR_RUNNING_REQUESTS_ANNOTATION: &str = "grid.praxis.fast/fake-running-requests";
 /// Pod template annotation for the simulator's KV-cache metric.
 const SIMULATOR_KV_CACHE_ANNOTATION: &str = "grid.praxis.fast/fake-kv-cache-usage";
 
@@ -264,6 +267,8 @@ impl ScoringFlavor {
 
 /// Demo execution context holding resolved paths.
 struct DemoContext {
+    /// Directory where this run's structured evidence is written.
+    evidence_dir: PathBuf,
     /// Path to the resolved Forge config.
     resolved_config: PathBuf,
     /// Per-run Forge state directory, kept beside the run's evidence.
@@ -452,6 +457,7 @@ pub(crate) fn run(
 
     let context = prepare_setup(
         forge_config,
+        &evidence_dir,
         &evidence_dir.join("forge-state"),
         &run_id,
         metrics_transport,
@@ -636,6 +642,7 @@ fn write_transition_timeline(
 )]
 fn prepare_setup(
     forge_config: &Path,
+    evidence_dir: &Path,
     forge_state_dir: &Path,
     run_id: &str,
     metrics_transport: MetricsTransport,
@@ -661,6 +668,7 @@ fn prepare_setup(
         .into();
 
     Ok(DemoContext {
+        evidence_dir: evidence_dir.to_path_buf(),
         resolved_config,
         forge_state_dir: forge_state_dir.to_path_buf(),
         forge_bin,
@@ -958,6 +966,7 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
         // Proof 5: EPP metrics cross the operator poll relay and drive the
         // embedded Grid Gateway's live site route without a gateway restart.
         results.insert("cross_site_signal_poll".to_owned(), cross_site::proof(context));
+        results.insert("learned_ceiling_lifecycle".to_owned(), learned_ceiling::proof(context));
     }
 
     // TLS proof stages, only in mTLS mode
@@ -1413,9 +1422,20 @@ fn set_simulator_waiting_requests(
     scoring_flavor: ScoringFlavor,
     mtls: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = kind_context(cluster);
     let (waiting_requests, kv_cache_usage) = simulator_metrics(waiting_requests, scoring_flavor);
-    let config = simulator_config(waiting_requests, kv_cache_usage);
+    set_simulator_fake_metrics(cluster, waiting_requests, 0, kv_cache_usage, mtls)
+}
+
+/// Persist all fake simulator metrics and roll its run-owned pods.
+fn set_simulator_fake_metrics(
+    cluster: &str,
+    waiting_requests: u32,
+    running_requests: u32,
+    kv_cache_usage: f64,
+    mtls: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    let config = simulator_config(waiting_requests, running_requests, kv_cache_usage);
     kubectl::apply_manifest(&ctx, &config)
         .map_err(|e| format!("apply persistent simulator config on {cluster}: {e}"))?;
 
@@ -1425,7 +1445,7 @@ fn set_simulator_waiting_requests(
             "spec": {
                 "template": {
                     "metadata": {
-                        "annotations": simulator_rollout_annotations(waiting_requests, kv_cache_usage)
+                        "annotations": simulator_rollout_annotations(waiting_requests, running_requests, kv_cache_usage)
                     }
                 }
             }
@@ -1464,16 +1484,16 @@ fn set_simulator_waiting_requests(
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     while Instant::now() < deadline {
         let config_text = get_configmap_data_key(&ctx, GRID_SYSTEM_NS, SIMULATOR_CONFIGMAP, "config.yaml");
-        if config_text
-            .as_deref()
-            .is_ok_and(|text| text.contains(&format!("waiting-requests: {waiting_requests}")))
-            && kubectl_exec_epp_metrics(cluster, mtls)
-                .ok()
-                .and_then(|text| parse_required_epp_metrics(&text).ok())
-                .is_some_and(|metrics| {
-                    (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
-                        && (metrics.kv_cache - kv_cache_usage).abs() < f64::EPSILON
-                })
+        if config_text.as_deref().is_ok_and(|text| {
+            text.contains(&format!("waiting-requests: {waiting_requests}"))
+                && text.contains(&format!("running-requests: {running_requests}"))
+        }) && kubectl_exec_epp_metrics(cluster, mtls)
+            .ok()
+            .and_then(|text| parse_required_epp_metrics(&text).ok())
+            .is_some_and(|metrics| {
+                (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
+                    && (metrics.kv_cache - kv_cache_usage).abs() < f64::EPSILON
+            })
         {
             eprintln!("  [OK] {cluster}: simulator waiting-requests={waiting_requests} is live in EPP metrics");
             return Ok(());
@@ -1484,9 +1504,9 @@ fn set_simulator_waiting_requests(
 }
 
 /// Render the complete simulator startup configuration for a queue value.
-fn simulator_config(waiting_requests: u32, kv_cache_usage: f64) -> String {
+fn simulator_config(waiting_requests: u32, running_requests: u32, kv_cache_usage: f64) -> String {
     format!(
-        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {SIMULATOR_CONFIGMAP}\n  namespace: {GRID_SYSTEM_NS}\ndata:\n  config.yaml: |\n    port: 8000\n    model: {VCR_MODEL}\n    served-model-name: [{VCR_MODEL}]\n    mode: echo\n    fake-metrics:\n      waiting-requests: {waiting_requests}\n      kv-cache-usage: {kv_cache_usage}\n"
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {SIMULATOR_CONFIGMAP}\n  namespace: {GRID_SYSTEM_NS}\ndata:\n  config.yaml: |\n    port: 8000\n    model: {VCR_MODEL}\n    served-model-name: [{VCR_MODEL}]\n    mode: echo\n    fake-metrics:\n      waiting-requests: {waiting_requests}\n      running-requests: {running_requests}\n      kv-cache-usage: {kv_cache_usage}\n"
     )
 }
 
@@ -1502,11 +1522,19 @@ fn simulator_metrics(pressure: u32, scoring_flavor: ScoringFlavor) -> (u32, f64)
 }
 
 /// Return the pod-template annotations that identify the complete fake-metric state.
-fn simulator_rollout_annotations(waiting_requests: u32, kv_cache_usage: f64) -> BTreeMap<String, String> {
+fn simulator_rollout_annotations(
+    waiting_requests: u32,
+    running_requests: u32,
+    kv_cache_usage: f64,
+) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             SIMULATOR_WAITING_REQUESTS_ANNOTATION.to_owned(),
             waiting_requests.to_string(),
+        ),
+        (
+            SIMULATOR_RUNNING_REQUESTS_ANNOTATION.to_owned(),
+            running_requests.to_string(),
         ),
         (SIMULATOR_KV_CACHE_ANNOTATION.to_owned(), kv_cache_usage.to_string()),
     ])
@@ -4437,15 +4465,16 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
     #[test]
     fn simulator_config_persists_zero_queue_value() {
-        let config = simulator_config(0, 0.0);
+        let config = simulator_config(0, 0, 0.0);
         assert!(config.contains("fake-metrics:"));
         assert!(config.contains("waiting-requests: 0"));
+        assert!(config.contains("running-requests: 0"));
         assert!(config.contains("kv-cache-usage: 0"));
     }
 
     #[test]
     fn simulator_config_persists_pressure_queue_value() {
-        let config = simulator_config(9, 0.0);
+        let config = simulator_config(9, 0, 0.0);
         assert!(config.contains("waiting-requests: 9"));
         assert!(!config.contains("pressure-generator"));
     }
@@ -4453,15 +4482,15 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     #[test]
     fn kv_cache_pressure_sets_only_the_selected_signal() {
         let (queue, kv_cache) = simulator_metrics(9, ScoringFlavor::KvCachePressure);
-        let config = simulator_config(queue, kv_cache);
+        let config = simulator_config(queue, 0, kv_cache);
         assert!(config.contains("waiting-requests: 0"));
         assert!(config.contains("kv-cache-usage: 0.95"));
     }
 
     #[test]
     fn simulator_rollout_annotations_change_for_kv_cache_pressure() {
-        let idle = simulator_rollout_annotations(0, 0.0);
-        let pressured = simulator_rollout_annotations(0, 0.95);
+        let idle = simulator_rollout_annotations(0, 0, 0.0);
+        let pressured = simulator_rollout_annotations(0, 0, 0.95);
 
         assert_eq!(
             idle.get(SIMULATOR_WAITING_REQUESTS_ANNOTATION).map(String::as_str),
@@ -4477,6 +4506,11 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             idle.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str),
             Some("0"),
             "idle configuration should annotate zero KV-cache use"
+        );
+        assert_eq!(
+            idle.get(SIMULATOR_RUNNING_REQUESTS_ANNOTATION).map(String::as_str),
+            Some("0"),
+            "idle configuration should annotate the zero running-request value"
         );
         assert_eq!(
             pressured.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str),

@@ -1,0 +1,3261 @@
+//! Deployed proof for the learned route-ceiling lifecycle.
+
+#![expect(
+    clippy::disallowed_methods,
+    clippy::too_many_lines,
+    reason = "This synchronous Kind proof owns bounded polling and restores its run-owned mutations"
+)]
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use serde::Serialize;
+use serde_json::{Map, Value, json};
+use sha2::{Digest as _, Sha256};
+
+use super::{
+    DemoContext, GRID_NETWORK_NAME, GRID_SERVING_CONFIGMAP, GRID_SERVING_GATEWAY, GRID_SERVING_GATEWAY_PORT,
+    GRID_SERVING_METRICS_PORT, GRID_SERVING_SITE, GRID_SYSTEM_NS, MetricsTransport, OVERLAY_CONFIGMAP, ProofResult,
+    SIMULATOR_CONFIGMAP, SIMULATOR_DEPLOYMENTS, SIMULATOR_KV_CACHE_ANNOTATION, SIMULATOR_RUNNING_REQUESTS_ANNOTATION,
+    SIMULATOR_WAITING_REQUESTS_ANNOTATION,
+    cross_site::{
+        RouteDistribution, SiteRouteResponse, has_connected_swim_peer, read_connected_sites, read_gateway_metrics,
+        read_operator_metrics, send_site_request, start_ready_port_forward,
+    },
+    format_utc_iso, get_configmap_data_key, kind_context, kubectl, kubectl_exec_epp_metrics, run_cluster_prefix,
+    set_simulator_fake_metrics,
+};
+use crate::env::verify::PortForwardGuard;
+
+/// Remote site whose learned ceiling is exercised.
+const SITE: &str = "pool-b";
+/// Provider cluster that must be removed and then returned as the exact same pair.
+const CLUSTER: &str = "llmd-pool-b-provider";
+/// Local provider that remains eligible while the remote pair is withdrawn.
+const POOL_A_PROVIDER: &str = "llmd-pool-a-provider";
+/// Serving ConfigMap annotation carrying the operator's content-addressed revision.
+const SERVING_DIGEST_ANNOTATION: &str = "grid.praxis.fast/serving-digest";
+/// GridNetwork annotation used by the qualification harness to request prompt reconciliation.
+const METRICS_REFRESH_ANNOTATION: &str = "grid.praxis.fast/metrics-refresh-at";
+/// Unique access-policy label used to exclude the pool-A consumer during this run.
+const RUN_EXCLUSION_LABEL: &str = "grid.praxis.fast/issue-374-run";
+/// Gauge that reports the learned `(site, cluster)` ceiling.
+const CEILING_METRIC: &str = "grid_route_site_ceiling";
+/// Pinned llm-d EPP running-request metric.
+const RUNNING_METRIC: &str = "llm_d_epp_average_running_requests";
+/// Pinned llm-d EPP queue metric.
+const QUEUE_METRIC: &str = "llm_d_epp_average_queue_size";
+/// Pinned llm-d EPP ready-endpoint metric.
+const READY_METRIC: &str = "llm_d_epp_ready_endpoints";
+/// Pinned llm-d EPP per-endpoint queue metric.
+const PER_ENDPOINT_QUEUE_METRIC: &str = "llm_d_epp_per_endpoint_queue_size";
+/// Pinned llm-d EPP held-request count metric, when the EPP emits it.
+const HELD_QUEUE_METRIC: &str = "llm_d_epp_flow_control_queue_size";
+/// Pinned llm-d EPP request-capacity utilization metric used to prove zero held work.
+const HELD_CAPACITY_METRIC: &str = "llm_d_epp_flow_control_capacity_utilization_requests";
+/// Container in the Grid Gateway deployment.
+const GATEWAY_CONTAINER: &str = "praxis";
+/// Mounted operator-generated configuration read from the running Gateway pod.
+const MOUNTED_CONFIG_PATH: &str = "/etc/praxis/grid-serving/serving-config.json";
+/// Learned ceilings start at this configured floor.
+const DEFAULT_CEILING_FLOOR: f64 = 8.0;
+/// Deterministic per-endpoint load used to teach a clearly higher ceiling.
+const HIGH_RUNNING_REQUESTS: u32 = 20;
+/// Deterministic per-endpoint load used after the old sample expires.
+const LOW_RUNNING_REQUESTS: u32 = 2;
+/// Required gap between the old learned ceiling and the returned ceiling.
+const CEILING_MARGIN: f64 = 8.0;
+/// Tolerance around the returned floor-or-measured-load ceiling.
+const RETURNED_CEILING_TOLERANCE: f64 = 2.0;
+/// Exact identity of one candidate in an operator-generated serving topology.
+type CandidatePair = (String, String);
+/// Requests sent in each explicit attribution phase.
+const REQUESTS_PER_PHASE: usize = 5;
+/// Poll interval for bounded deployed-state convergence checks.
+const POLL: Duration = Duration::from_secs(2);
+/// Minimum observation span for a state to survive multiple Gateway polling cycles.
+const STABLE_SPAN: Duration = Duration::from_secs(12);
+/// Maximum wait for signal, route-config, and restoration transitions.
+const TRANSITION_TIMEOUT: Duration = Duration::from_secs(180);
+/// Maximum wait for simulator rollout and metric restoration.
+const SIMULATOR_RESTORE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Globally unique session sequence so affinity cannot pin probes to an older route.
+static REQUEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+/// Diagnostic port-forwards owned by this proof.
+struct PortForwards {
+    /// Grid Gateway inference listener.
+    gateway_http: u16,
+    /// Grid Gateway TLS metrics listener.
+    gateway_metrics: u16,
+    /// Pool-A operator metrics listener.
+    local_operator_metrics: u16,
+    /// Pool-B operator metrics listener.
+    remote_operator_metrics: u16,
+    /// Child guards terminate all port-forward processes on every return path.
+    _guards: Vec<PortForwardGuard>,
+}
+
+/// Exact run-owned state captured before the first mutation.
+struct OriginalState {
+    /// Pool-B provider access policy as it existed before the proof.
+    access_policy: Value,
+    /// Simulator ConfigMap text as it existed before the proof.
+    simulator_config: String,
+    /// Pool-A operator-generated routing overlay before this proof mutates the run-owned provider.
+    pool_a_overlay: String,
+    /// Values of the simulator metric annotations on each run-owned deployment.
+    simulator_annotations: BTreeMap<String, BTreeMap<String, Option<String>>>,
+    /// Live pool-B EPP readings before the proof changes simulator metrics.
+    simulator_readings: EppReadings,
+    /// Previous values of the harness reconciliation annotation on both networks.
+    reconcile_annotations: BTreeMap<String, Option<String>>,
+    /// Serving state and pod identity captured before any mutation.
+    baseline: RuntimeSnapshot,
+}
+
+/// Required direct observations from the pinned pool-B EPP.
+#[derive(Clone)]
+struct EppReadings {
+    /// Average running requests per ready endpoint.
+    running: f64,
+    /// Average waiting requests per endpoint.
+    queue: f64,
+    /// Number of ready endpoints.
+    ready: f64,
+    /// Queue size reported for each ready endpoint.
+    per_endpoint_queues: Vec<f64>,
+    /// Sum of held requests when the EPP exposes a direct held-count series.
+    held_queue_count: Option<f64>,
+    /// Exact metric family used to establish no held work.
+    held_source: String,
+    /// Maximum request-capacity utilization across flow-control priorities.
+    held_capacity_utilization: f64,
+}
+
+/// One timestamped view of operator, mounted, Gateway, and EPP state.
+#[derive(Clone)]
+struct RuntimeSnapshot {
+    /// Operator-generated serving JSON.
+    operator_config: String,
+    /// Operator ConfigMap content digest.
+    operator_digest: String,
+    /// Operator ConfigMap revision annotation.
+    operator_digest_annotation: String,
+    /// Kubernetes resourceVersion of the operator ConfigMap.
+    operator_resource_version: String,
+    /// Serving JSON read inside the exact running Gateway pod.
+    mounted_config: String,
+    /// SHA-256 digest of the mounted serving JSON.
+    mounted_digest: String,
+    /// Exact `(site, cluster)` candidate pairs in the operator JSON.
+    candidates: Vec<CandidatePair>,
+    /// Exact `(site, cluster)` candidate pairs in the mounted Gateway JSON.
+    mounted_candidates: Vec<CandidatePair>,
+    /// Direct EPP readings from the pinned pool-B metrics service.
+    epp: EppReadings,
+    /// Raw EPP metric lines relevant to this proof.
+    epp_metric_samples: String,
+    /// Pool-B operator's own published in-flight count.
+    origin_in_flight: f64,
+    /// Pool-B operator's own ready-endpoint count.
+    origin_ready: f64,
+    /// Pool-A operator's relayed pool-B in-flight count.
+    local_in_flight: Option<f64>,
+    /// Pool-A operator's relayed pool-B ready-endpoint count.
+    local_ready: Option<f64>,
+    /// Relevant pool-B operator metric lines from the origin site.
+    origin_operator_metric_samples: String,
+    /// Relevant pool-B operator metric lines relayed to pool-A.
+    local_operator_metric_samples: String,
+    /// Raw Grid Gateway metrics text.
+    gateway_metrics: String,
+    /// Grid Gateway's accepted `applied` serving-config reload count.
+    gateway_reloads: f64,
+    /// Finite ceiling value, if the Gateway exports one for this pair.
+    ceiling: Option<f64>,
+    /// Raw ceiling gauge value, including the literal `NaN` when cleared.
+    ceiling_raw: Option<String>,
+    /// Whether the Gateway exports the pair's cleared ceiling as NaN.
+    ceiling_is_nan: bool,
+    /// Pod UID of the running Grid Gateway process.
+    gateway_uid: String,
+    /// Actual pod image reference, runtime image ID, and container ID for the Gateway.
+    gateway_image_identity: Value,
+    /// Freshness window configured in the mounted serving file.
+    load_window_ms: u64,
+    /// Gateway load-store horizon configured in the mounted serving file.
+    horizon_ms: u64,
+    /// Gateway load-store retention configured in the mounted serving file.
+    window_secs: u64,
+}
+
+/// Evidence envelope written independently for this proof.
+#[derive(Serialize)]
+struct LearnedCeilingEvidence<'evidence> {
+    /// Evidence schema version.
+    schema_version: &'static str,
+    /// Git commit checked out when this proof ran.
+    source_sha: Option<&'evidence str>,
+    /// Whether the tracked worktree was clean when the proof started.
+    tracked_worktree_clean: Option<bool>,
+    /// SHA-256 fingerprint of tracked diff content and non-ignored untracked files.
+    source_worktree_sha256: Option<&'evidence str>,
+    /// Run-scoped Kind cluster prefix.
+    run_cluster_prefix: &'static str,
+    /// Start timestamp in UTC.
+    started_at: &'evidence str,
+    /// Final proof status, including restoration.
+    success: bool,
+    /// Primary lifecycle failure, if any.
+    primary_error: Option<&'evidence str>,
+    /// Errors encountered while restoring run-owned state.
+    restoration_errors: &'evidence [String],
+    /// Original-state summary captured before mutation.
+    original_state: Option<Value>,
+    /// Requested image references, Docker IDs, repository digests, and live pod IDs.
+    image_manifest: Option<Value>,
+    /// Time-ordered phase and sample evidence.
+    phases: &'evidence [Value],
+    /// Failed HTTP probes and transport errors, distinguished by `kind`.
+    probe_failures: &'evidence [Value],
+}
+
+/// Run the learned-ceiling proof and restore its run-owned provider and simulator state.
+pub(super) fn proof(context: &DemoContext) -> ProofResult {
+    let mut observations = Vec::new();
+    let mut phases = Vec::new();
+    let mut probe_failures = Vec::new();
+    let mut restoration_errors = Vec::new();
+    let started_at = format_utc_iso();
+    observations.push(format!("[{started_at}] learned ceiling lifecycle proof started"));
+
+    let (source_sha, tracked_worktree_clean, source_worktree_sha256) = match source_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            let message = format!("could not capture source revision: {error}");
+            observations.push(format!("[SETUP][FAIL] {message}"));
+            record_evidence_write(
+                write_evidence(
+                    context,
+                    None,
+                    None,
+                    None,
+                    &started_at,
+                    false,
+                    Some(&message),
+                    &restoration_errors,
+                    None,
+                    None,
+                    &phases,
+                    &probe_failures,
+                ),
+                &mut observations,
+            );
+            return result(false, observations);
+        },
+    };
+
+    let port_forwards = match open_port_forwards() {
+        Ok(forwards) => forwards,
+        Err(error) => {
+            let message = format!("could not open run-owned diagnostic port-forwards: {error}");
+            observations.push(format!("[SETUP][FAIL] {message}"));
+            record_evidence_write(
+                write_evidence(
+                    context,
+                    Some(&source_sha),
+                    Some(tracked_worktree_clean),
+                    Some(&source_worktree_sha256),
+                    &started_at,
+                    false,
+                    Some(&message),
+                    &restoration_errors,
+                    None,
+                    None,
+                    &phases,
+                    &probe_failures,
+                ),
+                &mut observations,
+            );
+            return result(false, observations);
+        },
+    };
+
+    let baseline = match wait_for_baseline_state(context, &port_forwards, &mut phases, &mut observations) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let message = format!("could not establish a stable original serving state before mutation: {error}");
+            observations.push(format!("[SETUP][FAIL] {message}"));
+            record_evidence_write(
+                write_evidence(
+                    context,
+                    Some(&source_sha),
+                    Some(tracked_worktree_clean),
+                    Some(&source_worktree_sha256),
+                    &started_at,
+                    false,
+                    Some(&message),
+                    &restoration_errors,
+                    None,
+                    None,
+                    &phases,
+                    &probe_failures,
+                ),
+                &mut observations,
+            );
+            return result(false, observations);
+        },
+    };
+
+    let original = match capture_original_state(context, baseline) {
+        Ok(state) => state,
+        Err(error) => {
+            let message = format!("could not save original run-owned state before mutation: {error}");
+            observations.push(format!("[SETUP][FAIL] {message}"));
+            record_evidence_write(
+                write_evidence(
+                    context,
+                    Some(&source_sha),
+                    Some(tracked_worktree_clean),
+                    Some(&source_worktree_sha256),
+                    &started_at,
+                    false,
+                    Some(&message),
+                    &restoration_errors,
+                    None,
+                    None,
+                    &phases,
+                    &probe_failures,
+                ),
+                &mut observations,
+            );
+            return result(false, observations);
+        },
+    };
+
+    let original_summary = Some(original_state_summary(&original));
+    let image_manifest = match collect_image_manifest(context) {
+        Ok(manifest) => Some(manifest),
+        Err(error) => {
+            let message = format!("could not capture actual image identities before mutation: {error}");
+            observations.push(format!("[SETUP][FAIL] {message}"));
+            record_evidence_write(
+                write_evidence(
+                    context,
+                    Some(&source_sha),
+                    Some(tracked_worktree_clean),
+                    Some(&source_worktree_sha256),
+                    &started_at,
+                    false,
+                    Some(&message),
+                    &restoration_errors,
+                    original_summary,
+                    None,
+                    &phases,
+                    &probe_failures,
+                ),
+                &mut observations,
+            );
+            return result(false, observations);
+        },
+    };
+
+    observations.push(format!(
+        "source SHA {source_sha}; tracked worktree clean={tracked_worktree_clean}; source worktree SHA-256={source_worktree_sha256}"
+    ));
+    observations.push("actual image manifest captured for the run-owned pods and local image store".to_owned());
+
+    let primary = run_lifecycle(
+        context,
+        &port_forwards,
+        &original,
+        &mut phases,
+        &mut observations,
+        &mut probe_failures,
+    );
+    if let Err(error) = &primary {
+        observations.push(format!("[PROOF][FAIL] {error}"));
+        if let Ok(snapshot) = observe_runtime(context, &port_forwards) {
+            if let Err(capture_error) = record_phase(context, "failure-capture", &snapshot, None, &mut phases) {
+                observations.push(format!(
+                    "[EVIDENCE][FAIL] could not record final live diagnostics: {capture_error}"
+                ));
+            }
+        } else {
+            observations.push("[EVIDENCE][WARN] final live snapshot was unavailable before restoration".to_owned());
+        }
+    }
+
+    observations.push(format!("[{}] restoration of run-owned state started", format_utc_iso()));
+    restore_original_state(
+        context,
+        &port_forwards,
+        &original,
+        &mut phases,
+        &mut restoration_errors,
+        &mut probe_failures,
+    );
+    for error in &restoration_errors {
+        observations.push(format!("[RESTORE][FAIL] {error}"));
+    }
+
+    let mut success = qualification_succeeded(primary.is_ok(), &restoration_errors);
+    let primary_error = primary.as_ref().err().map(ToString::to_string);
+    let final_error = primary_error
+        .as_deref()
+        .or_else(|| (!restoration_errors.is_empty()).then_some("run-owned state restoration failed"));
+    match write_evidence(
+        context,
+        Some(&source_sha),
+        Some(tracked_worktree_clean),
+        Some(&source_worktree_sha256),
+        &started_at,
+        success,
+        final_error,
+        &restoration_errors,
+        original_summary,
+        image_manifest,
+        &phases,
+        &probe_failures,
+    ) {
+        Ok(path) => observations.push(format!("learned-ceiling evidence: {}", path.display())),
+        Err(error) => {
+            success = false;
+            observations.push(format!(
+                "[EVIDENCE][FAIL] could not write learned-ceiling evidence: {error}"
+            ));
+        },
+    }
+    observations.push(if success {
+        "learned ceiling lifecycle proof passed; provider policy, simulator settings, and reconcile annotations were restored".to_owned()
+    } else {
+        "learned ceiling lifecycle proof failed; see primary, restoration, and phase evidence".to_owned()
+    });
+    result(success, observations)
+}
+
+/// Build the enclosing xtask proof result.
+fn result(success: bool, observations: Vec<String>) -> ProofResult {
+    ProofResult {
+        success,
+        description: "a running-request-learned ceiling persists while idle, clears when its exact published pair leaves, and is relearned lower when the pair returns".to_owned(),
+        observations,
+    }
+}
+
+/// Record whether an early proof exit successfully persisted its diagnostic artifact.
+fn record_evidence_write(
+    result: Result<std::path::PathBuf, Box<dyn std::error::Error>>,
+    observations: &mut Vec<String>,
+) {
+    match result {
+        Ok(path) => observations.push(format!("evidence: {}", path.display())),
+        Err(error) => observations.push(format!("[EVIDENCE][FAIL] {error}")),
+    }
+}
+
+/// Require the primary proof and every run-owned restoration to succeed.
+fn qualification_succeeded(primary_succeeded: bool, restoration_errors: &[String]) -> bool {
+    primary_succeeded && restoration_errors.is_empty()
+}
+
+/// Capture the source commit and a digest of all source changes present at proof start.
+fn source_identity() -> Result<(String, bool, String), Box<dyn std::error::Error>> {
+    let revision = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
+    if !revision.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD: {}",
+            String::from_utf8_lossy(&revision.stderr).trim()
+        )
+        .into());
+    }
+    let sha = String::from_utf8_lossy(&revision.stdout).trim().to_owned();
+    if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("git returned an invalid source SHA: {sha:?}").into());
+    }
+    let status = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=no"])
+        .output()?;
+    if !status.status.success() {
+        return Err(format!("git status: {}", String::from_utf8_lossy(&status.stderr).trim()).into());
+    }
+    let tracked_diff = Command::new("git").args(["diff", "--binary", "HEAD", "--"]).output()?;
+    if !tracked_diff.status.success() {
+        return Err(format!(
+            "git diff --binary HEAD: {}",
+            String::from_utf8_lossy(&tracked_diff.stderr).trim()
+        )
+        .into());
+    }
+    let untracked = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()?;
+    if !untracked.status.success() {
+        return Err(format!(
+            "git ls-files --others: {}",
+            String::from_utf8_lossy(&untracked.stderr).trim()
+        )
+        .into());
+    }
+    let mut untracked_paths = String::from_utf8_lossy(&untracked.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    untracked_paths.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"tracked-diff\0");
+    hasher.update(&tracked_diff.stdout);
+    for path in untracked_paths {
+        let contents = fs::read(&path)?;
+        hasher.update(b"\0untracked-file\0");
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(contents);
+    }
+    let source_worktree_sha256 = format!("{:x}", hasher.finalize());
+    Ok((sha, status.stdout.is_empty(), source_worktree_sha256))
+}
+
+/// Open the HTTP and metrics listeners used by this proof.
+fn open_port_forwards() -> Result<PortForwards, Box<dyn std::error::Error>> {
+    let local_context = kind_context(GRID_SERVING_SITE);
+    let peer_context = kind_context(SITE);
+    let (gateway_http, gateway_guard) =
+        start_ready_port_forward(&local_context, GRID_SERVING_GATEWAY, GRID_SERVING_GATEWAY_PORT)?;
+    let (gateway_metrics, gateway_metrics_guard) = start_ready_port_forward(
+        &local_context,
+        &format!("{GRID_SERVING_GATEWAY}-metrics"),
+        GRID_SERVING_METRICS_PORT,
+    )?;
+    let (local_operator_metrics, local_operator_guard) =
+        start_ready_port_forward(&local_context, "grid-operator-metrics", 9090)?;
+    let (remote_operator_metrics, remote_operator_guard) =
+        start_ready_port_forward(&peer_context, "grid-operator-metrics", 9090)?;
+    Ok(PortForwards {
+        gateway_http,
+        gateway_metrics,
+        local_operator_metrics,
+        remote_operator_metrics,
+        _guards: vec![
+            gateway_guard,
+            gateway_metrics_guard,
+            local_operator_guard,
+            remote_operator_guard,
+        ],
+    })
+}
+
+/// Capture all state that may be changed later, before allowing the first mutation.
+fn capture_original_state(
+    context: &DemoContext,
+    baseline: RuntimeSnapshot,
+) -> Result<OriginalState, Box<dyn std::error::Error>> {
+    require_pair(&baseline.candidates, "operator's baseline serving config")?;
+    require_pair(&baseline.mounted_candidates, "Gateway's baseline mounted config")?;
+    require_same_gateway_config(&baseline)?;
+
+    let peer_context = kind_context(SITE);
+    let provider = kube_json(&peer_context, "get", &format!("inferenceprovider/{CLUSTER}"))?;
+    let access_policy = provider
+        .pointer("/spec/accessPolicy")
+        .cloned()
+        .ok_or("pool-B InferenceProvider has no spec.accessPolicy to preserve")?;
+    let simulator_config = get_configmap_data_key(&peer_context, GRID_SYSTEM_NS, SIMULATOR_CONFIGMAP, "config.yaml")?;
+    let pool_a_overlay = get_configmap_data_key(
+        &kind_context(GRID_SERVING_SITE),
+        GRID_SYSTEM_NS,
+        OVERLAY_CONFIGMAP,
+        "routing-config.json",
+    )?;
+    let mut simulator_annotations = BTreeMap::new();
+    for deployment in SIMULATOR_DEPLOYMENTS {
+        let object = kube_json(&peer_context, "get", &format!("deployment/{deployment}"))?;
+        let annotations = object
+            .pointer("/spec/template/metadata/annotations")
+            .and_then(Value::as_object);
+        let values = [
+            SIMULATOR_WAITING_REQUESTS_ANNOTATION,
+            SIMULATOR_RUNNING_REQUESTS_ANNOTATION,
+            SIMULATOR_KV_CACHE_ANNOTATION,
+        ]
+        .into_iter()
+        .map(|key| {
+            (
+                key.to_owned(),
+                annotations
+                    .and_then(|items| items.get(key))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            )
+        })
+        .collect();
+        simulator_annotations.insert((*deployment).to_owned(), values);
+    }
+    let simulator_readings = parse_epp_readings(&kubectl_exec_epp_metrics(
+        SITE,
+        context.metrics_transport == MetricsTransport::MtlsProxy,
+    )?)?;
+    if !epp_readings_match(&simulator_readings, &baseline.epp) {
+        return Err(format!(
+            "pool-B EPP readings changed while saving original state: baseline={:?}, current={:?}",
+            epp_value(&baseline.epp),
+            epp_value(&simulator_readings)
+        )
+        .into());
+    }
+    require_signal_values(&baseline, simulator_readings.running)?;
+
+    let reconcile_annotations = [SITE, GRID_SERVING_SITE]
+        .into_iter()
+        .map(|site| {
+            let network = kube_json(&kind_context(site), "get", &format!("gridnetwork/{GRID_NETWORK_NAME}"))?;
+            Ok((site.to_owned(), annotation_value(&network, METRICS_REFRESH_ANNOTATION)))
+        })
+        .collect::<Result<BTreeMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+    Ok(OriginalState {
+        access_policy,
+        simulator_config,
+        pool_a_overlay,
+        simulator_annotations,
+        simulator_readings,
+        reconcile_annotations,
+        baseline,
+    })
+}
+
+/// Wait until the run's original operator config is mounted and stably accepted before mutation.
+fn wait_for_baseline_state(
+    context: &DemoContext,
+    forwards: &PortForwards,
+    phases: &mut Vec<Value>,
+    observations: &mut Vec<String>,
+) -> Result<RuntimeSnapshot, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + TRANSITION_TIMEOUT;
+    let mut stable_signature: Option<(String, String, u64)> = None;
+    let mut stable_since = None;
+    let mut stable_samples = 0_u32;
+    let mut last_recorded_signature: Option<(String, String, String, u64)> = None;
+    let mut last_snapshot = None;
+    let mut last = String::from("no runtime sample");
+    let mut evidence_sequence = 0_u32;
+
+    while Instant::now() < deadline {
+        match observe_runtime(context, forwards) {
+            Ok(snapshot) => {
+                let diagnostic_signature = (
+                    snapshot.operator_digest.clone(),
+                    snapshot.mounted_digest.clone(),
+                    snapshot.gateway_uid.clone(),
+                    snapshot.gateway_reloads.to_bits(),
+                );
+                if last_recorded_signature.as_ref() != Some(&diagnostic_signature) {
+                    evidence_sequence = evidence_sequence.saturating_add(1);
+                    record_phase(
+                        context,
+                        &format!("baseline-convergence-{evidence_sequence}"),
+                        &snapshot,
+                        None,
+                        phases,
+                    )?;
+                    last_recorded_signature = Some(diagnostic_signature);
+                }
+
+                let config_state = baseline_config_problem(&snapshot);
+                let signal_state = require_signal_values(&snapshot, snapshot.epp.running);
+                if config_state.is_none() && signal_state.is_ok() {
+                    let signature = (
+                        snapshot.operator_digest.clone(),
+                        snapshot.gateway_uid.clone(),
+                        snapshot.gateway_reloads.to_bits(),
+                    );
+                    if stable_signature.as_ref() == Some(&signature) {
+                        stable_samples = stable_samples.saturating_add(1);
+                    } else {
+                        stable_signature = Some(signature);
+                        stable_since = Some(Instant::now());
+                        stable_samples = 1;
+                    }
+                    if stable_samples >= 3 && stable_since.is_some_and(|start| start.elapsed() >= STABLE_SPAN) {
+                        record_phase(context, "baseline-serving-ready", &snapshot, None, phases)?;
+                        observations.push(format!(
+                            "original operator config is mounted and stable at revision {}; Gateway applied-reload count={}, pod UID={}",
+                            snapshot.operator_digest, snapshot.gateway_reloads, snapshot.gateway_uid
+                        ));
+                        return Ok(snapshot);
+                    }
+                    last = format!(
+                        "waiting for stable baseline observations: {}",
+                        snapshot_summary(&snapshot)
+                    );
+                } else {
+                    stable_signature = None;
+                    stable_since = None;
+                    stable_samples = 0;
+                    last = config_state.unwrap_or_else(|| {
+                        signal_state
+                            .err()
+                            .map_or_else(|| "baseline state is not ready".to_owned(), |error| error.to_string())
+                    });
+                    if !observations.last().is_some_and(|entry| entry.contains(&last)) {
+                        observations.push(format!("baseline is not ready; waiting without mutation: {last}"));
+                    }
+                }
+                last_snapshot = Some(snapshot);
+            },
+            Err(error) => {
+                last = error.to_string();
+                stable_signature = None;
+                stable_since = None;
+                stable_samples = 0;
+            },
+        }
+        std::thread::sleep(POLL);
+    }
+
+    if let Some(snapshot) = last_snapshot {
+        record_phase(context, "baseline-convergence-timeout", &snapshot, None, phases)?;
+    }
+    Err(format!("timed out waiting for an accepted original serving config; last observation: {last}").into())
+}
+
+/// Explain why an operator and mounted config are not yet a usable baseline.
+fn baseline_config_problem(snapshot: &RuntimeSnapshot) -> Option<String> {
+    if !pair_present(&snapshot.candidates) {
+        return Some(format!(
+            "exact candidate pair ({SITE}, {CLUSTER}) is absent from operator config: {:?}",
+            snapshot.candidates
+        ));
+    }
+    if !pair_present(&snapshot.mounted_candidates) {
+        return Some(format!(
+            "exact candidate pair ({SITE}, {CLUSTER}) is absent from mounted config: {:?}",
+            snapshot.mounted_candidates
+        ));
+    }
+    if !gateway_config_values_match(
+        &snapshot.operator_digest,
+        &snapshot.operator_digest_annotation,
+        &snapshot.mounted_digest,
+        &snapshot.operator_config,
+        &snapshot.mounted_config,
+    ) {
+        return Some(format!(
+            "operator and mounted serving revisions have not converged: operator={} annotation={} mounted={}",
+            snapshot.operator_digest, snapshot.operator_digest_annotation, snapshot.mounted_digest
+        ));
+    }
+    None
+}
+
+/// Execute all four learned-ceiling states in order.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the synchronous lifecycle retains small diagnostic snapshots while making sequential bounded API calls"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the lifecycle keeps its run state, phase evidence, user observations, and failed-probe evidence explicit"
+)]
+fn run_lifecycle(
+    context: &DemoContext,
+    forwards: &PortForwards,
+    original: &OriginalState,
+    phases: &mut Vec<Value>,
+    observations: &mut Vec<String>,
+    probe_failures: &mut Vec<Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let baseline = &original.baseline;
+    let original_uid = baseline.gateway_uid.clone();
+    let original_candidates = candidate_set(&baseline.candidates);
+    let baseline_record = record_phase(context, "baseline-pair-present", baseline, None, phases)?;
+    observations.push(format!(
+        "baseline pair is published and mounted at serving digest {} (resourceVersion={}); Gateway pod UID={original_uid}",
+        baseline.operator_digest, baseline.operator_resource_version
+    ));
+    record_attributed_requests(
+        context,
+        forwards,
+        "before-removal",
+        None,
+        baseline,
+        phases,
+        observations,
+        probe_failures,
+    )?;
+
+    set_simulator_fake_metrics(
+        SITE,
+        0,
+        HIGH_RUNNING_REQUESTS,
+        0.0,
+        context.metrics_transport == MetricsTransport::MtlsProxy,
+    )?;
+    observations.push(format!(
+        "pool-B simulator set running-requests={HIGH_RUNNING_REQUESTS}, waiting-requests=0, KV-cache=0"
+    ));
+    let taught = wait_for_ceiling(
+        context,
+        forwards,
+        &original_uid,
+        HIGH_RUNNING_REQUESTS,
+        |snapshot| {
+            snapshot
+                .ceiling
+                .is_some_and(|value| value > DEFAULT_CEILING_FLOOR + CEILING_MARGIN)
+        },
+        "high-running-ceiling",
+    )?;
+    let high_ceiling = taught.ceiling.ok_or("Gateway did not publish a finite high ceiling")?;
+    if high_ceiling <= DEFAULT_CEILING_FLOOR + CEILING_MARGIN {
+        return Err(format!("running load did not teach a ceiling above the floor with margin: {high_ceiling}").into());
+    }
+    record_phase(context, "high-ceiling-learned", &taught, None, phases)?;
+    observations.push(format!(
+        "Gateway learned ceiling {high_ceiling:.2} for ({SITE}, {CLUSTER}) from running={} across {} ready endpoints; EPP queue, per-endpoint queues, and held work were clear",
+        taught.epp.running, taught.epp.ready
+    ));
+    record_attributed_requests(
+        context,
+        forwards,
+        "high-ceiling-learned",
+        None,
+        &taught,
+        phases,
+        observations,
+        probe_failures,
+    )?;
+
+    set_simulator_fake_metrics(
+        SITE,
+        0,
+        0,
+        0.0,
+        context.metrics_transport == MetricsTransport::MtlsProxy,
+    )?;
+    let idle = wait_for_ceiling(
+        context,
+        forwards,
+        &original_uid,
+        0,
+        |snapshot| {
+            snapshot
+                .ceiling
+                .is_some_and(|value| (value - high_ceiling).abs() < f64::EPSILON)
+        },
+        "idle-ceiling-retained",
+    )?;
+    record_phase(context, "idle-ceiling-retained", &idle, None, phases)?;
+    observations.push(format!(
+        "after fresh idle samples, ceiling remained {high_ceiling:.2}; the exact pair stayed published and the Gateway pod UID stayed {original_uid}"
+    ));
+
+    let connected_before = read_connected_sites(&kind_context(GRID_SERVING_SITE))?;
+    if !has_connected_swim_peer(connected_before) {
+        return Err(
+            format!("cannot withdraw provider while SWIM is disconnected: connectedSites={connected_before}").into(),
+        );
+    }
+    let excluded_policy = patch_access_policy_to_exclude_run_site(original)?;
+    trigger_gridnetwork_reconcile_strict(SITE)?;
+    trigger_gridnetwork_reconcile_strict(GRID_SERVING_SITE)?;
+    let mut expected_removed = original_candidates.clone();
+    expected_removed.remove(&(SITE.to_owned(), CLUSTER.to_owned()));
+    if !expected_removed.contains(&("pool-a".to_owned(), POOL_A_PROVIDER.to_owned())) {
+        return Err(
+            "pool-A's local provider is missing from the original topology; cannot prove a safe pool-A-only route"
+                .into(),
+        );
+    }
+    let removed = wait_for_topology_state(
+        context,
+        forwards,
+        &original_uid,
+        false,
+        &expected_removed,
+        &idle,
+        0,
+        "pair-removed-and-accepted",
+        phases,
+        probe_failures,
+    )?;
+    let connected_after = read_connected_sites(&kind_context(GRID_SERVING_SITE))?;
+    if !has_connected_swim_peer(connected_after) || connected_after != connected_before {
+        return Err(format!(
+            "access-policy withdrawal changed SWIM membership: {connected_before} -> {connected_after}"
+        )
+        .into());
+    }
+    if !removed.ceiling_is_nan {
+        return Err(format!(
+            "Gateway did not clear the withdrawn pair's ceiling to NaN: {:?}",
+            removed.ceiling_raw
+        )
+        .into());
+    }
+    record_phase(context, "pair-removed-and-accepted", &removed, None, phases)?;
+    observations.push(format!(
+        "operator published digest {} at resourceVersion {}; Gateway accepted the mounted removal of ({SITE}, {CLUSTER}), cleared its ceiling, and kept SWIM at {connected_after}; temporary policy={}",
+        removed.operator_digest, removed.operator_resource_version, excluded_policy
+    ));
+    record_attributed_requests(
+        context,
+        forwards,
+        "only-pool-a-eligible",
+        Some("pool-a"),
+        &removed,
+        phases,
+        observations,
+        probe_failures,
+    )?;
+
+    set_simulator_fake_metrics(
+        SITE,
+        0,
+        LOW_RUNNING_REQUESTS,
+        0.0,
+        context.metrics_transport == MetricsTransport::MtlsProxy,
+    )?;
+    let low_signal = wait_for_signal(
+        context,
+        forwards,
+        &original_uid,
+        LOW_RUNNING_REQUESTS,
+        &expected_removed,
+        "lower-running-signal-while-absent",
+    )?;
+    if !low_signal.ceiling_is_nan {
+        return Err(format!(
+            "the removed pair's ceiling became finite before the pair was re-added: {:?}",
+            low_signal.ceiling_raw
+        )
+        .into());
+    }
+    record_phase(context, "lower-running-signal-while-absent", &low_signal, None, phases)?;
+
+    let exclusion_ms = low_signal
+        .load_window_ms
+        .max(low_signal.horizon_ms)
+        .max(low_signal.window_secs.saturating_mul(1000))
+        .saturating_add(12_000);
+    let low_window = Duration::from_millis(exclusion_ms);
+    observations.push(format!(
+        "waiting {exclusion_ms}ms with a fresh low-only signal window before re-adding the pair (load_window_ms={}, horizon_ms={}, window_secs={})",
+        low_signal.load_window_ms, low_signal.horizon_ms, low_signal.window_secs
+    ));
+    let low_window_end = Instant::now() + low_window;
+    let mut window_sample = 0_u32;
+    while Instant::now() < low_window_end {
+        let snapshot = observe_runtime(context, forwards)?;
+        require_signal_values(&snapshot, f64::from(LOW_RUNNING_REQUESTS))?;
+        if candidate_set(&snapshot.candidates) != expected_removed
+            || candidate_set(&snapshot.mounted_candidates) != expected_removed
+        {
+            return Err(
+                "operator or mounted Gateway configuration re-added the pair before the high sample expired".into(),
+            );
+        }
+        if !snapshot.ceiling_is_nan {
+            return Err(format!(
+                "the removed pair regained a ceiling during the low-only window: {:?}",
+                snapshot.ceiling_raw
+            )
+            .into());
+        }
+        if snapshot.gateway_uid != original_uid {
+            return Err(format!(
+                "Gateway pod UID changed while pair was absent: {original_uid} -> {}",
+                snapshot.gateway_uid
+            )
+            .into());
+        }
+        let sample_name = format!("lower-only-window-{window_sample:02}");
+        let probe = send_probe(forwards.gateway_http, Some("pool-a"), &sample_name, probe_failures)?;
+        observations.push(format!(
+            "low-only window request {} returned HTTP {} attributed to pool-a/{}",
+            window_sample.saturating_add(1),
+            probe.status,
+            probe.backend.as_deref().unwrap_or("missing")
+        ));
+        record_phase(context, &sample_name, &snapshot, None, phases)?;
+        window_sample = window_sample.saturating_add(1);
+        let remaining = low_window_end.saturating_duration_since(Instant::now());
+        std::thread::sleep(POLL.min(remaining));
+    }
+    if window_sample < 2 {
+        return Err(format!("low-only observation window produced only {window_sample} samples").into());
+    }
+
+    let before_return = observe_runtime(context, forwards)?;
+    let mut expected_returned = original_candidates.clone();
+    expected_returned.insert((SITE.to_owned(), CLUSTER.to_owned()));
+    patch_access_policy(original)?;
+    trigger_gridnetwork_reconcile_strict(SITE)?;
+    trigger_gridnetwork_reconcile_strict(GRID_SERVING_SITE)?;
+    let returned = wait_for_topology_state(
+        context,
+        forwards,
+        &original_uid,
+        true,
+        &expected_returned,
+        &before_return,
+        LOW_RUNNING_REQUESTS,
+        "same-pair-returned-under-low-load",
+        phases,
+        probe_failures,
+    )?;
+    let returned_local_in_flight = returned
+        .local_in_flight
+        .ok_or("returned candidate has no relayed in-flight observation")?;
+    let new_ceiling = returned
+        .ceiling
+        .ok_or("returned candidate has no finite learned ceiling")?;
+    if !lifecycle_ceiling_sequence_valid(
+        high_ceiling,
+        idle.ceiling.unwrap_or(f64::NAN),
+        removed.ceiling_raw.as_deref(),
+        new_ceiling,
+        returned_local_in_flight,
+    ) {
+        return Err(format!(
+            "returned ceiling {new_ceiling:.2} did not prove the old value was forgotten: old={high_ceiling:.2}, measured low in-flight={returned_local_in_flight}, floor={DEFAULT_CEILING_FLOOR}, margin={CEILING_MARGIN}"
+        )
+        .into());
+    }
+    require_same_gateway_config(&returned)?;
+    record_phase(context, "same-pair-returned-under-low-load", &returned, None, phases)?;
+    observations.push(format!(
+        "the exact pair returned at serving digest {} (resourceVersion={}); its new ceiling was {new_ceiling:.2}, more than {CEILING_MARGIN:.2} below old ceiling {high_ceiling:.2}",
+        returned.operator_digest, returned.operator_resource_version
+    ));
+    record_attributed_requests(
+        context,
+        forwards,
+        "after-return",
+        None,
+        &returned,
+        phases,
+        observations,
+        probe_failures,
+    )?;
+
+    if returned.gateway_uid != original_uid {
+        return Err(format!(
+            "Gateway pod UID changed during the lifecycle: {original_uid} -> {}",
+            returned.gateway_uid
+        )
+        .into());
+    }
+    if candidate_set(&returned.candidates) != original_candidates {
+        return Err("returned serving topology does not match the original candidate set".into());
+    }
+    if baseline_record
+        .pointer("/operator_revision/content_digest")
+        .and_then(Value::as_str)
+        != Some(returned.operator_digest.as_str())
+    {
+        observations.push(
+            "restored pair uses a new content-addressed serving revision after the intervening removal".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Wait for a finite ceiling while requiring current EPP and relayed signals to match.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the wait predicate binds one proof phase to its live context and expected signal"
+)]
+fn wait_for_ceiling<F>(
+    context: &DemoContext,
+    forwards: &PortForwards,
+    gateway_uid: &str,
+    expected_running: u32,
+    predicate: F,
+    phase: &str,
+) -> Result<RuntimeSnapshot, Box<dyn std::error::Error>>
+where
+    F: Fn(&RuntimeSnapshot) -> bool,
+{
+    let deadline = Instant::now() + TRANSITION_TIMEOUT;
+    let mut stable_since = None;
+    let mut stable_samples = 0_u32;
+    let mut last = String::from("no runtime sample");
+    while Instant::now() < deadline {
+        match observe_runtime(context, forwards) {
+            Ok(snapshot) => {
+                last = snapshot_summary(&snapshot);
+                if snapshot.gateway_uid != gateway_uid {
+                    return Err(format!(
+                        "Gateway pod UID changed during {phase}: {gateway_uid} -> {}",
+                        snapshot.gateway_uid
+                    )
+                    .into());
+                }
+                let valid = require_pair(&snapshot.candidates, "operator serving config")
+                    .and_then(|()| require_pair(&snapshot.mounted_candidates, "mounted Gateway config"))
+                    .and_then(|()| require_same_gateway_config(&snapshot))
+                    .and_then(|()| require_signal_values(&snapshot, f64::from(expected_running)));
+                if valid.is_ok() && predicate(&snapshot) {
+                    stable_since.get_or_insert_with(Instant::now);
+                    stable_samples = stable_samples.saturating_add(1);
+                    if stable_samples >= 3 && stable_since.is_some_and(|start| start.elapsed() >= STABLE_SPAN) {
+                        return Ok(snapshot);
+                    }
+                } else {
+                    last = valid.err().map_or_else(
+                        || format!("ceiling predicate false: {}", snapshot_summary(&snapshot)),
+                        |error| error.to_string(),
+                    );
+                    stable_since = None;
+                    stable_samples = 0;
+                }
+            },
+            Err(error) => {
+                last = error.to_string();
+                stable_since = None;
+                stable_samples = 0;
+            },
+        }
+        std::thread::sleep(POLL);
+    }
+    Err(format!("timed out waiting for {phase}; last observation: {last}").into())
+}
+
+/// Wait for lower load to reach both operators while the exact pair remains absent.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the wait binds one absent-topology phase to its expected signal and candidates"
+)]
+fn wait_for_signal(
+    context: &DemoContext,
+    forwards: &PortForwards,
+    gateway_uid: &str,
+    expected_running: u32,
+    expected_candidates: &BTreeSet<CandidatePair>,
+    phase: &str,
+) -> Result<RuntimeSnapshot, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + TRANSITION_TIMEOUT;
+    let mut stable_since = None;
+    let mut stable_samples = 0_u32;
+    let mut last = String::from("no runtime sample");
+    while Instant::now() < deadline {
+        match observe_runtime(context, forwards) {
+            Ok(snapshot) => {
+                last = snapshot_summary(&snapshot);
+                if snapshot.gateway_uid != gateway_uid {
+                    return Err(format!(
+                        "Gateway pod UID changed during {phase}: {gateway_uid} -> {}",
+                        snapshot.gateway_uid
+                    )
+                    .into());
+                }
+                let valid = if candidate_set(&snapshot.candidates) != *expected_candidates
+                    || candidate_set(&snapshot.mounted_candidates) != *expected_candidates
+                {
+                    Err("operator or mounted candidate set differs from the required absent-pair set".to_owned())
+                } else if !snapshot.ceiling_is_nan {
+                    Err(format!("removed pair ceiling is not NaN: {:?}", snapshot.ceiling_raw))
+                } else {
+                    require_signal_values(&snapshot, f64::from(expected_running)).map_err(|error| error.to_string())
+                };
+                if valid.is_ok() {
+                    stable_since.get_or_insert_with(Instant::now);
+                    stable_samples = stable_samples.saturating_add(1);
+                    if stable_samples >= 3 && stable_since.is_some_and(|start| start.elapsed() >= STABLE_SPAN) {
+                        return Ok(snapshot);
+                    }
+                } else {
+                    last = valid.err().unwrap_or_else(|| "signal predicate false".to_owned());
+                    stable_since = None;
+                    stable_samples = 0;
+                }
+            },
+            Err(error) => {
+                last = error.to_string();
+                stable_since = None;
+                stable_samples = 0;
+            },
+        }
+        std::thread::sleep(POLL);
+    }
+    Err(format!("timed out waiting for {phase}; last observation: {last}").into())
+}
+
+/// Wait for a fresh operator serving revision and the Gateway's applied reload of it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the transition wait checks the prior revision, exact topology, signal, and live Gateway"
+)]
+fn wait_for_topology_state(
+    context: &DemoContext,
+    forwards: &PortForwards,
+    gateway_uid: &str,
+    pair_present_expected: bool,
+    expected_candidates: &BTreeSet<CandidatePair>,
+    previous: &RuntimeSnapshot,
+    expected_running: u32,
+    phase: &str,
+    phases: &mut Vec<Value>,
+    probe_failures: &mut Vec<Value>,
+) -> Result<RuntimeSnapshot, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + TRANSITION_TIMEOUT;
+    let mut stable_since = None;
+    let mut stable_samples = 0_u32;
+    let mut last = String::from("no runtime sample");
+    while Instant::now() < deadline {
+        match observe_runtime(context, forwards) {
+            Ok(snapshot) => {
+                last = snapshot_summary(&snapshot);
+                if snapshot.gateway_uid != gateway_uid {
+                    return Err(format!(
+                        "Gateway pod UID changed during {phase}: {gateway_uid} -> {}",
+                        snapshot.gateway_uid
+                    )
+                    .into());
+                }
+                let pairs = candidate_set(&snapshot.candidates);
+                let mounted_pairs = candidate_set(&snapshot.mounted_candidates);
+                let accepted_revision = pair_present(&snapshot.candidates) == pair_present_expected
+                    && pair_present(&snapshot.mounted_candidates) == pair_present_expected
+                    && pairs == *expected_candidates
+                    && mounted_pairs == *expected_candidates
+                    && snapshot.operator_digest != previous.operator_digest
+                    && snapshot.operator_resource_version != previous.operator_resource_version
+                    && snapshot.operator_digest_annotation == snapshot.operator_digest
+                    && snapshot.mounted_digest == snapshot.operator_digest
+                    && snapshot.gateway_reloads > previous.gateway_reloads;
+                let signals_valid = require_signal_values(&snapshot, f64::from(expected_running));
+                if accepted_revision && signals_valid.is_ok() {
+                    let expected_site = (!pair_present_expected).then_some("pool-a");
+                    let response = send_probe(forwards.gateway_http, expected_site, phase, probe_failures)?;
+                    observations_for_topology_probe(phase, &response);
+                    let reloaded = observe_runtime(context, forwards)?;
+                    let response_evidence = response_value(&response);
+                    record_phase(
+                        context,
+                        &format!("{phase}-accepted-probe"),
+                        &reloaded,
+                        Some(&response_evidence),
+                        phases,
+                    )?;
+                    let still_state = reloaded.gateway_uid == gateway_uid
+                        && require_topology_transition(previous, &reloaded, pair_present_expected, expected_candidates)
+                        && require_signal_values(&reloaded, f64::from(expected_running)).is_ok();
+                    if still_state {
+                        stable_since.get_or_insert_with(Instant::now);
+                        stable_samples = stable_samples.saturating_add(1);
+                        if stable_samples >= 3 && stable_since.is_some_and(|start| start.elapsed() >= STABLE_SPAN) {
+                            return Ok(reloaded);
+                        }
+                    } else {
+                        last = format!(
+                            "Gateway state changed after an accepted-revision request: {}",
+                            snapshot_summary(&reloaded)
+                        );
+                        stable_since = None;
+                        stable_samples = 0;
+                    }
+                } else {
+                    last = signals_valid.err().map_or_else(
+                        || {
+                            format!(
+                                "new revision/reload/topology predicate false: {}",
+                                snapshot_summary(&snapshot)
+                            )
+                        },
+                        |error| error.to_string(),
+                    );
+                    stable_since = None;
+                    stable_samples = 0;
+                }
+            },
+            Err(error) => {
+                last = error.to_string();
+                stable_since = None;
+                stable_samples = 0;
+            },
+        }
+        std::thread::sleep(POLL);
+    }
+    Err(format!("timed out waiting for {phase}; last observation: {last}").into())
+}
+
+/// Keep the accepted-revision probe in a concise human-readable observation.
+fn observations_for_topology_probe(phase: &str, response: &SiteRouteResponse) {
+    eprintln!(
+        "[LEARNED-CEILING] {phase} accepted-revision probe: HTTP {}, site={:?}, backend={:?}, provider_site={:?}",
+        response.status, response.site, response.backend, response.provider_site
+    );
+}
+
+/// Send a uniquely sessioned request and require consistent Grid and provider attribution.
+fn send_probe(
+    port: u16,
+    expected_site: Option<&str>,
+    phase: &str,
+    probe_failures: &mut Vec<Value>,
+) -> Result<SiteRouteResponse, Box<dyn std::error::Error>> {
+    let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let response = match send_site_request(port, sequence) {
+        Ok(response) => response,
+        Err(error) => {
+            let failure = probe_failure_value(phase, sequence, expected_site, None, &error.to_string());
+            eprintln!("[LEARNED-CEILING][PROBE][TRANSPORT-FAIL] {failure}");
+            probe_failures.push(failure);
+            return Err(error);
+        },
+    };
+    if let Err(error) = validate_response_attribution(&response, expected_site) {
+        let failure = probe_failure_value(phase, sequence, expected_site, Some(&response), &error);
+        eprintln!("[LEARNED-CEILING][PROBE][FAIL] {failure}");
+        probe_failures.push(failure);
+        return Err(format!(
+            "Grid Gateway request failed attribution validation (HTTP {}, headers={:?}): {error}",
+            response.status, response.raw_header_names
+        )
+        .into());
+    }
+    Ok(response)
+}
+
+/// Capture an unsuccessful request without treating its HTTP status as transport failure.
+fn probe_failure_value(
+    phase: &str,
+    sequence: usize,
+    expected_site: Option<&str>,
+    response: Option<&SiteRouteResponse>,
+    error: &str,
+) -> Value {
+    let kind = response.map_or("transport_error", |response| {
+        if response.status == 200 {
+            "attribution_error"
+        } else {
+            "http_status"
+        }
+    });
+    json!({
+        "phase": phase,
+        "observed_at": format_utc_iso(),
+        "request_sequence": sequence,
+        "kind": kind,
+        "expected_site": expected_site,
+        "status": response.map(|response| response.status),
+        "x_grid_site": response.and_then(|response| response.site.as_deref()),
+        "x_grid_backend": response.and_then(|response| response.backend.as_deref()),
+        "provider_site": response.and_then(|response| response.provider_site.as_deref()),
+        "raw_header_names": response.map(|response| &response.raw_header_names),
+        "error": error,
+    })
+}
+
+/// Require HTTP success and agreement among both Grid headers and the trusted provider marker.
+fn validate_response_attribution(response: &SiteRouteResponse, expected_site: Option<&str>) -> Result<(), String> {
+    if response.status != 200 {
+        return Err(format!("expected HTTP 200, got {}", response.status));
+    }
+    let site = response.site.as_deref().ok_or("response has no x-grid-site header")?;
+    let backend = response
+        .backend
+        .as_deref()
+        .ok_or("response has no x-grid-backend header")?;
+    let provider_site = response
+        .provider_site
+        .as_deref()
+        .ok_or("response has no trusted provider marker")?;
+    if site != provider_site {
+        return Err(format!(
+            "x-grid-site {site:?} disagrees with provider marker {provider_site:?}"
+        ));
+    }
+    let expected_backend = format!("llmd-{site}-provider");
+    if backend != expected_backend {
+        return Err(format!(
+            "x-grid-backend {backend:?} does not identify site {site:?} ({expected_backend})"
+        ));
+    }
+    if expected_site.is_some_and(|expected| site != expected) {
+        return Err(format!("expected route to {expected_site:?}, got {site:?}/{backend:?}"));
+    }
+    Ok(())
+}
+
+/// Compare direct EPP, both operator signal paths, and live Gateway state in one sample.
+fn observe_runtime(
+    context: &DemoContext,
+    forwards: &PortForwards,
+) -> Result<RuntimeSnapshot, Box<dyn std::error::Error>> {
+    let local_context = kind_context(GRID_SERVING_SITE);
+    let config_map = kube_json(&local_context, "get", &format!("configmap/{GRID_SERVING_CONFIGMAP}"))?;
+    let operator_config = config_map
+        .pointer("/data/serving-config.json")
+        .and_then(Value::as_str)
+        .ok_or("operator serving ConfigMap has no serving-config.json data")?
+        .to_owned();
+    let operator_value: Value = serde_json::from_str(&operator_config)?;
+    let operator_candidates = candidate_pairs(&operator_value)?;
+    let operator_digest = sha256_text(&operator_config);
+    let operator_digest_annotation = annotation_value(&config_map, SERVING_DIGEST_ANNOTATION)
+        .ok_or("operator serving ConfigMap has no content-addressed serving revision annotation")?;
+    let operator_resource_version = config_map
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .ok_or("operator serving ConfigMap has no resourceVersion")?
+        .to_owned();
+
+    let (gateway_pod, gateway_uid) = gateway_pod_identity(&local_context, context)?;
+    let pod_name = gateway_pod
+        .get("pod_name")
+        .and_then(Value::as_str)
+        .ok_or("Grid Gateway pod identity has no pod name")?;
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &local_context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            pod_name,
+            "-c",
+            GATEWAY_CONTAINER,
+            "--",
+            "cat",
+            MOUNTED_CONFIG_PATH,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "read mounted serving config from Gateway pod {pod_name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let mounted_config = String::from_utf8_lossy(&output.stdout).into_owned();
+    if mounted_config.trim().is_empty() {
+        return Err("Gateway mounted serving config is empty".into());
+    }
+    let mounted_value: Value = serde_json::from_str(&mounted_config)?;
+    let mounted_candidates = candidate_pairs(&mounted_value)?;
+    let mounted_digest = sha256_text(&mounted_config);
+    let load_window_ms = required_unsigned(&mounted_value, "/load_window_ms", "load_window_ms")?;
+    let horizon_ms = mounted_value
+        .pointer("/horizon_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(load_window_ms);
+    let window_secs = required_unsigned(&mounted_value, "/window_secs", "window_secs")?;
+
+    let epp_metrics = kubectl_exec_epp_metrics(SITE, context.metrics_transport == MetricsTransport::MtlsProxy)?;
+    let epp = parse_epp_readings(&epp_metrics)?;
+    let origin_operator_metrics = read_operator_metrics(forwards.remote_operator_metrics)?;
+    let local_operator_metrics = read_operator_metrics(forwards.local_operator_metrics)?;
+    let origin_in_flight = required_operator_sample(
+        &origin_operator_metrics,
+        "grid_provider_in_flight_requests",
+        "pool-B origin in-flight",
+    )?;
+    let origin_ready = required_operator_sample(
+        &origin_operator_metrics,
+        "grid_provider_ready_endpoints",
+        "pool-B origin readiness",
+    )?;
+    let local_in_flight = optional_operator_sample(
+        &local_operator_metrics,
+        "grid_provider_in_flight_requests",
+        "pool-A relayed pool-B in-flight",
+    )?;
+    let local_ready = optional_operator_sample(
+        &local_operator_metrics,
+        "grid_provider_ready_endpoints",
+        "pool-A relayed pool-B readiness",
+    )?;
+    let gateway_metrics = read_gateway_metrics(forwards.gateway_metrics)?;
+    let gateway_reloads = required_metric(
+        &gateway_metrics,
+        "grid_serving_config_reload_total",
+        &[("result", "applied")],
+        "Gateway applied-reload counter",
+    )?;
+    let ceiling_raw = metric_sample(
+        &gateway_metrics,
+        CEILING_METRIC,
+        &[("site", SITE), ("cluster", CLUSTER)],
+    )
+    .map(|(_, value)| value.to_owned());
+    let ceiling = ceiling_raw.as_deref().and_then(|value| value.parse::<f64>().ok());
+    let ceiling_is_nan = ceiling.is_some_and(f64::is_nan);
+
+    Ok(RuntimeSnapshot {
+        operator_config,
+        operator_digest,
+        operator_digest_annotation,
+        operator_resource_version,
+        mounted_config,
+        mounted_digest,
+        candidates: operator_candidates,
+        mounted_candidates,
+        epp,
+        epp_metric_samples: relevant_epp_metric_lines(&epp_metrics),
+        origin_in_flight,
+        origin_ready,
+        local_in_flight,
+        local_ready,
+        origin_operator_metric_samples: relevant_operator_metric_lines(&origin_operator_metrics),
+        local_operator_metric_samples: relevant_operator_metric_lines(&local_operator_metrics),
+        gateway_metrics: relevant_gateway_metric_lines(&gateway_metrics),
+        gateway_reloads,
+        ceiling,
+        ceiling_raw,
+        ceiling_is_nan,
+        gateway_uid,
+        gateway_image_identity: gateway_pod,
+        load_window_ms,
+        horizon_ms,
+        window_secs,
+    })
+}
+
+/// Read the exact Ready Grid Gateway pod identity and actual runtime image fields.
+fn gateway_pod_identity(context: &str, demo: &DemoContext) -> Result<(Value, String), Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/instance=grid-serving-gateway",
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "read Grid Gateway pod identity: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let pods: Value = serde_json::from_slice(&output.stdout)?;
+    let items = pods
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or("Grid Gateway pod query returned no items array")?;
+    let ready: Vec<&Value> = items
+        .iter()
+        .filter(|pod| {
+            pod.pointer("/status/phase").and_then(Value::as_str) == Some("Running")
+                && pod
+                    .pointer("/status/conditions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|conditions| {
+                        conditions.iter().any(|condition| {
+                            condition.get("type").and_then(Value::as_str) == Some("Ready")
+                                && condition.get("status").and_then(Value::as_str) == Some("True")
+                        })
+                    })
+        })
+        .collect();
+    if ready.len() != 1 {
+        return Err(format!("expected one Ready Grid Gateway pod, found {}", ready.len()).into());
+    }
+    let pod = ready.first().ok_or("Ready Grid Gateway pod disappeared")?;
+    let uid = pod
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .ok_or("Ready Grid Gateway pod has no UID")?
+        .to_owned();
+    let name = pod
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .ok_or("Ready Grid Gateway pod has no name")?;
+    let requested = pod
+        .pointer("/spec/containers")
+        .and_then(Value::as_array)
+        .and_then(|containers| {
+            containers
+                .iter()
+                .find(|container| container.get("name").and_then(Value::as_str) == Some(GATEWAY_CONTAINER))
+        })
+        .and_then(|container| container.get("image"))
+        .and_then(Value::as_str)
+        .ok_or("Ready Grid Gateway pod has no praxis container image reference")?;
+    let expected = demo
+        .images
+        .grid_gateway
+        .as_deref()
+        .ok_or("full-mode Grid Gateway image is not configured")?;
+    if requested != expected {
+        return Err(format!(
+            "running Grid Gateway requested image {requested:?}, expected the source-built image {expected:?}"
+        )
+        .into());
+    }
+    let container_status = pod
+        .pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+        .and_then(|containers| {
+            containers
+                .iter()
+                .find(|container| container.get("name").and_then(Value::as_str) == Some(GATEWAY_CONTAINER))
+        })
+        .ok_or("Ready Grid Gateway pod has no praxis container status")?;
+    let image_id = container_status
+        .get("imageID")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("Ready Grid Gateway pod has no runtime imageID")?;
+    let container_id = container_status
+        .get("containerID")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok((
+        json!({
+            "pod_name": name,
+            "pod_uid": uid,
+            "container": GATEWAY_CONTAINER,
+            "requested_image": requested,
+            "runtime_image_id": image_id,
+            "container_id": container_id,
+        }),
+        uid,
+    ))
+}
+
+/// Parse and validate the complete signal surface needed to teach a ceiling.
+fn parse_epp_readings(metrics: &str) -> Result<EppReadings, Box<dyn std::error::Error>> {
+    let running = required_metric(
+        metrics,
+        RUNNING_METRIC,
+        &[("name", "pool-b")],
+        "pool-B running requests",
+    )?;
+    let queue = required_metric(metrics, QUEUE_METRIC, &[("name", "pool-b")], "pool-B average queue")?;
+    let ready = required_metric(metrics, READY_METRIC, &[("name", "pool-b")], "pool-B ready endpoints")?;
+    let per_endpoint_queues = metric_values(metrics, PER_ENDPOINT_QUEUE_METRIC, &[("name", "pool-b")]);
+    if per_endpoint_queues.is_empty() {
+        return Err("pinned EPP has no per-endpoint queue series for pool-b".into());
+    }
+    let held_capacity = metric_values(metrics, HELD_CAPACITY_METRIC, &[("inference_pool", "pool-b")]);
+    if held_capacity.is_empty() {
+        return Err("pinned EPP has no flow-control request-capacity observation for pool-b".into());
+    }
+    let held_queue = metric_values(metrics, HELD_QUEUE_METRIC, &[("inference_pool", "pool-b")]);
+    let held_queue_count = (!held_queue.is_empty()).then(|| held_queue.iter().sum());
+    let readings = EppReadings {
+        running,
+        queue,
+        ready,
+        per_endpoint_queues,
+        held_queue_count,
+        held_source: if held_queue.is_empty() {
+            HELD_CAPACITY_METRIC.to_owned()
+        } else {
+            HELD_QUEUE_METRIC.to_owned()
+        },
+        held_capacity_utilization: held_capacity.into_iter().fold(0.0_f64, f64::max),
+    };
+    for (name, value) in [
+        ("running requests", readings.running),
+        ("average queue", readings.queue),
+        ("ready endpoints", readings.ready),
+        ("held capacity utilization", readings.held_capacity_utilization),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!("EPP {name} is not a finite non-negative value: {value}").into());
+        }
+    }
+    if readings
+        .per_endpoint_queues
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err("EPP per-endpoint queue contains a non-finite or negative value".into());
+    }
+    if readings
+        .held_queue_count
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err("EPP held queue count is non-finite or negative".into());
+    }
+    Ok(readings)
+}
+
+/// Check that all available waiting and held-work observations are exactly zero.
+fn no_waiting_or_held_work(epp: &EppReadings) -> bool {
+    epp.queue == 0.0
+        && epp.per_endpoint_queues.iter().all(|queue| *queue == 0.0)
+        && epp.held_queue_count.is_none_or(|held| held == 0.0)
+        && epp.held_capacity_utilization == 0.0
+}
+
+/// Require zero waiting and held work and match both operator views to the raw EPP sample.
+fn require_signal_values(snapshot: &RuntimeSnapshot, expected_running: f64) -> Result<(), Box<dyn std::error::Error>> {
+    let epp = &snapshot.epp;
+    if (epp.running - expected_running).abs() > f64::EPSILON {
+        return Err(format!("EPP running requests are {}, expected {expected_running}", epp.running).into());
+    }
+    if epp.ready < 1.0 || epp.ready.fract() != 0.0 {
+        return Err(format!("EPP ready-endpoint count is not a positive integer: {}", epp.ready).into());
+    }
+    if epp.per_endpoint_queues.len() != usize_value(epp.ready)? {
+        return Err(format!(
+            "EPP reports {} ready endpoints but {} per-endpoint queue series",
+            epp.ready,
+            epp.per_endpoint_queues.len()
+        )
+        .into());
+    }
+    if !no_waiting_or_held_work(epp) {
+        return Err(format!(
+            "EPP must report exactly zero waiting and held work: average_queue={}, per_endpoint_queues={:?}, held_queue={:?}, request_capacity_utilization={}",
+            epp.queue, epp.per_endpoint_queues, epp.held_queue_count, epp.held_capacity_utilization
+        )
+        .into());
+    }
+
+    let expected_in_flight = epp.running * epp.ready + epp.queue + epp.held_queue_count.unwrap_or(0.0);
+    for (name, actual, expected) in [("pool-B origin", snapshot.origin_in_flight, expected_in_flight)] {
+        if (actual - expected).abs() > 0.01 {
+            return Err(format!("{name} in-flight sample {actual} does not match EPP-derived {expected}").into());
+        }
+    }
+    if (snapshot.origin_ready - epp.ready).abs() > f64::EPSILON {
+        return Err(format!(
+            "origin ready-endpoint signal differs from EPP: EPP={}, origin={}",
+            epp.ready, snapshot.origin_ready
+        )
+        .into());
+    }
+    let local_signal = local_relay_matches(
+        pair_present(&snapshot.candidates),
+        snapshot.local_in_flight,
+        snapshot.local_ready,
+        expected_in_flight,
+        epp.ready,
+    )
+    .map_err(Into::<Box<dyn std::error::Error>>::into)?;
+    if !local_signal {
+        return Err(format!(
+            "pool-A relayed signal differs from EPP: EPP in-flight={expected_in_flight}, EPP ready={}, relay in-flight={:?}, relay ready={:?}",
+            epp.ready, snapshot.local_in_flight, snapshot.local_ready
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Match the local operator relay, requiring it while the provider is published.
+fn local_relay_matches(
+    pair_published: bool,
+    local_in_flight: Option<f64>,
+    local_ready: Option<f64>,
+    expected_in_flight: f64,
+    expected_ready: f64,
+) -> Result<bool, String> {
+    match (local_in_flight, local_ready) {
+        (Some(in_flight), Some(ready)) => {
+            Ok((in_flight - expected_in_flight).abs() <= 0.01 && (ready - expected_ready).abs() <= f64::EPSILON)
+        },
+        (None, None) if !pair_published => Ok(true),
+        (None, None) => Err("pool-A relayed metrics are missing while the provider pair is published".to_owned()),
+        (None, Some(_)) if pair_published => {
+            Err("pool-A relayed in-flight metric is missing while the provider pair is published".to_owned())
+        },
+        (Some(_), None) if pair_published => {
+            Err("pool-A relayed readiness metric is missing while the provider pair is published".to_owned())
+        },
+        (None, Some(ready)) => Ok((ready - expected_ready).abs() <= f64::EPSILON),
+        (Some(in_flight), None) => Ok((in_flight - expected_in_flight).abs() <= 0.01),
+    }
+}
+
+/// Convert an already-validated integral endpoint count without a lossy float cast.
+fn usize_value(value: f64) -> Result<usize, Box<dyn std::error::Error>> {
+    value
+        .to_string()
+        .parse::<usize>()
+        .map_err(|error| format!("invalid endpoint count {value}: {error}").into())
+}
+
+/// Capture a batch of attributed real requests as a separate time-ordered evidence phase.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each evidence sample is tied to its phase, expected site, runtime snapshot, and output collectors"
+)]
+fn record_attributed_requests(
+    context: &DemoContext,
+    forwards: &PortForwards,
+    phase: &str,
+    expected_site: Option<&str>,
+    snapshot: &RuntimeSnapshot,
+    phases: &mut Vec<Value>,
+    observations: &mut Vec<String>,
+    probe_failures: &mut Vec<Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut distribution = RouteDistribution::default();
+    let mut responses = Vec::new();
+    for _ in 0..REQUESTS_PER_PHASE {
+        let response = send_probe(forwards.gateway_http, expected_site, phase, probe_failures)?;
+        distribution
+            .observe(&response)
+            .map_err(|error| format!("record provider attribution: {error}"))?;
+        responses.push(response_value(&response));
+    }
+    let attribution = json!({
+        "requested": REQUESTS_PER_PHASE,
+        "successful": responses.len(),
+        "expected_site": expected_site,
+        "distribution": {
+            "sites": distribution.sites,
+            "backends": distribution.backends,
+            "provider_gateways": distribution.provider_gateways,
+        },
+        "responses": responses,
+    });
+    record_phase(context, phase, snapshot, Some(&attribution), phases)?;
+    observations.push(format!("{phase}: {attribution}"));
+    Ok(())
+}
+
+/// Convert a validated route response to safe structured evidence.
+fn response_value(response: &SiteRouteResponse) -> Value {
+    json!({
+        "status": response.status,
+        "x_grid_site": response.site,
+        "x_grid_backend": response.backend,
+        "provider_site": response.provider_site,
+        "raw_header_names": response.raw_header_names,
+    })
+}
+
+/// Append one structured snapshot and persist the exact operator and mounted JSON contents.
+fn record_phase(
+    context: &DemoContext,
+    name: &str,
+    snapshot: &RuntimeSnapshot,
+    attribution: Option<&Value>,
+    phases: &mut Vec<Value>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let revision_dir = context
+        .evidence_dir
+        .join("learned-ceiling-lifecycle")
+        .join("serving-revisions");
+    fs::create_dir_all(&revision_dir)?;
+    let operator_name = format!("operator-{}.json", safe_digest(&snapshot.operator_digest));
+    let mounted_name = format!("mounted-{}.json", safe_digest(&snapshot.mounted_digest));
+    persist_content(&revision_dir.join(operator_name), &snapshot.operator_config)?;
+    persist_content(&revision_dir.join(mounted_name), &snapshot.mounted_config)?;
+    let finite_ceiling = snapshot.ceiling.filter(|value| value.is_finite());
+    let record = json!({
+        "phase": name,
+        "observed_at": format_utc_iso(),
+        "operator_revision": {
+            "content_digest": snapshot.operator_digest,
+            "annotation_digest": snapshot.operator_digest_annotation,
+            "resource_version": snapshot.operator_resource_version,
+            "config_file": revision_dir.join(format!("operator-{}.json", safe_digest(&snapshot.operator_digest))).display().to_string(),
+        },
+        "mounted_revision": {
+            "content_digest": snapshot.mounted_digest,
+            "matches_operator": snapshot.mounted_digest == snapshot.operator_digest,
+            "config_file": revision_dir.join(format!("mounted-{}.json", safe_digest(&snapshot.mounted_digest))).display().to_string(),
+        },
+        "candidate_pairs": snapshot.candidates,
+        "mounted_candidate_pairs": snapshot.mounted_candidates,
+        "signals": {
+            "epp": {
+                "running_requests_per_ready_endpoint": snapshot.epp.running,
+                "average_waiting_requests": snapshot.epp.queue,
+                "ready_endpoints": snapshot.epp.ready,
+                "per_endpoint_queues": snapshot.epp.per_endpoint_queues,
+                "held_queue_count": snapshot.epp.held_queue_count,
+                "held_observation_source": snapshot.epp.held_source,
+                "held_request_capacity_utilization": snapshot.epp.held_capacity_utilization,
+                "metric_samples": snapshot.epp_metric_samples,
+            },
+            "pool_b_origin": {
+                "in_flight": snapshot.origin_in_flight,
+                "ready_endpoints": snapshot.origin_ready,
+                "metric_samples": snapshot.origin_operator_metric_samples,
+            },
+            "pool_a_relay": {
+                "in_flight": snapshot.local_in_flight,
+                "ready_endpoints": snapshot.local_ready,
+                "metric_samples": snapshot.local_operator_metric_samples,
+            },
+        },
+        "gateway": {
+            "pod_uid": snapshot.gateway_uid,
+            "image": snapshot.gateway_image_identity,
+            "applied_config_reload_count": snapshot.gateway_reloads,
+            "ceiling_metric": CEILING_METRIC,
+            "ceiling_value": finite_ceiling,
+            "ceiling_raw": snapshot.ceiling_raw,
+            "ceiling_is_nan": snapshot.ceiling_is_nan,
+            "metric_samples": snapshot.gateway_metrics,
+        },
+        "load_store": {
+            "load_window_ms": snapshot.load_window_ms,
+            "horizon_ms": snapshot.horizon_ms,
+            "window_secs": snapshot.window_secs,
+        },
+        "attribution": attribution,
+    });
+    phases.push(record.clone());
+    Ok(record)
+}
+
+/// Write evidence once per content digest and reject inconsistent repeated content.
+fn persist_content(path: &std::path::Path, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if path.exists() {
+        let existing = fs::read_to_string(path)?;
+        if existing != contents {
+            return Err(format!("evidence path {} already contains different content", path.display()).into());
+        }
+        return Ok(());
+    }
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+/// Write the standalone structured proof artifact.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the standalone evidence envelope keeps each failure and source field explicit"
+)]
+fn write_evidence(
+    context: &DemoContext,
+    source_sha: Option<&str>,
+    tracked_worktree_clean: Option<bool>,
+    source_worktree_sha256: Option<&str>,
+    started_at: &str,
+    success: bool,
+    primary_error: Option<&str>,
+    restoration_errors: &[String],
+    original_state: Option<Value>,
+    image_manifest: Option<Value>,
+    phases: &[Value],
+    probe_failures: &[Value],
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let directory = context.evidence_dir.join("learned-ceiling-lifecycle");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join("evidence.json");
+    let evidence = LearnedCeilingEvidence {
+        schema_version: "1",
+        source_sha,
+        tracked_worktree_clean,
+        source_worktree_sha256,
+        run_cluster_prefix: run_cluster_prefix(),
+        started_at,
+        success,
+        primary_error,
+        restoration_errors,
+        original_state,
+        image_manifest,
+        phases,
+        probe_failures,
+    };
+    fs::write(path.as_path(), serde_json::to_vec_pretty(&evidence)?)?;
+    Ok(path)
+}
+
+/// Summarize original state without copying unneeded runtime data into the envelope.
+fn original_state_summary(original: &OriginalState) -> Value {
+    let simulator_annotations: BTreeMap<&str, &BTreeMap<String, Option<String>>> = original
+        .simulator_annotations
+        .iter()
+        .map(|(deployment, annotations)| (deployment.as_str(), annotations))
+        .collect();
+    json!({
+        "provider_access_policy": original.access_policy,
+        "simulator_config_sha256": sha256_text(&original.simulator_config),
+        "simulator_config": original.simulator_config,
+        "pool_a_operator_overlay_sha256": sha256_text(&original.pool_a_overlay),
+        "pool_a_operator_overlay": original.pool_a_overlay,
+        "simulator_annotations": simulator_annotations,
+        "simulator_epp_readings": epp_value(&original.simulator_readings),
+        "gridnetwork_metrics_refresh_annotations": original.reconcile_annotations,
+        "serving_revision": original.baseline.operator_digest,
+        "serving_resource_version": original.baseline.operator_resource_version,
+        "gateway_pod_uid": original.baseline.gateway_uid,
+        "gateway_image": original.baseline.gateway_image_identity,
+    })
+}
+
+/// Serialize all direct EPP observations with non-finite values already rejected.
+fn epp_value(epp: &EppReadings) -> Value {
+    json!({
+        "running": epp.running,
+        "queue": epp.queue,
+        "ready": epp.ready,
+        "per_endpoint_queues": epp.per_endpoint_queues,
+        "held_queue_count": epp.held_queue_count,
+        "held_source": epp.held_source,
+        "held_capacity_utilization": epp.held_capacity_utilization,
+    })
+}
+
+/// Collect requested image references and actual Docker and pod-runtime image identities.
+fn collect_image_manifest(context: &DemoContext) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut references = BTreeMap::from([
+        ("gateway".to_owned(), context.images.gateway.clone()),
+        ("operator".to_owned(), context.images.operator.clone()),
+        ("epp".to_owned(), context.images.epp.clone()),
+        ("simulator".to_owned(), context.images.vcr.clone()),
+        ("overlay_sync".to_owned(), context.images.overlay_sync.clone()),
+    ]);
+    if let Some(image) = &context.images.grid_gateway {
+        references.insert("grid_gateway".to_owned(), image.clone());
+    }
+    if let Some(image) = &context.images.nginx {
+        references.insert("nginx".to_owned(), image.clone());
+    }
+    let mut docker_identities = BTreeMap::new();
+    for (role, image) in &references {
+        docker_identities.insert(role.clone(), docker_image_identity(image)?);
+    }
+    let mut pods = BTreeMap::new();
+    for site in [GRID_SERVING_SITE, SITE] {
+        let site_context = kind_context(site);
+        let object = kube_json(&site_context, "get", "pods")?;
+        let items = object
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{site} pod listing has no items array"))?;
+        let mut identities = Vec::new();
+        for pod in items {
+            if pod.pointer("/metadata/namespace").and_then(Value::as_str) != Some(GRID_SYSTEM_NS) {
+                continue;
+            }
+            identities.push(pod_image_identity(pod));
+        }
+        pods.insert(site.to_owned(), identities);
+    }
+    Ok(json!({
+        "requested_references": references,
+        "docker_image_identities": docker_identities,
+        "running_pod_images": pods,
+    }))
+}
+
+/// Read a Docker image's immutable config ID and any repository digests.
+fn docker_image_identity(reference: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let output = Command::new("docker").args(["image", "inspect", reference]).output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "docker image inspect {reference}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let images: Value = serde_json::from_slice(&output.stdout)?;
+    let image = images
+        .as_array()
+        .and_then(|items| items.first())
+        .ok_or_else(|| format!("docker image inspect returned no image for {reference}"))?;
+    let id = image
+        .get("Id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Docker image {reference} has no config ID"))?;
+    Ok(json!({
+        "reference": reference,
+        "image_id": id,
+        "repo_digests": image.get("RepoDigests").cloned().unwrap_or(Value::Null),
+        "repo_tags": image.get("RepoTags").cloned().unwrap_or(Value::Null),
+        "architecture": image.get("Architecture"),
+        "os": image.get("Os"),
+    }))
+}
+
+/// Extract requested and runtime image identities from one Kubernetes pod object.
+fn pod_image_identity(pod: &Value) -> Value {
+    let containers = pod
+        .pointer("/spec/containers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|container| {
+            let name = container.get("name").and_then(Value::as_str).unwrap_or("unknown");
+            let status = pod
+                .pointer("/status/containerStatuses")
+                .and_then(Value::as_array)
+                .and_then(|statuses| {
+                    statuses
+                        .iter()
+                        .find(|status| status.get("name").and_then(Value::as_str) == Some(name))
+                });
+            json!({
+                "name": name,
+                "requested_image": container.get("image"),
+                "runtime_image": status.and_then(|item| item.get("image")),
+                "runtime_image_id": status.and_then(|item| item.get("imageID")),
+                "container_id": status.and_then(|item| item.get("containerID")),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "name": pod.pointer("/metadata/name"),
+        "uid": pod.pointer("/metadata/uid"),
+        "phase": pod.pointer("/status/phase"),
+        "containers": containers,
+    })
+}
+
+/// Change only the pool-B provider policy so the pool-A consumer cannot select it.
+fn patch_access_policy_to_exclude_run_site(original: &OriginalState) -> Result<String, Box<dyn std::error::Error>> {
+    let local_context = kind_context(GRID_SERVING_SITE);
+    let consumer = kube_json(&local_context, "get", &format!("gridsite/{GRID_SERVING_SITE}"))?;
+    let labels = consumer
+        .pointer("/metadata/labels")
+        .and_then(Value::as_object)
+        .ok_or("pool-A GridSite has no metadata.labels object")?;
+    let run_token = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let run_value = format!("exclude-{run_token}");
+    if labels.get(RUN_EXCLUSION_LABEL).and_then(Value::as_str) == Some(run_value.as_str()) {
+        return Err("run-unique exclusion label unexpectedly already matches pool-A GridSite".into());
+    }
+    let policy = policy_with_run_exclusion(&original.access_policy, &run_value)?;
+    patch_access_policy_value(&policy)?;
+    let applied = read_access_policy()?;
+    if applied != policy {
+        return Err("pool-B InferenceProvider did not retain the run-specific exclusion policy".into());
+    }
+    Ok(run_value)
+}
+
+/// Add only the run-owned selector label while preserving the saved policy's other selectors.
+fn policy_with_run_exclusion(original: &Value, run_value: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut policy = original.clone();
+    let policy_object = policy
+        .as_object_mut()
+        .ok_or("saved provider accessPolicy is not an object")?;
+    let selector = policy_object
+        .entry("siteSelector".to_owned())
+        .or_insert_with(|| json!({}));
+    let selector_object = selector
+        .as_object_mut()
+        .ok_or("saved provider accessPolicy.siteSelector is not an object")?;
+    let match_labels = selector_object
+        .entry("matchLabels".to_owned())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("saved provider accessPolicy.siteSelector.matchLabels is not an object")?;
+    if match_labels.contains_key(RUN_EXCLUSION_LABEL) {
+        return Err("saved provider access policy already uses the run-exclusion label".into());
+    }
+    match_labels.insert(RUN_EXCLUSION_LABEL.to_owned(), Value::String(run_value.to_owned()));
+    Ok(policy)
+}
+
+/// Restore the provider's original access policy exactly.
+fn patch_access_policy(original: &OriginalState) -> Result<(), Box<dyn std::error::Error>> {
+    patch_access_policy_value(&original.access_policy)
+}
+
+/// Apply one complete accessPolicy object to the run-owned pool-B provider.
+fn patch_access_policy_value(policy: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kind_context(SITE);
+    let patch = access_policy_json_patch(policy).to_string();
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "patch",
+            "inferenceprovider",
+            CLUSTER,
+            "--type=json",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "patch pool-B InferenceProvider accessPolicy: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Replace the complete accessPolicy object so temporary nested labels cannot survive restoration.
+fn access_policy_json_patch(policy: &Value) -> Value {
+    json!([{"op":"replace","path":"/spec/accessPolicy","value":policy}])
+}
+
+/// Read the pool-B provider access policy exactly as Kubernetes stores it.
+fn read_access_policy() -> Result<Value, Box<dyn std::error::Error>> {
+    let provider = kube_json(&kind_context(SITE), "get", &format!("inferenceprovider/{CLUSTER}"))?;
+    provider
+        .pointer("/spec/accessPolicy")
+        .cloned()
+        .ok_or_else(|| "pool-B InferenceProvider has no spec.accessPolicy".into())
+}
+
+/// Trigger a checked reconcile without changing any resource outside this run's clusters.
+fn trigger_gridnetwork_reconcile_strict(site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kind_context(site);
+    let token = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos().to_string();
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "annotate",
+            "gridnetwork",
+            GRID_NETWORK_NAME,
+            &format!("{METRICS_REFRESH_ANNOTATION}={token}"),
+            "--overwrite",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "trigger {site} GridNetwork reconcile: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Restore the provider policy, simulator config/annotations, and reconcile annotations on all exits.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "restoration must retain the run state and separate cleanup, phase, and probe diagnostics"
+)]
+fn restore_original_state(
+    context: &DemoContext,
+    forwards: &PortForwards,
+    original: &OriginalState,
+    phases: &mut Vec<Value>,
+    errors: &mut Vec<String>,
+    probe_failures: &mut Vec<Value>,
+) {
+    let before_restore = observe_runtime(context, forwards).ok();
+    match read_access_policy() {
+        Ok(current) if current == original.access_policy => {},
+        Ok(_) | Err(_) => {
+            if let Err(error) = patch_access_policy(original) {
+                errors.push(format!("restore pool-B InferenceProvider accessPolicy: {error}"));
+            }
+        },
+    }
+
+    if let Err(error) = restore_simulator_state(context, original) {
+        errors.push(format!("restore pool-B simulator state: {error}"));
+    }
+
+    for site in [SITE, GRID_SERVING_SITE] {
+        if let Err(error) = trigger_gridnetwork_reconcile_strict(site) {
+            errors.push(format!("reconcile {site} after restoring provider policy: {error}"));
+        }
+    }
+    if let Err(error) = wait_for_restored_topology(
+        context,
+        forwards,
+        original,
+        phases,
+        probe_failures,
+        before_restore.as_ref(),
+    ) {
+        errors.push(format!("restore and verify the original serving topology: {error}"));
+    }
+
+    for (site, previous) in &original.reconcile_annotations {
+        if let Err(error) = restore_reconcile_annotation(site, previous.as_deref()) {
+            errors.push(format!("restore {site} GridNetwork reconcile annotation: {error}"));
+        }
+    }
+    for (site, previous) in &original.reconcile_annotations {
+        match current_reconcile_annotation(site) {
+            Ok(actual) if actual.as_deref() == previous.as_deref() => {},
+            Ok(actual) => errors.push(format!(
+                "{site} GridNetwork reconcile annotation remained {actual:?}, expected {previous:?}"
+            )),
+            Err(error) => errors.push(format!("verify {site} GridNetwork reconcile annotation: {error}")),
+        }
+    }
+
+    match wait_for_restored_topology(context, forwards, original, phases, probe_failures, None) {
+        Ok(snapshot) => {
+            if let Err(error) = record_phase(context, "restoration-verified", &snapshot, None, phases) {
+                errors.push(format!("record restored serving state: {error}"));
+            }
+        },
+        Err(error) => errors.push(format!(
+            "final serving verification after annotation restoration: {error}"
+        )),
+    }
+    if let Err(error) = verify_simulator_state(context, original) {
+        errors.push(format!("verify restored pool-B simulator state: {error}"));
+    }
+    match read_access_policy() {
+        Ok(actual) if actual == original.access_policy => {},
+        Ok(actual) => errors.push(format!(
+            "pool-B provider accessPolicy was not restored exactly: {actual}"
+        )),
+        Err(error) => errors.push(format!("verify restored pool-B provider accessPolicy: {error}")),
+    }
+}
+
+/// Restore the simulator ConfigMap and each mutated pod-template annotation independently.
+fn restore_simulator_state(context: &DemoContext, original: &OriginalState) -> Result<(), Box<dyn std::error::Error>> {
+    let peer_context = kind_context(SITE);
+    let mut errors = Vec::new();
+    let config_patch = json!({"data": {"config.yaml": original.simulator_config}}).to_string();
+    let config = Command::new("kubectl")
+        .args([
+            "--context",
+            &peer_context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "patch",
+            "configmap",
+            SIMULATOR_CONFIGMAP,
+            "--type=merge",
+            "-p",
+            &config_patch,
+        ])
+        .output();
+    match config {
+        Ok(output) if output.status.success() => {},
+        Ok(output) => errors.push(format!(
+            "patch simulator ConfigMap: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => errors.push(format!("patch simulator ConfigMap: {error}")),
+    }
+
+    for deployment in SIMULATOR_DEPLOYMENTS {
+        match original.simulator_annotations.get(*deployment) {
+            Some(annotations) => {
+                if let Err(error) = patch_simulator_annotations(&peer_context, deployment, annotations) {
+                    errors.push(format!("restore {deployment} simulator annotations: {error}"));
+                }
+                match kubectl::wait_for_rollout_ns(&peer_context, deployment, GRID_SYSTEM_NS, SITE) {
+                    Ok(()) => {},
+                    Err(error) => errors.push(format!("wait for restored {deployment} rollout: {error}")),
+                }
+            },
+            None => errors.push(format!("no saved simulator annotations for {deployment}")),
+        }
+    }
+    if errors.is_empty() {
+        wait_for_original_simulator_readings(context, original)?;
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; ").into())
+    }
+}
+
+/// Patch only the fake-metric annotations while preserving every unrelated pod-template field.
+fn patch_simulator_annotations(
+    context: &str,
+    deployment: &str,
+    annotations: &BTreeMap<String, Option<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut values = Map::new();
+    for (key, value) in annotations {
+        values.insert(key.clone(), value.clone().map_or(Value::Null, Value::String));
+    }
+    let patch = json!({"spec": {"template": {"metadata": {"annotations": values}}}}).to_string();
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "patch",
+            &format!("deployment/{deployment}"),
+            "--type=merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "patch deployment/{deployment}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Wait for the exact pre-proof EPP metrics after restoring simulator configuration.
+fn wait_for_original_simulator_readings(
+    context: &DemoContext,
+    original: &OriginalState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + SIMULATOR_RESTORE_TIMEOUT;
+    let mut last = String::from("no EPP metrics sample");
+    while Instant::now() < deadline {
+        match kubectl_exec_epp_metrics(SITE, context.metrics_transport == MetricsTransport::MtlsProxy)
+            .and_then(|text| parse_epp_readings(&text))
+        {
+            Ok(actual) if epp_readings_match(&actual, &original.simulator_readings) => return Ok(()),
+            Ok(actual) => {
+                last = format!(
+                    "restored metrics differ: expected {:?}, got {:?}",
+                    epp_value(&original.simulator_readings),
+                    epp_value(&actual)
+                );
+            },
+            Err(error) => last = error.to_string(),
+        }
+        std::thread::sleep(POLL);
+    }
+    Err(format!("simulator metrics did not return to their original state: {last}").into())
+}
+
+/// Verify the restored simulator ConfigMap, annotation values, and EPP readings.
+fn verify_simulator_state(context: &DemoContext, original: &OriginalState) -> Result<(), Box<dyn std::error::Error>> {
+    let peer_context = kind_context(SITE);
+    let config = get_configmap_data_key(&peer_context, GRID_SYSTEM_NS, SIMULATOR_CONFIGMAP, "config.yaml")?;
+    if config != original.simulator_config {
+        return Err("simulator ConfigMap config.yaml differs from its original text".into());
+    }
+    for deployment in SIMULATOR_DEPLOYMENTS {
+        let object = kube_json(&peer_context, "get", &format!("deployment/{deployment}"))?;
+        let actual = object
+            .pointer("/spec/template/metadata/annotations")
+            .and_then(Value::as_object);
+        let expected = original
+            .simulator_annotations
+            .get(*deployment)
+            .ok_or("saved simulator annotation map is missing")?;
+        for (key, value) in expected {
+            let actual_value = actual
+                .and_then(|annotations| annotations.get(key))
+                .and_then(Value::as_str);
+            if actual_value != value.as_deref() {
+                return Err(format!(
+                    "deployment/{deployment} annotation {key} is {actual_value:?}, expected {value:?}"
+                )
+                .into());
+            }
+        }
+    }
+    let metrics = kubectl_exec_epp_metrics(SITE, context.metrics_transport == MetricsTransport::MtlsProxy)?;
+    let readings = parse_epp_readings(&metrics)?;
+    if !epp_readings_match(&readings, &original.simulator_readings) {
+        return Err(format!(
+            "restored EPP readings differ from original state: expected {:?}, got {:?}",
+            epp_value(&original.simulator_readings),
+            epp_value(&readings)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Compare every queue, readiness, and held-work reading while allowing no missing series.
+fn epp_readings_match(actual: &EppReadings, expected: &EppReadings) -> bool {
+    (actual.running - expected.running).abs() < f64::EPSILON
+        && (actual.queue - expected.queue).abs() < f64::EPSILON
+        && (actual.ready - expected.ready).abs() < f64::EPSILON
+        && actual.per_endpoint_queues == expected.per_endpoint_queues
+        && actual.held_queue_count == expected.held_queue_count
+        && (actual.held_capacity_utilization - expected.held_capacity_utilization).abs() < f64::EPSILON
+}
+
+/// Wait for the original operator topology, Gateway mount, and same Gateway pod after restoration.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "restoration verification records the original state and any failed serving probes"
+)]
+fn wait_for_restored_topology(
+    context: &DemoContext,
+    forwards: &PortForwards,
+    original: &OriginalState,
+    phases: &mut Vec<Value>,
+    probe_failures: &mut Vec<Value>,
+    before_restore: Option<&RuntimeSnapshot>,
+) -> Result<RuntimeSnapshot, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + TRANSITION_TIMEOUT;
+    let expected = candidate_set(&original.baseline.candidates);
+    let mut stable_since = None;
+    let mut stable_samples = 0_u32;
+    let mut last = String::from("no runtime sample");
+    while Instant::now() < deadline {
+        match observe_runtime(context, forwards) {
+            Ok(snapshot) => {
+                last = snapshot_summary(&snapshot);
+                let stable = snapshot.gateway_uid == original.baseline.gateway_uid
+                    && candidate_set(&snapshot.candidates) == expected
+                    && candidate_set(&snapshot.mounted_candidates) == expected
+                    && snapshot.operator_digest == snapshot.operator_digest_annotation
+                    && snapshot.mounted_digest == snapshot.operator_digest
+                    && before_restore.is_none_or(|previous| {
+                        snapshot.operator_digest == previous.operator_digest
+                            || snapshot.gateway_reloads > previous.gateway_reloads
+                    })
+                    && original_signals_restored(&snapshot, original);
+                if stable {
+                    let response =
+                        send_probe(forwards.gateway_http, None, "restoration-serving-probe", probe_failures)?;
+                    let post_request = observe_runtime(context, forwards)?;
+                    if post_request.gateway_uid == original.baseline.gateway_uid
+                        && candidate_set(&post_request.candidates) == expected
+                        && candidate_set(&post_request.mounted_candidates) == expected
+                        && post_request.operator_digest == post_request.operator_digest_annotation
+                        && post_request.mounted_digest == post_request.operator_digest
+                        && before_restore.is_none_or(|previous| {
+                            post_request.operator_digest == previous.operator_digest
+                                || post_request.gateway_reloads > previous.gateway_reloads
+                        })
+                        && original_signals_restored(&post_request, original)
+                    {
+                        let response_evidence = response_value(&response);
+                        record_phase(
+                            context,
+                            "restoration-serving-probe",
+                            &post_request,
+                            Some(&response_evidence),
+                            phases,
+                        )?;
+                        stable_since.get_or_insert_with(Instant::now);
+                        stable_samples = stable_samples.saturating_add(1);
+                        if stable_samples >= 3 && stable_since.is_some_and(|start| start.elapsed() >= STABLE_SPAN) {
+                            return Ok(post_request);
+                        }
+                    } else {
+                        last = format!(
+                            "state changed after restoration request: {}",
+                            snapshot_summary(&post_request)
+                        );
+                        stable_since = None;
+                        stable_samples = 0;
+                    }
+                } else {
+                    stable_since = None;
+                    stable_samples = 0;
+                }
+            },
+            Err(error) => {
+                last = error.to_string();
+                stable_since = None;
+                stable_samples = 0;
+            },
+        }
+        std::thread::sleep(POLL);
+    }
+    let failure = format!("timed out restoring the original serving topology: {last}");
+    if let Ok(snapshot) = observe_runtime(context, forwards)
+        && let Err(error) = record_phase(context, "restoration-timeout-capture", &snapshot, None, phases)
+    {
+        return Err(format!("{failure}; could not save timeout snapshot: {error}").into());
+    }
+    Err(failure.into())
+}
+
+/// Require the original EPP and operator sample values after the simulator settings are restored.
+fn original_signals_restored(snapshot: &RuntimeSnapshot, original: &OriginalState) -> bool {
+    let local_in_flight_restored = match (snapshot.local_in_flight, original.baseline.local_in_flight) {
+        (Some(actual), Some(expected)) => (actual - expected).abs() <= 0.01,
+        _ => false,
+    };
+    let local_ready_restored = match (snapshot.local_ready, original.baseline.local_ready) {
+        (Some(actual), Some(expected)) => (actual - expected).abs() <= f64::EPSILON,
+        _ => false,
+    };
+    epp_readings_match(&snapshot.epp, &original.simulator_readings)
+        && (snapshot.origin_in_flight - original.baseline.origin_in_flight).abs() <= 0.01
+        && (snapshot.origin_ready - original.baseline.origin_ready).abs() <= f64::EPSILON
+        && local_in_flight_restored
+        && local_ready_restored
+}
+
+/// Restore or remove only the harness reconciliation annotation on one run-owned network.
+fn restore_reconcile_annotation(site: &str, previous: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kind_context(site);
+    let mut annotations = Map::new();
+    annotations.insert(
+        METRICS_REFRESH_ANNOTATION.to_owned(),
+        previous.map_or(Value::Null, |value| Value::String(value.to_owned())),
+    );
+    let patch = json!({"metadata": {"annotations": annotations}}).to_string();
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "patch",
+            "gridnetwork",
+            GRID_NETWORK_NAME,
+            "--type=merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "restore {site} GridNetwork annotation: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Read the current harness reconciliation annotation from one GridNetwork.
+fn current_reconcile_annotation(site: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let network = kube_json(&kind_context(site), "get", &format!("gridnetwork/{GRID_NETWORK_NAME}"))?;
+    Ok(annotation_value(&network, METRICS_REFRESH_ANNOTATION))
+}
+
+/// Read a string value from `metadata.annotations` without interpreting slashes in annotation keys.
+fn annotation_value(object: &Value, name: &str) -> Option<String> {
+    object
+        .pointer("/metadata/annotations")
+        .and_then(Value::as_object)
+        .and_then(|annotations| annotations.get(name))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Require both semantic states, a changed operator revision, mount equality, and a Gateway apply.
+fn require_topology_transition(
+    previous: &RuntimeSnapshot,
+    current: &RuntimeSnapshot,
+    pair_present_expected: bool,
+    expected_candidates: &BTreeSet<CandidatePair>,
+) -> bool {
+    candidate_set(&current.candidates) == *expected_candidates
+        && candidate_set(&current.mounted_candidates) == *expected_candidates
+        && pair_present(&current.candidates) == pair_present_expected
+        && pair_present(&current.mounted_candidates) == pair_present_expected
+        && current.operator_digest != previous.operator_digest
+        && current.operator_resource_version != previous.operator_resource_version
+        && current.operator_digest_annotation == current.operator_digest
+        && current.mounted_digest == current.operator_digest
+        && current.gateway_reloads > previous.gateway_reloads
+        && if pair_present_expected {
+            current.ceiling.is_some_and(f64::is_finite)
+        } else {
+            current.ceiling_is_nan
+        }
+}
+
+/// Check whether the old learned ceiling was cleared and the returned pair learned a lower value.
+fn lifecycle_ceiling_sequence_valid(
+    high: f64,
+    idle: f64,
+    removed_raw: Option<&str>,
+    returned: f64,
+    measured_low: f64,
+) -> bool {
+    high > DEFAULT_CEILING_FLOOR + CEILING_MARGIN
+        && (idle - high).abs() < f64::EPSILON
+        && removed_raw.is_some_and(|raw| raw.eq_ignore_ascii_case("nan"))
+        && returned_ceiling_is_valid(high, returned, measured_low)
+}
+
+/// Require the returned ceiling to match the floor-or-current-load and reject retained high state.
+fn returned_ceiling_is_valid(high: f64, returned: f64, measured_low: f64) -> bool {
+    if !high.is_finite() || !returned.is_finite() || !measured_low.is_finite() {
+        return false;
+    }
+    let expected = DEFAULT_CEILING_FLOOR.max(measured_low);
+    high > DEFAULT_CEILING_FLOOR + CEILING_MARGIN
+        && returned < high - CEILING_MARGIN
+        && (returned - expected).abs() <= RETURNED_CEILING_TOLERANCE
+}
+
+/// Require a specific pair in one serving candidate list.
+fn require_pair(candidates: &[CandidatePair], source: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if pair_present(candidates) {
+        Ok(())
+    } else {
+        Err(format!("exact candidate pair ({SITE}, {CLUSTER}) is absent from {source}: {candidates:?}").into())
+    }
+}
+
+/// Whether a candidate list contains the exact expected site and cluster.
+fn pair_present(candidates: &[CandidatePair]) -> bool {
+    candidates
+        .iter()
+        .any(|(site, cluster)| site == SITE && cluster == CLUSTER)
+}
+
+/// Parse and sort exact site/cluster pairs from one serving JSON document.
+fn candidate_pairs(config: &Value) -> Result<Vec<CandidatePair>, Box<dyn std::error::Error>> {
+    let items = config
+        .get("candidates")
+        .and_then(Value::as_array)
+        .ok_or("serving config has no candidates array")?;
+    let mut candidates = Vec::with_capacity(items.len());
+    for item in items {
+        let site = item
+            .get("site")
+            .and_then(Value::as_str)
+            .ok_or("serving candidate has no site")?;
+        let cluster = item
+            .get("cluster")
+            .and_then(Value::as_str)
+            .ok_or("serving candidate has no cluster")?;
+        candidates.push((site.to_owned(), cluster.to_owned()));
+    }
+    candidates.sort();
+    Ok(candidates)
+}
+
+/// Make a stable set for exact topology comparisons.
+fn candidate_set(candidates: &[CandidatePair]) -> BTreeSet<CandidatePair> {
+    candidates.iter().cloned().collect()
+}
+
+/// Require identical operator and mounted contents before using a serving revision.
+fn require_same_gateway_config(snapshot: &RuntimeSnapshot) -> Result<(), Box<dyn std::error::Error>> {
+    if gateway_config_values_match(
+        &snapshot.operator_digest,
+        &snapshot.operator_digest_annotation,
+        &snapshot.mounted_digest,
+        &snapshot.operator_config,
+        &snapshot.mounted_config,
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Gateway mount does not match operator config: operator={} mounted={}",
+            snapshot.operator_digest, snapshot.mounted_digest
+        )
+        .into())
+    }
+}
+
+/// Check that the mounted bytes and content-addressed revision match the current operator config.
+fn gateway_config_values_match(
+    operator_digest: &str,
+    annotation_digest: &str,
+    mounted_digest: &str,
+    operator_config: &str,
+    mounted_config: &str,
+) -> bool {
+    operator_digest == annotation_digest && operator_digest == mounted_digest && operator_config == mounted_config
+}
+
+/// Require a finite metric sample with one exact label set.
+fn required_metric(
+    text: &str,
+    name: &str,
+    labels: &[(&str, &str)],
+    description: &str,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let value = metric_sample(text, name, labels)
+        .ok_or_else(|| format!("required metric {name} {labels:?} for {description} is missing"))?
+        .1
+        .parse::<f64>()?;
+    if !value.is_finite() {
+        return Err(format!("required metric {name} for {description} is not finite: {value}").into());
+    }
+    Ok(value)
+}
+
+/// Require one operator series labeled for pool-B's exact provider identity.
+fn required_operator_sample(text: &str, name: &str, description: &str) -> Result<f64, Box<dyn std::error::Error>> {
+    required_metric(
+        text,
+        name,
+        &[("grid_site", SITE), ("grid_provider", CLUSTER)],
+        description,
+    )
+}
+
+/// Read an optional operator series labeled for pool-B's exact provider identity.
+fn optional_operator_sample(
+    text: &str,
+    name: &str,
+    description: &str,
+) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+    let Some((_, raw)) = metric_sample(text, name, &[("grid_site", SITE), ("grid_provider", CLUSTER)]) else {
+        return Ok(None);
+    };
+    let value = raw.parse::<f64>()?;
+    if !value.is_finite() {
+        return Err(format!("operator metric {name} for {description} is not finite: {value}").into());
+    }
+    Ok(Some(value))
+}
+
+/// Find one exact Prometheus metric sample matching every requested label.
+fn metric_sample<'metrics>(
+    text: &'metrics str,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<(&'metrics str, &'metrics str)> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let series = fields.next()?;
+        let metric_name = series.split('{').next()?;
+        if metric_name != name
+            || !labels
+                .iter()
+                .all(|(key, value)| series.contains(&format!("{key}=\"{value}\"")))
+        {
+            return None;
+        }
+        Some((series, fields.next()?))
+    })
+}
+
+/// Collect every numeric sample of one metric with the required labels.
+fn metric_values(text: &str, name: &str, labels: &[(&str, &str)]) -> Vec<f64> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let series = fields.next()?;
+            let metric_name = series.split('{').next()?;
+            if metric_name == name
+                && labels
+                    .iter()
+                    .all(|(key, value)| series.contains(&format!("{key}=\"{value}\"")))
+            {
+                fields.next()?.parse::<f64>().ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Select safe EPP lines for this pool and the metric families needed by the proof.
+fn relevant_epp_metric_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            !line.starts_with('#')
+                && (line.contains("name=\"pool-b\"") || line.contains("inference_pool=\"pool-b\""))
+                && (line.starts_with(RUNNING_METRIC)
+                    || line.starts_with(QUEUE_METRIC)
+                    || line.starts_with(READY_METRIC)
+                    || line.starts_with(PER_ENDPOINT_QUEUE_METRIC)
+                    || line.starts_with(HELD_QUEUE_METRIC)
+                    || line.starts_with(HELD_CAPACITY_METRIC))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Select operator lines for the exact remote provider without copying unrelated metrics.
+fn relevant_operator_metric_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            !line.starts_with('#')
+                && line.contains(&format!("grid_site=\"{SITE}\""))
+                && line.contains(&format!("grid_provider=\"{CLUSTER}\""))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Select serving reload and per-site ceiling series from live Gateway metrics.
+fn relevant_gateway_metric_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            !line.starts_with('#')
+                && (line.starts_with("grid_serving_config_reload_total")
+                    || line.starts_with("grid_route_site_")
+                    || line.starts_with("grid_route_snapshot_"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse one required unsigned serving-config field.
+fn required_unsigned(config: &Value, pointer: &str, name: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    config
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("serving config has no positive {name}").into())
+}
+
+/// Read one namespaced Kubernetes JSON object.
+fn kube_json(context: &str, verb: &str, resource: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args(["--context", context, "-n", GRID_SYSTEM_NS, verb, resource, "-o", "json"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl {verb} {resource}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// Hash one exact UTF-8 serving document using the operator's sha256 revision format.
+fn sha256_text(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+/// Convert a digest to a filesystem-safe suffix.
+fn safe_digest(digest: &str) -> String {
+    digest
+        .strip_prefix("sha256:")
+        .unwrap_or(digest)
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .collect()
+}
+
+/// Render a compact last-observation summary for timeout diagnostics.
+fn snapshot_summary(snapshot: &RuntimeSnapshot) -> String {
+    format!(
+        "revision={} rv={} mounted={} candidates={:?} running={} queue={} ready={} per_endpoint={:?} held={:?}/{} origin={} relay={:?} reloads={} ceiling={:?}/{:?} pod={}",
+        snapshot.operator_digest,
+        snapshot.operator_resource_version,
+        snapshot.mounted_digest,
+        snapshot.candidates,
+        snapshot.epp.running,
+        snapshot.epp.queue,
+        snapshot.epp.ready,
+        snapshot.epp.per_endpoint_queues,
+        snapshot.epp.held_queue_count,
+        snapshot.epp.held_capacity_utilization,
+        snapshot.origin_in_flight,
+        snapshot.local_in_flight,
+        snapshot.gateway_reloads,
+        snapshot.ceiling,
+        snapshot.ceiling_raw,
+        snapshot.gateway_uid
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        EppReadings, HELD_CAPACITY_METRIC, HIGH_RUNNING_REQUESTS, QUEUE_METRIC, READY_METRIC, RUN_EXCLUSION_LABEL,
+        RUNNING_METRIC, access_policy_json_patch, gateway_config_values_match, lifecycle_ceiling_sequence_valid,
+        local_relay_matches, metric_values, no_waiting_or_held_work, parse_epp_readings, policy_with_run_exclusion,
+        probe_failure_value, qualification_succeeded, returned_ceiling_is_valid, validate_response_attribution,
+    };
+
+    #[test]
+    fn pinned_epp_parser_requires_running_queue_readiness_per_unit_and_flow_control_observations() {
+        let text = format!(
+            "{RUNNING_METRIC}{{name=\"pool-b\"}} 20\n{QUEUE_METRIC}{{name=\"pool-b\"}} 0\n{READY_METRIC}{{name=\"pool-b\"}} 2\nllm_d_epp_per_endpoint_queue_size{{model_server_endpoint=\"vcr-1\",name=\"pool-b\"}} 0\nllm_d_epp_per_endpoint_queue_size{{model_server_endpoint=\"vcr-2\",name=\"pool-b\"}} 0\n{HELD_CAPACITY_METRIC}{{inference_pool=\"pool-b\",priority=\"0\"}} 0\n"
+        );
+        let parsed = parse_epp_readings(&text).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            (parsed.running - f64::from(HIGH_RUNNING_REQUESTS)).abs() < f64::EPSILON,
+            "running metric should preserve the pinned EPP value"
+        );
+        assert!(
+            parsed.queue.abs() < f64::EPSILON,
+            "average queue must be observed as zero"
+        );
+        assert!(
+            (parsed.ready - 2.0).abs() < f64::EPSILON,
+            "the ready endpoint count must be present"
+        );
+        assert_eq!(
+            parsed.per_endpoint_queues,
+            vec![0.0, 0.0],
+            "every endpoint queue must be observed"
+        );
+        assert!(
+            parsed.held_capacity_utilization.abs() < f64::EPSILON,
+            "flow-control capacity metric must prove there is no held work"
+        );
+        assert!(
+            parsed.held_queue_count.is_none(),
+            "an absent held-count series must remain unknown"
+        );
+        assert_eq!(
+            parsed.held_source, HELD_CAPACITY_METRIC,
+            "evidence should name the present held-work signal"
+        );
+    }
+
+    #[test]
+    fn pinned_epp_parser_does_not_treat_missing_held_observations_as_zero() {
+        let text = format!(
+            "{RUNNING_METRIC}{{name=\"pool-b\"}} 20\n{QUEUE_METRIC}{{name=\"pool-b\"}} 0\n{READY_METRIC}{{name=\"pool-b\"}} 2\nllm_d_epp_per_endpoint_queue_size{{model_server_endpoint=\"vcr-1\",name=\"pool-b\"}} 0\nllm_d_epp_per_endpoint_queue_size{{model_server_endpoint=\"vcr-2\",name=\"pool-b\"}} 0\n"
+        );
+        assert!(
+            parse_epp_readings(&text).is_err(),
+            "missing flow-control observation must fail closed"
+        );
+    }
+
+    #[test]
+    fn held_queue_metric_requires_exact_pool_labels() {
+        let text = "llm_d_epp_flow_control_queue_size{inference_pool=\"pool-b\",priority=\"0\"} 0\nllm_d_epp_flow_control_queue_size{inference_pool=\"pool-a\",priority=\"0\"} 3\n";
+        assert_eq!(
+            metric_values(
+                text,
+                "llm_d_epp_flow_control_queue_size",
+                &[("inference_pool", "pool-b")]
+            ),
+            vec![0.0]
+        );
+        assert_eq!(
+            metric_values(
+                text,
+                "llm_d_epp_flow_control_queue_size",
+                &[("inference_pool", "pool-a")]
+            ),
+            vec![3.0]
+        );
+        assert!(
+            metric_values(
+                text,
+                "llm_d_epp_flow_control_queue_size",
+                &[("inference_pool", "pool-c")]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn ceiling_learning_rejects_any_fractional_waiting_or_held_work() {
+        let clear = EppReadings {
+            running: 20.0,
+            queue: 0.0,
+            ready: 2.0,
+            per_endpoint_queues: vec![0.0, 0.0],
+            held_queue_count: Some(0.0),
+            held_source: "test".to_owned(),
+            held_capacity_utilization: 0.0,
+        };
+        assert!(
+            no_waiting_or_held_work(&clear),
+            "zero readings should permit ceiling learning"
+        );
+
+        let average_waiting = EppReadings {
+            queue: 0.5,
+            ..clear.clone()
+        };
+        assert!(
+            !no_waiting_or_held_work(&average_waiting),
+            "a fractional average queue still represents waiting work"
+        );
+
+        let endpoint_waiting = EppReadings {
+            per_endpoint_queues: vec![0.5, 0.0],
+            ..clear.clone()
+        };
+        assert!(
+            !no_waiting_or_held_work(&endpoint_waiting),
+            "a fractional per-endpoint queue still represents waiting work"
+        );
+
+        let held_queue = EppReadings {
+            held_queue_count: Some(0.5),
+            ..clear.clone()
+        };
+        assert!(
+            !no_waiting_or_held_work(&held_queue),
+            "a fractional held queue still represents held work"
+        );
+
+        let held_capacity = EppReadings {
+            held_capacity_utilization: f64::EPSILON,
+            ..clear
+        };
+        assert!(
+            !no_waiting_or_held_work(&held_capacity),
+            "nonzero held request capacity must not be treated as empty"
+        );
+    }
+
+    #[test]
+    fn restoration_errors_fail_the_proof_without_erasing_the_primary_result() {
+        assert!(
+            qualification_succeeded(true, &[]),
+            "proof and cleanup success should pass"
+        );
+        assert!(
+            !qualification_succeeded(false, &[]),
+            "successful cleanup must not turn a failed proof into a pass"
+        );
+        assert!(
+            !qualification_succeeded(true, &["policy restore failed".to_owned()]),
+            "a failed restoration must fail an otherwise passing proof"
+        );
+        assert!(
+            !qualification_succeeded(false, &["policy restore failed".to_owned()]),
+            "a restoration error must remain a failure when the primary proof also failed"
+        );
+    }
+
+    #[test]
+    fn excluded_policy_preserves_original_selectors_and_adds_one_run_label() {
+        let original = json!({
+            "siteSelector": {"matchLabels": {"provider-site": "pool-b"}},
+            "trustedDomains": ["pool-a.grid.internal"]
+        });
+        let excluded =
+            policy_with_run_exclusion(&original, "exclude-this-run").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            excluded.pointer("/siteSelector/matchLabels/provider-site"),
+            Some(&json!("pool-b")),
+            "the temporary selector should preserve the original site restriction"
+        );
+        let exclusion_value = excluded
+            .get("siteSelector")
+            .and_then(|value| value.as_object())
+            .and_then(|selector| selector.get("matchLabels"))
+            .and_then(|value| value.as_object())
+            .and_then(|labels| labels.get(RUN_EXCLUSION_LABEL));
+        assert_eq!(
+            exclusion_value,
+            Some(&json!("exclude-this-run")),
+            "the temporary selector should add its unique exclusion value"
+        );
+        assert_eq!(
+            excluded.get("trustedDomains"),
+            original.get("trustedDomains"),
+            "unrelated access policy fields must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn restoring_policy_replaces_the_complete_nested_object() {
+        let original = json!({"siteSelector": {"matchLabels": {"provider-site": "pool-b"}}});
+        let patch = access_policy_json_patch(&original);
+        let operation = patch.as_array().and_then(|operations| operations.first());
+        assert_eq!(
+            operation.and_then(|operation| operation.get("op")),
+            Some(&json!("replace")),
+            "restoration must replace, not merge, accessPolicy"
+        );
+        assert_eq!(
+            operation.and_then(|operation| operation.get("path")),
+            Some(&json!("/spec/accessPolicy")),
+            "the patch must target the exact policy field"
+        );
+        assert_eq!(
+            operation.and_then(|operation| operation.get("value")),
+            Some(&original),
+            "the replacement value must be the saved full policy"
+        );
+    }
+
+    #[test]
+    fn missing_local_relay_is_allowed_only_while_pair_is_absent() {
+        assert_eq!(
+            local_relay_matches(false, None, None, 40.0, 2.0),
+            Ok(true),
+            "an absent provider pair can stop publishing the local relay series"
+        );
+        assert!(
+            local_relay_matches(true, None, None, 40.0, 2.0).is_err(),
+            "a published pair requires both local relay metrics"
+        );
+        assert_eq!(
+            local_relay_matches(false, Some(4.0), Some(2.0), 4.0, 2.0),
+            Ok(true),
+            "an available absent-pair relay must still agree with the source"
+        );
+        assert_eq!(
+            local_relay_matches(false, Some(40.0), None, 4.0, 2.0),
+            Ok(false),
+            "an available stale relay value must not be accepted as the lower signal"
+        );
+    }
+
+    #[test]
+    fn four_state_sequence_accepts_clear_and_lower_relearning_but_rejects_retained_old_ceiling() {
+        assert!(lifecycle_ceiling_sequence_valid(40.0, 40.0, Some("NaN"), 8.0, 4.0));
+        assert!(!lifecycle_ceiling_sequence_valid(40.0, 40.0, Some("NaN"), 40.0, 4.0));
+        assert!(!lifecycle_ceiling_sequence_valid(40.0, 39.0, Some("NaN"), 8.0, 4.0));
+        assert!(!lifecycle_ceiling_sequence_valid(40.0, 40.0, None, 8.0, 4.0));
+        assert!(returned_ceiling_is_valid(40.0, 9.0, 8.0));
+        assert!(!returned_ceiling_is_valid(40.0, 40.0, 8.0));
+    }
+
+    #[test]
+    fn original_serving_baseline_requires_the_exact_annotated_config_in_the_gateway_mount() {
+        assert!(gateway_config_values_match(
+            "current", "current", "current", "same", "same"
+        ));
+        assert!(
+            !gateway_config_values_match("current", "current", "previous", "current bytes", "previous bytes"),
+            "a stale mounted overlay must remain unready until projection catches up"
+        );
+        assert!(
+            !gateway_config_values_match("current", "previous", "current", "same", "same"),
+            "the ConfigMap revision annotation must identify its serving content"
+        );
+        assert!(
+            !gateway_config_values_match("current", "current", "current", "operator bytes", "mount bytes"),
+            "equal digest labels must not hide different operator and mounted bytes"
+        );
+    }
+
+    #[test]
+    fn response_attribution_requires_grid_headers_and_trusted_provider_to_agree() {
+        let valid = super::SiteRouteResponse {
+            status: 200,
+            site: Some("pool-a".to_owned()),
+            backend: Some("llmd-pool-a-provider".to_owned()),
+            provider_site: Some("pool-a".to_owned()),
+            raw_header_names: vec!["x-grid-site".to_owned(), "x-grid-backend".to_owned()],
+        };
+        assert_eq!(
+            validate_response_attribution(&valid, Some("pool-a")),
+            Ok(()),
+            "the consistent route should pass attribution validation"
+        );
+        assert!(validate_response_attribution(&valid, Some("pool-b")).is_err());
+        let mut missing_backend = valid;
+        missing_backend.backend = None;
+        assert!(validate_response_attribution(&missing_backend, None).is_err());
+    }
+
+    #[test]
+    fn failed_http_responses_and_transport_errors_are_recorded_separately() {
+        let response = super::SiteRouteResponse {
+            status: 502,
+            site: Some("pool-b".to_owned()),
+            backend: Some("llmd-pool-b-provider".to_owned()),
+            provider_site: None,
+            raw_header_names: vec!["x-grid-site".to_owned(), "x-grid-backend".to_owned()],
+        };
+        let http_failure = probe_failure_value("idle", 19, Some("pool-b"), Some(&response), "expected HTTP 200");
+        assert_eq!(
+            http_failure.get("kind"),
+            Some(&json!("http_status")),
+            "an HTTP 502 is a response failure, not a transport failure"
+        );
+        assert_eq!(http_failure.get("status"), Some(&json!(502)));
+        assert_eq!(
+            http_failure.get("x_grid_backend"),
+            Some(&json!("llmd-pool-b-provider")),
+            "failed response attribution should be retained"
+        );
+
+        let transport_failure = probe_failure_value("idle", 20, Some("pool-b"), None, "curl timed out");
+        assert_eq!(
+            transport_failure.get("kind"),
+            Some(&json!("transport_error")),
+            "a failed curl request has no HTTP response"
+        );
+        assert_eq!(
+            transport_failure.get("status"),
+            Some(&json!(null)),
+            "transport failures should not be assigned an HTTP status"
+        );
+    }
+}
