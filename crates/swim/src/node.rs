@@ -15,7 +15,7 @@ use std::{
 };
 
 use crdt::GridStateSnapshot;
-use rand::{SeedableRng as _, rngs::SmallRng};
+use rand09::{SeedableRng as _, rngs::SmallRng};
 use tokio::sync::watch;
 
 use crate::{
