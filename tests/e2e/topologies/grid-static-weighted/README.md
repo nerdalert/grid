@@ -112,12 +112,10 @@ docker build -f overlay-sync/Containerfile -t "grid-overlay-sync:${IMAGE_TAG}" .
 docker build -f Containerfile -t "praxis-ai:${IMAGE_TAG}" .
 ```
 
-The standard `ghcr.io/praxis-proxy/ai:0.4.0` image predates empty versioned
-routing snapshots. It rejects the final-provider withdrawal revision and keeps
-serving the prior snapshot, so it cannot pass phase 4. Use AI 0.6.0 or a local
-Praxis build containing authoritative no-route overlay support; the
-qualification must remain failed while the configured image lacks that
-behavior.
+The standard `ghcr.io/praxis-proxy/ai:0.4.0` image is incompatible with Grid's
+authoritative empty versioned no-route snapshots. Use AI 0.6.0 or a Praxis build
+that supports them; the qualification must remain failed while the configured
+image lacks that support.
 
 Materialize the simulator and select the images explicitly. With
 `GRID_XTASK_IMAGE_PULL_POLICY=Never`, every selected image must be present in

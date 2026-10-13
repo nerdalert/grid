@@ -2899,6 +2899,20 @@ fn apply_static_weights(weights: [u32; 3]) -> Result<(), Box<dyn std::error::Err
 
 /// Read the original selector before temporarily withdrawing one provider.
 fn read_provider_selector(site: &str) -> Result<ProviderSelectorSnapshot, Box<dyn std::error::Error>> {
+    let value = read_provider_resource(site)?;
+    let selector = value
+        .pointer("/spec/siteSelector")
+        .filter(|selector| selector.is_object())
+        .cloned()
+        .ok_or_else(|| format!("{site}: provider has no object-valued spec.siteSelector"))?;
+    Ok(ProviderSelectorSnapshot {
+        site: site.to_owned(),
+        selector,
+    })
+}
+
+/// Read one provider resource for selector restoration evidence.
+fn read_provider_resource(site: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let context = cluster_context(site);
     let provider = provider_resource_name(site);
     let output = Command::new("kubectl")
@@ -2917,16 +2931,85 @@ fn read_provider_selector(site: &str) -> Result<ProviderSelectorSnapshot, Box<dy
     if !output.status.success() {
         return Err(format!("{site}: provider selector unavailable").into());
     }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let selector = value
-        .pointer("/spec/siteSelector")
-        .filter(|selector| selector.is_object())
-        .cloned()
-        .ok_or_else(|| format!("{site}: provider has no object-valued spec.siteSelector"))?;
-    Ok(ProviderSelectorSnapshot {
-        site: site.to_owned(),
-        selector,
-    })
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// Whether a provider has its saved selector and has reconciled its current generation.
+fn provider_selector_restored_and_reconciled(
+    resource: &serde_json::Value,
+    snapshot: &ProviderSelectorSnapshot,
+) -> bool {
+    let generation = resource
+        .pointer("/metadata/generation")
+        .and_then(serde_json::Value::as_i64);
+    let observed_generation = resource
+        .pointer("/status/observedGeneration")
+        .and_then(serde_json::Value::as_i64);
+    resource.pointer("/spec/siteSelector") == Some(&snapshot.selector)
+        && generation.is_some()
+        && generation == observed_generation
+}
+
+/// Whether restoration must publish a revision beyond the last observed withdrawal.
+fn restoration_requires_new_revision(last_withdrawal_revision: Option<&str>) -> bool {
+    last_withdrawal_revision.is_some()
+}
+
+/// Read and summarize one provider's selector restoration state.
+fn provider_selector_restoration_observation(snapshot: &ProviderSelectorSnapshot) -> (bool, serde_json::Value) {
+    match read_provider_resource(&snapshot.site) {
+        Ok(resource) => {
+            let generation = resource
+                .pointer("/metadata/generation")
+                .and_then(serde_json::Value::as_i64);
+            let observed_generation = resource
+                .pointer("/status/observedGeneration")
+                .and_then(serde_json::Value::as_i64);
+            let selector_matches = resource.pointer("/spec/siteSelector") == Some(&snapshot.selector);
+            let reconciled = provider_selector_restored_and_reconciled(&resource, snapshot);
+            (
+                reconciled,
+                serde_json::json!({
+                    "selector_matches": selector_matches,
+                    "generation": generation,
+                    "observed_generation": observed_generation,
+                    "reconciled": reconciled,
+                }),
+            )
+        },
+        Err(error) => (
+            false,
+            serde_json::json!({ "read_error": safe_truncate_str(&error.to_string(), 300) }),
+        ),
+    }
+}
+
+/// Wait until every restored provider selector has been reconciled by its controller.
+fn wait_for_provider_selector_restoration(
+    snapshots: &[ProviderSelectorSnapshot],
+    timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut all_restored = true;
+        let mut observations = BTreeMap::new();
+        for snapshot in snapshots {
+            let (restored, observation) = provider_selector_restoration_observation(snapshot);
+            all_restored &= restored;
+            observations.insert(snapshot.site.clone(), observation);
+        }
+        let last_observation = serde_json::json!(observations);
+        if all_restored {
+            return Ok(last_observation);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "provider selectors did not return to their saved values at the observed generation: {last_observation}"
+            )
+            .into());
+        }
+        std::thread::park_timeout(Duration::from_secs(2));
+    }
 }
 
 /// Replace one provider's selector, restoring it from the saved full object later.
@@ -3504,10 +3587,10 @@ fn overlay_provider_sites(overlay: &OverlayData) -> BTreeSet<String> {
         .collect()
 }
 
-/// Wait for a new semantic overlay revision with the expected site set, stable twice.
+/// Wait for the expected stable site set, requiring a changed revision when one is provided.
 fn wait_for_weighted_candidate_sites(
     expected_sites: &BTreeSet<String>,
-    previous_revision: &str,
+    previous_revision: Option<&str>,
     timeout: Duration,
 ) -> Result<OverlayData, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
@@ -3518,7 +3601,7 @@ fn wait_for_weighted_candidate_sites(
             let sites = overlay_provider_sites(&overlay);
             last_observation = format!("revision={}, sites={sites:?}", overlay.semantic_revision);
             let observation = (overlay.semantic_revision.clone(), sites.clone());
-            if sites == *expected_sites && observation.0 != previous_revision {
+            if sites == *expected_sites && previous_revision.is_none_or(|revision| observation.0 != revision) {
                 if previous_observation.as_ref() == Some(&observation) {
                     return Ok(overlay);
                 }
@@ -3568,6 +3651,8 @@ fn assert_static_weighted_withdrawal() -> AssertionResult {
     let mut facts = BTreeMap::new();
     let mut selectors = Vec::new();
     let mut lifecycle_result = Ok(());
+    let mut withdrawal_patch_attempted = false;
+    let mut last_observed_withdrawal_revision = None;
     let expected_sites = BTreeSet::from([
         "provider-a".to_owned(),
         "provider-b".to_owned(),
@@ -3636,6 +3721,7 @@ fn assert_static_weighted_withdrawal() -> AssertionResult {
         let mut withdrawal_observations = Vec::new();
         for snapshot in &selectors {
             let selector = excluded_provider_selector(snapshot)?;
+            withdrawal_patch_attempted = true;
             patch_provider_selector(snapshot, &selector)?;
             remaining_sites.remove(&snapshot.site);
             withdrawal_observations.push(serde_json::json!({
@@ -3649,17 +3735,25 @@ fn assert_static_weighted_withdrawal() -> AssertionResult {
                 "withdrawal_revisions".to_owned(),
                 serde_json::Value::Array(withdrawal_observations.clone()),
             );
-            let overlay =
-                wait_for_weighted_candidate_sites(&remaining_sites, &previous_revision, Duration::from_secs(180))?;
+            let overlay = wait_for_weighted_candidate_sites(
+                &remaining_sites,
+                Some(previous_revision.as_str()),
+                Duration::from_secs(180),
+            )?;
             let observation = withdrawal_observations
                 .last_mut()
                 .ok_or("withdrawal observation disappeared")?;
             observation["published_at_unix_seconds"] = serde_json::json!(format_utc_timestamp());
             observation["semantic_revision"] = serde_json::json!(overlay.semantic_revision.clone());
             observation["candidate_sites"] = serde_json::json!(overlay_provider_sites(&overlay));
+            last_observed_withdrawal_revision = Some(overlay.semantic_revision.clone());
             facts.insert(
                 "withdrawal_revisions".to_owned(),
                 serde_json::Value::Array(withdrawal_observations.clone()),
+            );
+            facts.insert(
+                "last_observed_withdrawal_revision".to_owned(),
+                serde_json::json!(last_observed_withdrawal_revision),
             );
             previous_revision.clone_from(&overlay.semantic_revision);
         }
@@ -3719,7 +3813,7 @@ fn assert_static_weighted_withdrawal() -> AssertionResult {
         patch_provider_selector(provider_a, &provider_a.selector)?;
         let one_provider_revision = wait_for_weighted_candidate_sites(
             &BTreeSet::from(["provider-a".to_owned()]),
-            &empty.semantic_revision,
+            Some(empty.semantic_revision.as_str()),
             Duration::from_secs(180),
         )?;
         let (one_provider_accepted, one_provider_serving, _) =
@@ -3757,13 +3851,41 @@ fn assert_static_weighted_withdrawal() -> AssertionResult {
         }
     }
     facts.insert(
+        "withdrawal_patch_attempted".to_owned(),
+        serde_json::json!(withdrawal_patch_attempted),
+    );
+    facts.insert(
+        "last_observed_withdrawal_revision".to_owned(),
+        serde_json::json!(last_observed_withdrawal_revision),
+    );
+    facts.insert(
         "selector_restoration_errors".to_owned(),
         serde_json::json!(restoration_errors),
     );
     if restoration_errors.is_empty() && !selectors.is_empty() {
-        match wait_for_weighted_candidate_sites(&expected_sites, "", Duration::from_secs(180)) {
+        match wait_for_provider_selector_restoration(&selectors, Duration::from_secs(180)) {
+            Ok(selector_evidence) => {
+                facts.insert("provider_selector_restoration".to_owned(), selector_evidence);
+            },
+            Err(error) => restoration_errors.push(format!("provider selectors did not reconcile: {error}")),
+        }
+    }
+    if restoration_errors.is_empty() && !selectors.is_empty() {
+        let previous_revision = last_observed_withdrawal_revision.as_deref();
+        let revision_requirement = restoration_requires_new_revision(previous_revision);
+        facts.insert(
+            "restoration_requires_new_revision".to_owned(),
+            serde_json::json!(revision_requirement),
+        );
+        match wait_for_weighted_candidate_sites(&expected_sites, previous_revision, Duration::from_secs(180)) {
             Ok(overlay) => {
                 let revision = overlay.semantic_revision.clone();
+                match wait_for_mounted_overlay_revision(&revision, Duration::from_secs(90)) {
+                    Ok(mounted) => {
+                        facts.insert("restored_overlay_mounted".to_owned(), serde_json::json!(mounted));
+                    },
+                    Err(error) => restoration_errors.push(format!("restored overlay was not mounted: {error}")),
+                }
                 match wait_for_stable_revision(&revision) {
                     Ok((accepted, serving, stable_observations)) => {
                         facts.insert(
@@ -3821,7 +3943,8 @@ mod static_phase_policy_tests {
     use super::{
         ProviderSelectorSnapshot, capacity_publication_diagnostic, excluded_provider_selector,
         latest_overlay_reload_rejection, parse_local_crdt_capacity, parse_mounted_overlay,
-        phase_requires_revision_change, provider_activity_unchanged, provider_resource_name, sum_counter_samples,
+        phase_requires_revision_change, provider_activity_unchanged, provider_resource_name,
+        provider_selector_restored_and_reconciled, restoration_requires_new_revision, sum_counter_samples,
     };
 
     #[test]
@@ -3837,6 +3960,53 @@ mod static_phase_policy_tests {
         assert_eq!(
             provider_resource_name("vcr-provider-a-provider"),
             "vcr-provider-a-provider"
+        );
+    }
+
+    #[test]
+    fn restoration_requires_revision_only_after_withdrawal_was_observed() {
+        assert!(
+            restoration_requires_new_revision(Some("withdrawal-revision")),
+            "an observed withdrawal revision must be followed by a restoration revision"
+        );
+        assert!(
+            !restoration_requires_new_revision(None),
+            "an attempted but unobserved withdrawal must not require semantic revision churn"
+        );
+    }
+
+    #[test]
+    fn provider_selector_restoration_requires_saved_selector_and_observed_generation() {
+        let snapshot = ProviderSelectorSnapshot {
+            site: "provider-a".to_owned(),
+            selector: serde_json::json!({"matchLabels": {"site": "provider-a"}}),
+        };
+        let restored_resource = |generation, observed_generation, selector: &serde_json::Value| {
+            serde_json::json!({
+                "metadata": {"generation": generation},
+                "spec": {"siteSelector": selector},
+                "status": {"observedGeneration": observed_generation}
+            })
+        };
+        let restored = restored_resource(7, 7, &snapshot.selector);
+        let unreconciled = restored_resource(8, 7, &snapshot.selector);
+        let wrong_selector = serde_json::json!({
+            "metadata": {"generation": 7},
+            "spec": {"siteSelector": {"matchLabels": {"site": "withdrawn"}}},
+            "status": {"observedGeneration": 7}
+        });
+
+        assert!(
+            provider_selector_restored_and_reconciled(&restored, &snapshot),
+            "the saved selector is restored and the controller observed the current generation"
+        );
+        assert!(
+            !provider_selector_restored_and_reconciled(&unreconciled, &snapshot),
+            "the selector is not ready while its current generation is unobserved"
+        );
+        assert!(
+            !provider_selector_restored_and_reconciled(&wrong_selector, &snapshot),
+            "a reconciled but different selector is not restored state"
         );
     }
 
