@@ -32,6 +32,29 @@ const WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS: usize = 32;
 const WEIGHTED_ROUTE_SHARE_TOLERANCE: f64 = 0.15;
 /// `grid_site_route` clamps a two-site weighted share to this range.
 const TWO_SITE_SHARE_RANGE: (f64, f64) = (0.1, 0.9);
+/// Provider identity retained while pool-a's EPP signal expires.
+const POOL_A_PROVIDER: &str = "llmd-pool-a-provider";
+/// Gateway gauges that a measured refresh owns and must clear when its reading disappears.
+const MEASURED_SITE_GAUGES: [&str; 8] = [
+    "grid_route_site_ceiling",
+    "grid_route_site_ceiling_soft",
+    "grid_route_site_ceiling_hard",
+    "grid_route_site_rho_reported",
+    "grid_route_site_rho_counted",
+    "grid_route_site_in_flight",
+    "grid_route_site_full",
+    "grid_route_site_reading_age_seconds",
+];
+/// Live gauges required before testing the stale-signal cleanup path.
+const ACTIVE_SIGNAL_GAUGES: [&str; 3] = [
+    "grid_route_site_in_flight",
+    "grid_route_site_full",
+    "grid_route_site_reading_age_seconds",
+];
+/// Site and cluster identity in the Gateway's serving topology.
+type ServingCandidatePair = (String, String);
+/// Parsed site/cluster pairs from the operator-generated serving configuration.
+type ServingCandidatePairsResult = Result<BTreeSet<ServingCandidatePair>, Box<dyn std::error::Error>>;
 /// Process-wide request counter so separate routing samples never reuse a session identifier.
 static SITE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -544,6 +567,18 @@ fn run(
         format!("Grid Gateway pod UID remained {gateway_uid}; its serving-config reload count stayed unchanged"),
     );
 
+    let metrics_before_signal_loss = read_gateway_metrics(gateway_metrics_port)?;
+    let active_site_metrics = require_active_signal_gauges(&metrics_before_signal_loss, "pool-a", POOL_A_PROVIDER)?;
+    if !serving_candidate_pairs(&local_context)?.contains(&("pool-a".to_owned(), POOL_A_PROVIDER.to_owned())) {
+        return Err("pool-a provider is absent before the stale-signal gauge proof".into());
+    }
+    record(
+        observations,
+        format!(
+            "Grid Gateway had live pool-a in-flight, full, and reading-age gauges before EPP signal removal: {active_site_metrics}"
+        ),
+    );
+
     let peer_polls_before_loss = metric_counter(
         &read_operator_metrics(operator_metrics_port)?,
         "grid_peer_poll_total",
@@ -573,6 +608,11 @@ fn run(
             "pool-a EPP signal became stale while successful SWIM-era peer polling continued ({peer_polls_before_loss} -> {peer_polls_after_loss})"
         ),
     );
+    if !serving_candidate_pairs(&local_context)?.contains(&("pool-a".to_owned(), POOL_A_PROVIDER.to_owned())) {
+        return Err(
+            "pool-a provider left the serving topology before stale-signal gauge cleanup could be verified".into(),
+        );
+    }
     wait_for_site_distribution(gateway_http_port, "pool-b", attribution, Duration::from_secs(90)).map(
         |distribution| {
             record(
@@ -581,6 +621,18 @@ fn run(
             );
         },
     )?;
+    let cleared_site_metrics = wait_for_measured_site_gauges_cleared(
+        gateway_metrics_port,
+        "pool-a",
+        POOL_A_PROVIDER,
+        Duration::from_secs(90),
+    )?;
+    record(
+        observations,
+        format!(
+            "Grid Gateway cleared every measured pool-a gauge while its provider remained in serving topology: {cleared_site_metrics}"
+        ),
+    );
 
     scale_epp("pool-a", 1)?;
     set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
@@ -1415,6 +1467,94 @@ fn wait_for_grid_serving_snapshot(timeout: Duration) -> Result<String, Box<dyn s
         }
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+/// Read the exact site/cluster pairs still published to the Grid Gateway.
+fn serving_candidate_pairs(context: &str) -> ServingCandidatePairsResult {
+    let serving_config =
+        get_configmap_data_key(context, GRID_SYSTEM_NS, GRID_SERVING_CONFIGMAP, "serving-config.json")?;
+    let snapshot: serde_json::Value = serde_json::from_str(&serving_config)?;
+    let candidates = snapshot
+        .pointer("/candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("Grid Gateway serving configuration has no candidate array")?;
+    let mut pairs = BTreeSet::new();
+    for candidate in candidates {
+        let site = candidate
+            .get("site")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Grid Gateway serving candidate has no site")?;
+        let cluster = candidate
+            .get("cluster")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Grid Gateway serving candidate has no cluster")?;
+        pairs.insert((site.to_owned(), cluster.to_owned()));
+    }
+    Ok(pairs)
+}
+
+/// Require the deployed Gateway to expose the metrics produced by an active EPP reading.
+fn require_active_signal_gauges(
+    metrics: &str,
+    site: &str,
+    cluster: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut values = Vec::with_capacity(ACTIVE_SIGNAL_GAUGES.len());
+    for name in ACTIVE_SIGNAL_GAUGES {
+        let value = sample_value(metrics, name, &[("site", site), ("cluster", cluster)])
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| format!("Grid Gateway has no finite {name} gauge for ({site}, {cluster})"))?;
+        values.push(format!("{name}={value:.3}"));
+    }
+    Ok(values.join(", "))
+}
+
+/// Require NaN samples for every measured gauge after a candidate's EPP reading disappears.
+fn measured_site_gauges_are_cleared(metrics: &str, site: &str, cluster: &str) -> bool {
+    MEASURED_SITE_GAUGES.iter().all(|name| {
+        sample_value(metrics, name, &[("site", site), ("cluster", cluster)]).is_some_and(|value| !value.is_finite())
+    })
+}
+
+/// Render all measured gauge samples for timeout diagnostics and qualification evidence.
+fn measured_site_gauge_summary(metrics: &str, site: &str, cluster: &str) -> String {
+    MEASURED_SITE_GAUGES
+        .iter()
+        .map(|name| {
+            format!(
+                "{name}={:?}",
+                sample_value(metrics, name, &[("site", site), ("cluster", cluster)])
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Wait for every measured gauge to clear while the candidate remains published.
+fn wait_for_measured_site_gauges_cleared(
+    port: u16,
+    site: &str,
+    cluster: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::from("Gateway metrics unavailable");
+    while Instant::now() < deadline {
+        match read_gateway_metrics(port) {
+            Ok(metrics) => {
+                last = measured_site_gauge_summary(&metrics, site, cluster);
+                if measured_site_gauges_are_cleared(&metrics, site, cluster) {
+                    return Ok(last);
+                }
+            },
+            Err(error) => last = error.to_string(),
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    Err(format!(
+        "timed out waiting for Grid Gateway measured gauges to clear for ({site}, {cluster}); last values: {last}"
+    )
+    .into())
 }
 
 /// Whether one serving peer is exactly the Gateway's local operator mTLS poll target.
@@ -2476,7 +2616,8 @@ pub(super) fn metric_counter(text: &str, name: &str, labels: &[(&str, &str)]) ->
 #[cfg(test)]
 mod serving_peer_tests {
     use super::{
-        applied_gateway_reload_count_from_text, is_expected_local_operator_peer, reused_gateway_config_count_from_text,
+        MEASURED_SITE_GAUGES, POOL_A_PROVIDER, applied_gateway_reload_count_from_text, is_expected_local_operator_peer,
+        measured_site_gauges_are_cleared, require_active_signal_gauges, reused_gateway_config_count_from_text,
     };
 
     #[test]
@@ -2534,6 +2675,61 @@ mod serving_peer_tests {
         assert!((applied_gateway_reload_count_from_text(metrics) - 2.0).abs() < f64::EPSILON);
         assert!((reused_gateway_config_count_from_text(metrics) - 3.0).abs() < f64::EPSILON);
         assert!(reused_gateway_config_count_from_text("").abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fresh_signal_exposes_finite_full_and_reading_age_gauges() {
+        let metrics = "grid_route_site_in_flight{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 9\n\
+                       grid_route_site_full{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0\n\
+                       grid_route_site_reading_age_seconds{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 1\n";
+        assert!(
+            require_active_signal_gauges(metrics, "pool-a", POOL_A_PROVIDER).is_ok(),
+            "the active Gateway sample should expose finite in-flight, full, and reading-age gauges"
+        );
+        assert!(
+            require_active_signal_gauges(
+                &metrics.replace(
+                    "grid_route_site_full{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0",
+                    "grid_route_site_full{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} NaN"
+                ),
+                "pool-a",
+                POOL_A_PROVIDER
+            )
+            .is_err(),
+            "a non-finite full gauge must not count as an active signal reading"
+        );
+    }
+
+    #[test]
+    fn stale_signal_clearing_requires_all_eight_measured_gauges_to_be_nan() {
+        let cleared = MEASURED_SITE_GAUGES
+            .iter()
+            .map(|name| format!("{name}{{site=\"pool-a\",cluster=\"{POOL_A_PROVIDER}\"}} NaN"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            measured_site_gauges_are_cleared(&cleared, "pool-a", POOL_A_PROVIDER),
+            "every measured gauge should have an explicit NaN sample after the signal disappears"
+        );
+        let stale = cleared.replace(
+            "grid_route_site_reading_age_seconds{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} NaN",
+            "grid_route_site_reading_age_seconds{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 4",
+        );
+        assert!(
+            !measured_site_gauges_are_cleared(&stale, "pool-a", POOL_A_PROVIDER),
+            "a stale reading-age gauge must fail the cleanup proof"
+        );
+        assert!(
+            !measured_site_gauges_are_cleared(
+                &cleared.replace(
+                    "grid_route_site_full{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} NaN\n",
+                    ""
+                ),
+                "pool-a",
+                POOL_A_PROVIDER
+            ),
+            "a missing measured gauge must not pass as a cleared gauge"
+        );
     }
 }
 

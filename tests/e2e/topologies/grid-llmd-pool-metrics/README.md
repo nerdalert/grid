@@ -155,7 +155,9 @@ by this topology. For local development, set
 - Full-mode local EPP publication, operator-to-operator mTLS polling, and
   Gateway polling of its local operator
 - Live cross-site pressure selection, stale-signal handling, recovery, and
-  wrong-peer-identity rejection
+  wrong-peer-identity rejection; when a provider's EPP signal disappears but
+  its serving pair remains published, all eight measured Gateway gauges must
+  clear, including `full` and `reading_age_seconds`
 - Full-mode network partition with both sites' operators and the Gateway
   running, traffic probes during loss, stale remote-route exclusion, and
   reconvergence after the run-owned network link is restored
