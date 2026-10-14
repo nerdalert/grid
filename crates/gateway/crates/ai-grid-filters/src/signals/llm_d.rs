@@ -34,7 +34,7 @@ const KV_METRICS: [&str; 2] = [
 ];
 
 /// The deviation across the pool's units, the cheap bound on one hot unit behind a low mean.
-const KV_SPREAD_METRIC: &str = "llm_d_epp_stddev_kv_cache_utilization";
+const KV_SPREAD_METRIC: &str = "llm_d_epp_std_dev_kv_cache_utilization";
 
 /// Requests the EPP's flow control holds before scheduling: in flight, and a backlog. One
 /// series per priority and fairness partition, summed at each instant.
@@ -555,7 +555,7 @@ mod tests {
             store.ingest_at(
                 &format!(
                     "llm_d_epp_average_kv_cache_utilization{{{labels}}} {mean} {at}\n\
-                     llm_d_epp_stddev_kv_cache_utilization{{{labels}}} {spread} {at}"
+                     llm_d_epp_std_dev_kv_cache_utilization{{{labels}}} {spread} {at}"
                 ),
                 at,
                 at,

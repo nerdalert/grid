@@ -1375,7 +1375,7 @@ const PEER_SIGNAL_NAMES: [&str; 19] = [
     "llm_d_epp_average_kv_cache_utilization",
     // The deviation across a pool's units, which a gateway reads beside the mean. Without it
     // a remote site is routed from the mean alone and one hot unit stays hidden behind it.
-    "llm_d_epp_stddev_kv_cache_utilization",
+    "llm_d_epp_std_dev_kv_cache_utilization",
     "llm_d_epp_ready_endpoints",
     "inference_pool_ready_pods",
     // What a gateway reads as a backlog beside the averages, and the per-unit series whose
@@ -1397,7 +1397,7 @@ const UNIT_SIGNALS: [&str; 5] = [
     // read as a hundred times saturated.
     "llm_d_epp_average_kv_cache_utilization",
     "inference_pool_average_kv_cache_utilization",
-    "llm_d_epp_stddev_kv_cache_utilization",
+    "llm_d_epp_std_dev_kv_cache_utilization",
 ];
 
 /// Whether a hub accepts the value: finite, non-negative, and at most one for a share.
@@ -3220,5 +3220,22 @@ q{pool=\"d\"} 0.35
                 "{name} is a share the gateway refuses above one, but a hub accepts any value"
             );
         }
+    }
+
+    #[test]
+    fn llm_d_kv_cache_spread_is_relayed_as_a_bounded_share() {
+        let spread = peer_sample("llm_d_epp_std_dev_kv_cache_utilization", "pool-b", 0.71);
+        assert_eq!(
+            refusal(&spread),
+            None,
+            "the pinned EPP spread series must be accepted and relayed to remote gateways"
+        );
+
+        let invalid_spread = peer_sample("llm_d_epp_std_dev_kv_cache_utilization", "pool-b", 1.01);
+        assert_eq!(
+            refusal(&invalid_spread),
+            Some("value"),
+            "the KV-cache spread is a normalized share and must stay within one"
+        );
     }
 }
