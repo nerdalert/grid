@@ -25,6 +25,7 @@ use std::{
 };
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 mod cross_site;
 mod learned_ceiling;
@@ -111,8 +112,8 @@ const RECOVERY_QUEUE_THRESHOLD: f64 = 3.0;
 
 /// Deterministic simulator Deployments representing the pool endpoints.
 const SIMULATOR_DEPLOYMENTS: &[&str] = &["vcr-1", "vcr-2"];
-/// Persistent simulator ConfigMap containing startup fake metrics.
-const SIMULATOR_CONFIGMAP: &str = "vcr-1-config";
+/// Persistent simulator ConfigMaps keyed by their Deployment.
+const SIMULATOR_CONFIGMAPS: &[(&str, &str)] = &[("vcr-1", "vcr-1-config"), ("vcr-2", "vcr-2-config")];
 /// Pod template annotation for the simulator's queue metric.
 const SIMULATOR_WAITING_REQUESTS_ANNOTATION: &str = "grid.praxis.fast/fake-waiting-requests";
 /// Pod template annotation for the simulator's running-request metric.
@@ -1434,12 +1435,49 @@ fn set_simulator_fake_metrics(
     kv_cache_usage: f64,
     mtls: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = kind_context(cluster);
-    let config = simulator_config(waiting_requests, running_requests, kv_cache_usage);
-    kubectl::apply_manifest(&ctx, &config)
-        .map_err(|e| format!("apply persistent simulator config on {cluster}: {e}"))?;
+    set_simulator_fake_metrics_with_endpoint_kv(
+        cluster,
+        waiting_requests,
+        running_requests,
+        kv_cache_usage,
+        kv_cache_usage,
+        mtls,
+    )
+}
 
-    for deployment in SIMULATOR_DEPLOYMENTS {
+/// Persist pool metrics with a distinct KV-cache value on each run-owned endpoint.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the queue, running load, and each endpoint's cache value describe the stimulus directly"
+)]
+fn set_simulator_fake_metrics_with_endpoint_kv(
+    cluster: &str,
+    waiting_requests: u32,
+    running_requests: u32,
+    vcr1_kv_cache_usage: f64,
+    vcr2_kv_cache_usage: f64,
+    mtls: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    for (deployment, configmap) in SIMULATOR_CONFIGMAPS {
+        let kv_cache_usage = match *deployment {
+            "vcr-1" => vcr1_kv_cache_usage,
+            "vcr-2" => vcr2_kv_cache_usage,
+            _ => return Err(format!("no KV-cache stimulus was specified for {deployment}").into()),
+        };
+        kubectl::apply_manifest(
+            &ctx,
+            &simulator_config(configmap, waiting_requests, running_requests, kv_cache_usage),
+        )
+        .map_err(|e| format!("apply persistent simulator configmap/{configmap} on {cluster}: {e}"))?;
+    }
+
+    for (deployment, configmap) in SIMULATOR_CONFIGMAPS {
+        let kv_cache_usage = match *deployment {
+            "vcr-1" => vcr1_kv_cache_usage,
+            "vcr-2" => vcr2_kv_cache_usage,
+            _ => return Err(format!("no KV-cache stimulus was specified for {deployment}").into()),
+        };
         let before = deployment_generation(&ctx, deployment)?;
         let patch = serde_json::json!({
             "spec": {
@@ -1479,23 +1517,38 @@ fn set_simulator_fake_metrics(
         }
         kubectl::wait_for_rollout_ns(&ctx, deployment, GRID_SYSTEM_NS, cluster)
             .map_err(|e| format!("wait for simulator deployment/{deployment} rollout: {e}"))?;
+
+        let expected_config = simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
+        let config_text = get_configmap_data_key(&ctx, GRID_SYSTEM_NS, configmap, "config.yaml").map_err(|error| {
+            format!("could not read configmap/{configmap} on {cluster} after applying the simulator metrics: {error}")
+        })?;
+        if config_text != expected_config {
+            let expected_digest = hex::encode(Sha256::digest(expected_config.as_bytes()));
+            let actual_digest = hex::encode(Sha256::digest(config_text.as_bytes()));
+            return Err(format!(
+                "configmap/{configmap} on {cluster} does not contain its requested simulator metrics (expected {} bytes sha256={expected_digest}; found {} bytes sha256={actual_digest})",
+                expected_config.len(),
+                config_text.len(),
+            )
+            .into());
+        }
     }
 
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     while Instant::now() < deadline {
-        let config_text = get_configmap_data_key(&ctx, GRID_SYSTEM_NS, SIMULATOR_CONFIGMAP, "config.yaml");
-        if config_text.as_deref().is_ok_and(|text| {
-            text.contains(&format!("waiting-requests: {waiting_requests}"))
-                && text.contains(&format!("running-requests: {running_requests}"))
-        }) && kubectl_exec_epp_metrics(cluster, mtls)
+        if kubectl_exec_epp_metrics(cluster, mtls)
             .ok()
             .and_then(|text| parse_required_epp_metrics(&text).ok())
             .is_some_and(|metrics| {
+                let expected_kv_cache = (vcr1_kv_cache_usage + vcr2_kv_cache_usage) / 2.0;
                 (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
-                    && (metrics.kv_cache - kv_cache_usage).abs() < f64::EPSILON
+                    && (metrics.kv_cache - expected_kv_cache).abs() < f64::EPSILON
             })
         {
-            eprintln!("  [OK] {cluster}: simulator waiting-requests={waiting_requests} is live in EPP metrics");
+            eprintln!(
+                "  [OK] {cluster}: simulator waiting-requests={waiting_requests}, KV-cache mean={:.3} is live in EPP metrics",
+                (vcr1_kv_cache_usage + vcr2_kv_cache_usage) / 2.0,
+            );
             return Ok(());
         }
         std::thread::sleep(DATA_PLANE_INTERVAL);
@@ -1503,10 +1556,22 @@ fn set_simulator_fake_metrics(
     Err(format!("{cluster}: simulator did not expose waiting-requests={waiting_requests} within timeout").into())
 }
 
-/// Render the complete simulator startup configuration for a queue value.
-fn simulator_config(waiting_requests: u32, running_requests: u32, kv_cache_usage: f64) -> String {
+/// Render the complete simulator ConfigMap for the requested fake metrics.
+fn simulator_config(configmap: &str, waiting_requests: u32, running_requests: u32, kv_cache_usage: f64) -> String {
+    let config_data = simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
+    let config_data_block = config_data
+        .lines()
+        .map(|line| format!("    {line}\n"))
+        .collect::<String>();
     format!(
-        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {SIMULATOR_CONFIGMAP}\n  namespace: {GRID_SYSTEM_NS}\ndata:\n  config.yaml: |\n    port: 8000\n    model: {VCR_MODEL}\n    served-model-name: [{VCR_MODEL}]\n    mode: echo\n    fake-metrics:\n      waiting-requests: {waiting_requests}\n      running-requests: {running_requests}\n      kv-cache-usage: {kv_cache_usage}\n"
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {configmap}\n  namespace: {GRID_SYSTEM_NS}\ndata:\n  config.yaml: |\n{config_data_block}"
+    )
+}
+
+/// Render the simulator's `config.yaml` ConfigMap value for fake metrics.
+fn simulator_config_data(waiting_requests: u32, running_requests: u32, kv_cache_usage: f64) -> String {
+    format!(
+        "port: 8000\nmodel: {VCR_MODEL}\nserved-model-name: [{VCR_MODEL}]\nmode: echo\nfake-metrics:\n  waiting-requests: {waiting_requests}\n  running-requests: {running_requests}\n  kv-cache-usage: {kv_cache_usage}\n"
     )
 }
 
@@ -4465,8 +4530,9 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
     #[test]
     fn simulator_config_persists_zero_queue_value() {
-        let config = simulator_config(0, 0, 0.0);
+        let config = simulator_config("vcr-1-config", 0, 0, 0.0);
         assert!(config.contains("fake-metrics:"));
+        assert!(config.contains("name: vcr-1-config"));
         assert!(config.contains("waiting-requests: 0"));
         assert!(config.contains("running-requests: 0"));
         assert!(config.contains("kv-cache-usage: 0"));
@@ -4474,15 +4540,49 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
     #[test]
     fn simulator_config_persists_pressure_queue_value() {
-        let config = simulator_config(9, 0, 0.0);
+        let config = simulator_config("vcr-2-config", 9, 0, 0.0);
+        assert!(config.contains("name: vcr-2-config"));
         assert!(config.contains("waiting-requests: 9"));
         assert!(!config.contains("pressure-generator"));
     }
 
     #[test]
+    fn simulator_config_supports_distinct_endpoint_kv_cache_values() {
+        let high_endpoint = simulator_config("vcr-1-config", 1, 8, 1.0);
+        let low_endpoint = simulator_config("vcr-2-config", 1, 8, 0.0);
+
+        assert!(high_endpoint.contains("name: vcr-1-config"));
+        assert!(high_endpoint.contains("waiting-requests: 1"));
+        assert!(high_endpoint.contains("running-requests: 8"));
+        assert!(high_endpoint.contains("kv-cache-usage: 1"));
+        assert!(low_endpoint.contains("name: vcr-2-config"));
+        assert!(low_endpoint.contains("waiting-requests: 1"));
+        assert!(low_endpoint.contains("running-requests: 8"));
+        assert!(low_endpoint.contains("kv-cache-usage: 0"));
+    }
+
+    #[test]
+    fn simulator_config_data_matches_the_manifest_block_value() {
+        let waiting_requests = 1;
+        let running_requests = 8;
+        let kv_cache_usage = 1.0;
+        let config = simulator_config("vcr-1-config", waiting_requests, running_requests, kv_cache_usage);
+        let config_data = simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
+        let indented_config_data = config_data
+            .lines()
+            .map(|line| format!("    {line}\n"))
+            .collect::<String>();
+
+        assert!(
+            config.ends_with(&format!("data:\n  config.yaml: |\n{indented_config_data}")),
+            "the readback value should be rendered from the same simulator configuration data"
+        );
+    }
+
+    #[test]
     fn kv_cache_pressure_sets_only_the_selected_signal() {
         let (queue, kv_cache) = simulator_metrics(9, ScoringFlavor::KvCachePressure);
-        let config = simulator_config(queue, 0, kv_cache);
+        let config = simulator_config("vcr-1-config", queue, 0, kv_cache);
         assert!(config.contains("waiting-requests: 0"));
         assert!(config.contains("kv-cache-usage: 0.95"));
     }
