@@ -1078,7 +1078,7 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
                 epp_a.queue_size
             );
             let probe_ctx = kind_context("pool-a");
-            match send_inference_request(&probe_ctx, VCR_MODEL) {
+            match send_inference_request(&probe_ctx, VCR_MODEL, "baseline") {
                 Ok(resp) => {
                     if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
                         let epp_b =
@@ -1232,7 +1232,7 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
             );
             eprintln!("  [FAILOVER] Pool B is now preferred; sending verification request");
             let probe_ctx = kind_context("pool-a");
-            match send_inference_request(&probe_ctx, VCR_MODEL) {
+            match send_inference_request(&probe_ctx, VCR_MODEL, "failover") {
                 Ok(resp) => {
                     last_route = if resp.provider_gateway.contains("pool-b") {
                         "pool-b".to_owned()
@@ -1357,7 +1357,7 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
                 epp_a.queue_size, epp_a.kv_cache
             );
             let probe_ctx = kind_context("pool-a");
-            match send_inference_request(&probe_ctx, VCR_MODEL) {
+            match send_inference_request(&probe_ctx, VCR_MODEL, "recovery") {
                 Ok(resp) => {
                     last_route = if resp.provider_gateway.contains("pool-a") {
                         "pool-a".to_owned()
@@ -1986,7 +1986,11 @@ fn print_live_table_row(row: &LiveTableRow<'_>) {
 // ---------------------------------------------------------------------------
 
 /// Send an inference request and capture gateway attribution headers.
-fn send_inference_request(kube_context: &str, model: &str) -> Result<InferenceResponse, Box<dyn std::error::Error>> {
+fn send_inference_request(
+    kube_context: &str,
+    model: &str,
+    phase: &str,
+) -> Result<InferenceResponse, Box<dyn std::error::Error>> {
     let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"test"}}]}}"#,);
     let session_id = format!("probe-{}", format_utc_timestamp());
     let curl_cmd = format!(
@@ -2006,31 +2010,85 @@ fn send_inference_request(kube_context: &str, model: &str) -> Result<InferenceRe
          printf '\\nCURL_STDERR_END\\n'
          exit 0",
     );
-    let raw = kubectl_exec_curl_raw(kube_context, &curl_cmd)
-        .map_err(|error| format!("inference probe session={session_id} failed to run curl: {error}"))?;
-    let probe = parse_curl_probe_output(&raw)?;
-    if probe.status != 200 || probe.curl_exit_code != 0 {
-        let response = if probe.status == 0 {
-            "no HTTP response (HTTP status 000)".to_owned()
+    let raw = kubectl_exec_curl_raw(kube_context, &curl_cmd).map_err(|error| {
+        format!(
+            "inference probe command failed: phase={phase}; observed_at={}; request_id={session_id}; {error}",
+            format_utc_iso()
+        )
+    })?;
+    let probe = parse_curl_probe_output(&raw.stdout).map_err(|error| {
+        format!(
+            "inference probe output could not be parsed: {}",
+            curl_probe_diagnostics(
+                phase,
+                &format_utc_iso(),
+                &session_id,
+                None,
+                None,
+                &format!("kubectl stderr: {}; raw stdout: {:?}", raw.stderr, raw.stdout),
+                &error.to_string(),
+            )
+        )
+    })?;
+    if probe.status != 200 {
+        let reason = if probe.status == 0 {
+            "no HTTP response (HTTP status 000)"
         } else {
-            format!("HTTP {}", probe.status)
+            "unexpected HTTP response"
         };
         return Err(format!(
-            "inference request failed: {response}; session_id={session_id}; curl_exit_code={}; curl_stderr={:?}",
-            probe.curl_exit_code, probe.curl_stderr
+            "inference probe failed: {}",
+            curl_probe_diagnostics(
+                phase,
+                &format_utc_iso(),
+                &session_id,
+                Some(probe.status),
+                Some(probe.curl_exit_code),
+                &probe.curl_stderr,
+                reason,
+            )
         )
         .into());
     }
     if probe.provider_gateway.is_empty() || probe.demo_attribution.is_empty() {
         return Err(format!(
-            "missing attribution headers in HTTP 200 response; session_id={session_id}; curl_exit_code={}; curl_stderr={:?}",
-            probe.curl_exit_code, probe.curl_stderr
+            "inference probe failed: {}",
+            curl_probe_diagnostics(
+                phase,
+                &format_utc_iso(),
+                &session_id,
+                Some(probe.status),
+                Some(probe.curl_exit_code),
+                &probe.curl_stderr,
+                "missing attribution headers in HTTP 200 response",
+            )
         )
         .into());
     }
     Ok(InferenceResponse {
         provider_gateway: probe.provider_gateway,
         demo_attribution: probe.demo_attribution,
+    })
+}
+
+/// Format the diagnostic context for one rejected inference probe without affecting acceptance.
+fn curl_probe_diagnostics(
+    phase: &str,
+    observed_at: &str,
+    request_id: &str,
+    http_status: Option<u16>,
+    curl_exit_code: Option<i32>,
+    curl_stderr: &str,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "phase": phase,
+        "observed_at": observed_at,
+        "request_id": request_id,
+        "http_status": http_status.map(|status| format!("{status:03}")),
+        "curl_exit_code": curl_exit_code,
+        "curl_stderr": curl_stderr,
+        "reason": reason,
     })
 }
 
@@ -2042,7 +2100,8 @@ fn parse_curl_probe_output(raw: &str) -> Result<CurlProbeOutput, Box<dyn std::er
     let (curl_stderr, trailing_output) = stderr_block
         .split_once("\nCURL_STDERR_END")
         .ok_or_else(|| std::io::Error::other("curl probe output omitted the stderr terminator"))?;
-    if !trailing_output.trim().is_empty() {
+    let trailing_output = trailing_output.trim();
+    if !trailing_output.is_empty() && !is_kubectl_curl_probe_cleanup_notice(trailing_output) {
         return Err(std::io::Error::other("curl probe output had unexpected trailing data").into());
     }
 
@@ -2074,6 +2133,16 @@ fn parse_curl_probe_output(raw: &str) -> Result<CurlProbeOutput, Box<dyn std::er
             .ok_or_else(|| std::io::Error::other("curl probe output omitted the curl exit code"))?,
         curl_stderr: curl_stderr.to_owned(),
     })
+}
+
+/// Recognize the line kubectl prints after deleting a successful `run --rm` pod.
+fn is_kubectl_curl_probe_cleanup_notice(line: &str) -> bool {
+    const PREFIX: &str = "pod \"curl-probe-";
+    const SUFFIX: &str = "\" deleted from grid-system namespace";
+
+    line.strip_prefix(PREFIX)
+        .and_then(|name| name.strip_suffix(SUFFIX))
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Fetch EPP metrics.
@@ -2131,7 +2200,12 @@ fn kubectl_exec_epp_metrics(cluster: &str, mtls: bool) -> Result<String, Box<dyn
 }
 
 /// Run an arbitrary command via `kubectl run` in a temporary pod.
-fn kubectl_exec_curl_raw(kube_context: &str, cmd: &str) -> Result<String, Box<dyn std::error::Error>> {
+struct KubectlCurlOutput {
+    stdout: String,
+    stderr: String,
+}
+
+fn kubectl_exec_curl_raw(kube_context: &str, cmd: &str) -> Result<KubectlCurlOutput, Box<dyn std::error::Error>> {
     let pod_name = format!("curl-probe-{}", &format_utc_timestamp()[9..15]);
     let output = Command::new("kubectl")
         .args([
@@ -2160,7 +2234,10 @@ fn kubectl_exec_curl_raw(kube_context: &str, cmd: &str) -> Result<String, Box<dy
         )
         .into());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(KubectlCurlOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
 }
 
 /// Extract a specific data key from a ConfigMap as raw text.
@@ -4347,7 +4424,7 @@ fn proof_tls_routing() -> ProofResult {
 
     // Send an inference request and verify attribution
     let probe_ctx = kind_context("pool-a");
-    match send_inference_request(&probe_ctx, VCR_MODEL) {
+    match send_inference_request(&probe_ctx, VCR_MODEL, "tls-routing") {
         Ok(resp) => {
             observations.push(format!(
                 "routing attribution: gateway={} provider={}",
@@ -4387,7 +4464,7 @@ mod tests {
     #[test]
     fn curl_probe_output_preserves_no_response_transport_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
         let output = parse_curl_probe_output(
-            "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\n",
+            "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\npod \"curl-probe-050906\" deleted from grid-system namespace\n",
         )?;
 
         assert_eq!(output.status, 0);
@@ -4396,6 +4473,47 @@ mod tests {
         assert!(output.provider_gateway.is_empty());
         assert!(output.demo_attribution.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn curl_probe_output_rejects_unrecognized_trailing_data() {
+        assert!(
+            parse_curl_probe_output(
+                "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\nunexpected output\n",
+            )
+            .err()
+            .is_some_and(|error| error.to_string().contains("unexpected trailing data")),
+            "unrecognized kubectl output must not be accepted as curl data"
+        );
+    }
+
+    #[test]
+    fn curl_probe_failure_report_keeps_phase_timestamp_exit_code_and_stderr() {
+        let report = curl_probe_diagnostics(
+            "network-partition-traffic",
+            "2026-10-15T04:28:27Z",
+            "grid-poll-0-1",
+            Some(0),
+            Some(28),
+            "curl: (28) Operation timed out\n",
+            "curl returned a transport failure or HTTP status 000",
+        );
+
+        assert_eq!(
+            report.get("phase"),
+            Some(&serde_json::json!("network-partition-traffic"))
+        );
+        assert_eq!(
+            report.get("observed_at"),
+            Some(&serde_json::json!("2026-10-15T04:28:27Z"))
+        );
+        assert_eq!(report.get("request_id"), Some(&serde_json::json!("grid-poll-0-1")));
+        assert_eq!(report.get("http_status"), Some(&serde_json::json!("000")));
+        assert_eq!(report.get("curl_exit_code"), Some(&serde_json::json!(28)));
+        assert_eq!(
+            report.get("curl_stderr"),
+            Some(&serde_json::json!("curl: (28) Operation timed out\n"))
+        );
     }
 
     #[test]

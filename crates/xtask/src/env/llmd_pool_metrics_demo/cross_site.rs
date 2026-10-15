@@ -18,8 +18,8 @@ use super::{
     CLUSTERS, CONSUMER_TLS_SECRET, DemoContext, GRID_NETWORK_NAME, GRID_SERVING_CONFIGMAP, GRID_SERVING_GATEWAY,
     GRID_SERVING_GATEWAY_PORT, GRID_SERVING_METRICS_PORT, GRID_SERVING_SITE, GRID_SYSTEM_NS, MetricsTransport,
     OPERATOR_METRICS_PORT, OVERLAY_CONFIGMAP, PROVIDER_GATEWAY_PORT, PortForwardGuard, ProofResult, VCR_MODEL,
-    find_free_port, format_utc_iso, get_configmap_data_key, kind_context, kubectl, run_cluster_prefix,
-    set_simulator_waiting_requests, split_image_reference,
+    curl_probe_diagnostics, find_free_port, format_utc_iso, get_configmap_data_key, kind_context, kubectl,
+    run_cluster_prefix, set_simulator_waiting_requests, split_image_reference,
 };
 
 /// One live peer is sufficient for the two-site topology used by this proof.
@@ -534,6 +534,7 @@ fn run(
         gateway_http_port,
         gateway_metrics_port,
         "pool-a",
+        "lower-pressure-baseline",
         attribution,
         Duration::from_secs(120),
     )
@@ -548,6 +549,7 @@ fn run(
         gateway_http_port,
         gateway_metrics_port,
         "pool-b",
+        "live-pressure-shift",
         attribution,
         Duration::from_secs(120),
     )
@@ -613,14 +615,19 @@ fn run(
             "pool-a provider left the serving topology before stale-signal gauge cleanup could be verified".into(),
         );
     }
-    wait_for_site_distribution(gateway_http_port, "pool-b", attribution, Duration::from_secs(90)).map(
-        |distribution| {
-            record(
-                observations,
-                format!("stale pool-a signal excluded while connectedSites={connected_sites}: {distribution}"),
-            );
-        },
-    )?;
+    wait_for_site_distribution(
+        gateway_http_port,
+        "pool-b",
+        "stale-pool-a-signal-exclusion",
+        attribution,
+        Duration::from_secs(90),
+    )
+    .map(|distribution| {
+        record(
+            observations,
+            format!("stale pool-a signal excluded while connectedSites={connected_sites}: {distribution}"),
+        );
+    })?;
     let cleared_site_metrics = wait_for_measured_site_gauges_cleared(
         gateway_metrics_port,
         "pool-a",
@@ -642,6 +649,7 @@ fn run(
         gateway_http_port,
         gateway_metrics_port,
         "pool-a",
+        "signal-and-route-recovery",
         attribution,
         Duration::from_secs(120),
     )
@@ -658,6 +666,7 @@ fn run(
         gateway_http_port,
         gateway_metrics_port,
         "pool-a",
+        "pre-pin-pressure-baseline",
         attribution,
         Duration::from_secs(120),
     )?;
@@ -803,8 +812,13 @@ fn run(
         // Always execute the original routing assertion, even when the signal
         // ordering precondition failed. This preserves routing evidence while
         // still failing the proof below if the stimulus was insufficient.
-        let wrong_pin_route =
-            wait_for_site_distribution(gateway_http_port, "pool-a", attribution, Duration::from_secs(30));
+        let wrong_pin_route = wait_for_site_distribution(
+            gateway_http_port,
+            "pool-a",
+            "wrong-peer-pin-routing",
+            attribution,
+            Duration::from_secs(30),
+        );
         if let Ok(distribution) = &wrong_pin_route {
             record(
                 observations,
@@ -892,6 +906,7 @@ fn run(
         gateway_http_port,
         gateway_metrics_port,
         "pool-b",
+        "restored-peer-identity-routing",
         attribution,
         Duration::from_secs(120),
     )
@@ -1008,6 +1023,7 @@ fn prove_network_partition(
         gateway_port,
         gateway_metrics_port,
         "pool-b",
+        "network-partition-precondition",
         attribution,
         Duration::from_secs(120),
     )?;
@@ -1078,6 +1094,7 @@ fn prove_network_partition(
         gateway_port,
         gateway_metrics_port,
         "pool-b",
+        "network-partition-recovery",
         attribution,
         Duration::from_secs(120),
     )?;
@@ -1114,23 +1131,24 @@ fn wait_for_partition_degradation(
 
     while Instant::now() < deadline {
         attempts += 1;
-        let request_observation = match send_site_request_with_timeout(gateway_port, sequence, 5) {
-            Ok(response) => {
-                attribution.observe(&response);
-                *statuses.entry(response.status).or_insert(0_usize) += 1;
-                if let Some(site) = response.provider_site.as_ref().or(response.site.as_ref()) {
-                    *attributed_sites.entry(site.clone()).or_insert(0_usize) += 1;
-                }
-                format!(
-                    "partition traffic HTTP {}, site={:?}, backend={:?}, provider_gateway_site={:?}",
-                    response.status, response.site, response.backend, response.provider_site
-                )
-            },
-            Err(error) => {
-                transport_errors += 1;
-                format!("partition traffic request error: {error}")
-            },
-        };
+        let request_observation =
+            match send_site_request_with_timeout(gateway_port, sequence, "network-partition-traffic", 5) {
+                Ok(response) => {
+                    attribution.observe(&response);
+                    *statuses.entry(response.status).or_insert(0_usize) += 1;
+                    if let Some(site) = response.provider_site.as_ref().or(response.site.as_ref()) {
+                        *attributed_sites.entry(site.clone()).or_insert(0_usize) += 1;
+                    }
+                    format!(
+                        "partition traffic HTTP {}, site={:?}, backend={:?}, provider_gateway_site={:?}",
+                        response.status, response.site, response.backend, response.provider_site
+                    )
+                },
+                Err(error) => {
+                    transport_errors += 1;
+                    format!("partition traffic request error: {error}")
+                },
+            };
         sequence += 1;
         if last_request_observation.as_deref() != Some(request_observation.as_str()) {
             record(observations, request_observation.clone());
@@ -1153,14 +1171,19 @@ fn wait_for_partition_degradation(
                     "partition traffic summary: attempts={attempts}, transport_errors={transport_errors}, HTTP statuses={statuses:?}, attributed sites={attributed_sites:?}"
                 ),
             );
-            wait_for_site_distribution(gateway_port, GRID_SERVING_SITE, attribution, Duration::from_secs(60)).map(
-                |distribution| {
-                    record(
-                        observations,
-                        format!("remote site was excluded while the network remained partitioned: {distribution}"),
-                    );
-                },
-            )?;
+            wait_for_site_distribution(
+                gateway_port,
+                GRID_SERVING_SITE,
+                "network-partition-remote-site-exclusion",
+                attribution,
+                Duration::from_secs(60),
+            )
+            .map(|distribution| {
+                record(
+                    observations,
+                    format!("remote site was excluded while the network remained partitioned: {distribution}"),
+                );
+            })?;
             return Ok(());
         }
         std::thread::sleep(Duration::from_secs(2));
@@ -1786,10 +1809,11 @@ fn verify_weighted_site_distribution(
     gateway_port: u16,
     metrics_port: u16,
     expected_site: &str,
+    phase: &str,
     attribution: &mut RoutingAttributionDiagnostics,
     timeout: Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let warmup = route_distribution(gateway_port, 1, attribution)?;
+    let warmup = route_distribution(gateway_port, 1, phase, attribution)?;
     if warmup.sites.values().sum::<usize>() != 1 {
         return Err(format!("weighted route warmup did not return one attributed response: {warmup}").into());
     }
@@ -1869,7 +1893,7 @@ fn verify_weighted_site_distribution(
                         let batch_requests = requests_remaining.min(WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS);
                         let before_metrics = read_gateway_metrics(metrics_port)?;
                         let before_batch = weighted_route_metrics(&before_metrics, expected_site)?;
-                        let batch = route_distribution(gateway_port, batch_requests, attribution)?;
+                        let batch = route_distribution(gateway_port, batch_requests, phase, attribution)?;
                         distribution.merge(batch);
                         let current_metrics = read_gateway_metrics(metrics_port)?;
                         let after_batch = weighted_route_metrics(&current_metrics, expected_site)?;
@@ -2067,6 +2091,7 @@ fn weighted_route_expected_share(windows: &[(usize, f64, f64)]) -> Result<f64, S
 fn wait_for_site_distribution(
     port: u16,
     expected_site: &str,
+    phase: &str,
     attribution: &mut RoutingAttributionDiagnostics,
     timeout: Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -2075,7 +2100,7 @@ fn wait_for_site_distribution(
     let deadline = Instant::now() + timeout;
     let mut last = RouteDistribution::default();
     while Instant::now() < deadline {
-        last = route_distribution(port, REQUESTS, attribution)?;
+        last = route_distribution(port, REQUESTS, phase, attribution)?;
         if last.proves_site(expected_site, REQUIRED) {
             return Ok(last.to_string());
         }
@@ -2443,11 +2468,12 @@ impl std::fmt::Display for RoutingAttributionDiagnostics {
 fn route_distribution(
     port: u16,
     requests: usize,
+    phase: &str,
     attribution: &mut RoutingAttributionDiagnostics,
 ) -> Result<RouteDistribution, Box<dyn std::error::Error>> {
     let mut distribution = RouteDistribution::default();
     for sequence in 0..requests {
-        let response = send_site_request(port, sequence)?;
+        let response = send_site_request(port, sequence, phase)?;
         attribution.observe(&response);
         if response.status != 200 {
             return Err(format!("Grid Gateway request returned HTTP {}", response.status).into());
@@ -2472,14 +2498,19 @@ pub(super) struct SiteRouteResponse {
 }
 
 /// Send one sessionless inference request to the local Grid Gateway listener.
-pub(super) fn send_site_request(port: u16, sequence: usize) -> Result<SiteRouteResponse, Box<dyn std::error::Error>> {
-    send_site_request_with_timeout(port, sequence, 15)
+pub(super) fn send_site_request(
+    port: u16,
+    sequence: usize,
+    phase: &str,
+) -> Result<SiteRouteResponse, Box<dyn std::error::Error>> {
+    send_site_request_with_timeout(port, sequence, phase, 15)
 }
 
 /// Send one request with a bounded timeout for traffic that runs during a partition.
 fn send_site_request_with_timeout(
     port: u16,
     sequence: usize,
+    phase: &str,
     timeout_secs: u8,
 ) -> Result<SiteRouteResponse, Box<dyn std::error::Error>> {
     let timeout = timeout_secs.to_string();
@@ -2511,16 +2542,40 @@ fn send_site_request_with_timeout(
             "--data",
             &body.to_string(),
         ])
-        .output()?;
-    if !output.status.success() {
+        .output()
+        .map_err(|error| {
+            format!(
+                "Grid Gateway inference probe failed: {}",
+                curl_probe_diagnostics(
+                    phase,
+                    &format_utc_iso(),
+                    &request_id,
+                    None,
+                    None,
+                    "",
+                    &format!("could not start curl: {error}"),
+                )
+            )
+        })?;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let response = parse_site_route_response(&text);
+    if !output.status.success() || response.status == 0 {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         return Err(format!(
-            "curl request through Grid Gateway failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "Grid Gateway inference probe failed: {}",
+            curl_probe_diagnostics(
+                phase,
+                &format_utc_iso(),
+                &request_id,
+                Some(response.status),
+                output.status.code(),
+                &stderr,
+                "curl returned a transport failure or HTTP status 000",
+            )
         )
         .into());
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_site_route_response(&text))
+    Ok(response)
 }
 
 /// Generate a session and prompt identifier that is unique across every sample in this process.

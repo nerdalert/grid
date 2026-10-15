@@ -2587,7 +2587,7 @@ fn send_probe(
     probe_failures: &mut Vec<Value>,
 ) -> Result<SiteRouteResponse, Box<dyn std::error::Error>> {
     let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let response = match send_site_request(port, sequence) {
+    let response = match send_site_request(port, sequence, phase) {
         Ok(response) => response,
         Err(error) => {
             let failure = probe_failure_value(phase, sequence, expected_site, None, &error.to_string());
