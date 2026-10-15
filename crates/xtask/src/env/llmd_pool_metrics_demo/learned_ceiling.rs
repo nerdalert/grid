@@ -4149,7 +4149,16 @@ fn wait_for_restored_topology(
                     && original_signals_restored(&snapshot, original);
                 if stable {
                     let response =
-                        send_probe(forwards.gateway_http, None, "restoration-serving-probe", probe_failures)?;
+                        match send_probe(forwards.gateway_http, None, "restoration-serving-probe", probe_failures) {
+                            Ok(response) => response,
+                            Err(error) => {
+                                last = format!("restoration serving probe failed: {error}");
+                                stable_since = None;
+                                stable_samples = 0;
+                                std::thread::sleep(POLL);
+                                continue;
+                            },
+                        };
                     let post_request = observe_runtime(context, forwards)?;
                     if post_request.gateway_uid == original.baseline.gateway_uid
                         && candidate_set(&post_request.candidates) == expected
