@@ -534,6 +534,7 @@ fn run(
         gateway_http_port,
         gateway_metrics_port,
         "pool-a",
+        false,
         "lower-pressure-baseline",
         attribution,
         Duration::from_secs(120),
@@ -549,6 +550,7 @@ fn run(
         gateway_http_port,
         gateway_metrics_port,
         "pool-b",
+        true,
         "live-pressure-shift",
         attribution,
         Duration::from_secs(120),
@@ -649,6 +651,7 @@ fn run(
         gateway_http_port,
         gateway_metrics_port,
         "pool-a",
+        true,
         "signal-and-route-recovery",
         attribution,
         Duration::from_secs(120),
@@ -666,6 +669,7 @@ fn run(
         gateway_http_port,
         gateway_metrics_port,
         "pool-a",
+        true,
         "pre-pin-pressure-baseline",
         attribution,
         Duration::from_secs(120),
@@ -906,6 +910,7 @@ fn run(
         gateway_http_port,
         gateway_metrics_port,
         "pool-b",
+        true,
         "restored-peer-identity-routing",
         attribution,
         Duration::from_secs(120),
@@ -1023,6 +1028,7 @@ fn prove_network_partition(
         gateway_port,
         gateway_metrics_port,
         "pool-b",
+        true,
         "network-partition-precondition",
         attribution,
         Duration::from_secs(120),
@@ -1094,6 +1100,7 @@ fn prove_network_partition(
         gateway_port,
         gateway_metrics_port,
         "pool-b",
+        true,
         "network-partition-recovery",
         attribution,
         Duration::from_secs(120),
@@ -1809,6 +1816,7 @@ fn verify_weighted_site_distribution(
     gateway_port: u16,
     metrics_port: u16,
     expected_site: &str,
+    require_strict_score_preference: bool,
     phase: &str,
     attribution: &mut RoutingAttributionDiagnostics,
     timeout: Duration,
@@ -1824,9 +1832,9 @@ fn verify_weighted_site_distribution(
     let mut stable_samples = 0_u32;
     let mut pre_sample_retries = 0_u32;
     while Instant::now() < deadline {
-        match read_gateway_metrics(metrics_port)
-            .and_then(|metrics| weighted_route_metrics(&metrics, expected_site).map_err(Into::into))
-        {
+        match read_gateway_metrics(metrics_port).and_then(|metrics| {
+            weighted_route_metrics(&metrics, expected_site, require_strict_score_preference).map_err(Into::into)
+        }) {
             Ok(current) => {
                 last = format!(
                     "expected site score={:.3}, weight={:.3}, rho={:.6}, weighted share={:.1}%; other site score={:.3}, weight={:.3}, rho={:.6}",
@@ -1847,8 +1855,9 @@ fn verify_weighted_site_distribution(
                 if stable_samples >= 2 {
                     let before_snapshot: Result<_, Box<dyn std::error::Error>> = read_gateway_metrics(metrics_port)
                         .and_then(|metrics| {
-                            let state = weighted_route_metrics(&metrics, expected_site)
-                                .map_err(Box::<dyn std::error::Error>::from)?;
+                            let state =
+                                weighted_route_metrics(&metrics, expected_site, require_strict_score_preference)
+                                    .map_err(Box::<dyn std::error::Error>::from)?;
                             let counts =
                                 route_selection_counts(&metrics).map_err(Box::<dyn std::error::Error>::from)?;
                             Ok((state, counts))
@@ -1892,11 +1901,13 @@ fn verify_weighted_site_distribution(
                     while requests_remaining > 0 {
                         let batch_requests = requests_remaining.min(WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS);
                         let before_metrics = read_gateway_metrics(metrics_port)?;
-                        let before_batch = weighted_route_metrics(&before_metrics, expected_site)?;
+                        let before_batch =
+                            weighted_route_metrics(&before_metrics, expected_site, require_strict_score_preference)?;
                         let batch = route_distribution(gateway_port, batch_requests, phase, attribution)?;
                         distribution.merge(batch);
                         let current_metrics = read_gateway_metrics(metrics_port)?;
-                        let after_batch = weighted_route_metrics(&current_metrics, expected_site)?;
+                        let after_batch =
+                            weighted_route_metrics(&current_metrics, expected_site, require_strict_score_preference)?;
                         expected_share_windows.push((
                             batch_requests,
                             before_batch.preferred_share,
@@ -1970,7 +1981,11 @@ fn verify_weighted_site_distribution(
 }
 
 /// Read the expected two-site selection share from the Gateway's current route snapshot metrics.
-fn weighted_route_metrics(metrics: &str, preferred_site: &str) -> Result<WeightedRouteMetrics, String> {
+fn weighted_route_metrics(
+    metrics: &str,
+    preferred_site: &str,
+    require_strict_score_preference: bool,
+) -> Result<WeightedRouteMetrics, String> {
     let other_site = match preferred_site {
         "pool-a" => "pool-b",
         "pool-b" => "pool-a",
@@ -1997,9 +2012,19 @@ fn weighted_route_metrics(metrics: &str, preferred_site: &str) -> Result<Weighte
     };
     let (preferred_score, preferred_weight, preferred_rho) = pair(preferred_site)?;
     let (other_score, other_weight, other_rho) = pair(other_site)?;
-    if preferred_score > other_score {
+    let score_order_invalid = if require_strict_score_preference {
+        preferred_score >= other_score
+    } else {
+        preferred_score > other_score
+    };
+    if score_order_invalid {
+        let relation = if require_strict_score_preference {
+            "is not strictly lower than"
+        } else {
+            "is higher than"
+        };
         return Err(format!(
-            "Gateway route score does not prefer {preferred_site}: score={preferred_score}, other site {other_site} score={other_score}"
+            "Gateway route score for {preferred_site} {relation} the other site: score={preferred_score}, {other_site} score={other_score}"
         ));
     }
     if preferred_weight <= 0.0 || other_weight <= 0.0 || preferred_rho < 0.0 || other_rho < 0.0 {
@@ -3021,7 +3046,7 @@ mod tests {
                        grid_route_site_weight{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 18\n\
                        grid_route_site_rho{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0.9999842224617964\n";
 
-        let route = weighted_route_metrics(metrics, "pool-a");
+        let route = weighted_route_metrics(metrics, "pool-a", true);
 
         assert!(route.is_ok(), "both sites must expose complete Gateway route metrics");
         let route = route.unwrap_or_else(|_| std::process::abort());
@@ -3048,7 +3073,7 @@ mod tests {
                        grid_route_site_weight{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 18\n\
                        grid_route_site_rho{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0.5\n";
 
-        let route = weighted_route_metrics(metrics, "pool-a");
+        let route = weighted_route_metrics(metrics, "pool-a", false);
 
         assert!(
             route.is_ok(),
@@ -3062,6 +3087,24 @@ mod tests {
     }
 
     #[test]
+    fn signal_recovery_requires_a_strictly_lower_site_score() {
+        let metrics = r#"grid_route_site_score{site="pool-a",cluster="llmd-pool-a-provider"} 0
+grid_route_site_weight{site="pool-a",cluster="llmd-pool-a-provider"} 8
+grid_route_site_rho{site="pool-a",cluster="llmd-pool-a-provider"} 0
+grid_route_site_score{site="pool-b",cluster="llmd-pool-b-provider"} 0
+grid_route_site_weight{site="pool-b",cluster="llmd-pool-b-provider"} 18
+grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0.5
+"#;
+
+        let route = weighted_route_metrics(metrics, "pool-a", true);
+
+        assert!(
+            route.is_err_and(|error| error.contains("is not strictly lower")),
+            "a tied score must not satisfy the recovery preference assertion"
+        );
+    }
+
+    #[test]
     fn missing_weighted_route_metric_reports_the_current_site_gauges() {
         let metrics = "grid_route_site_score{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0\n\
                        grid_route_site_weight{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 8\n\
@@ -3069,7 +3112,7 @@ mod tests {
                        grid_route_site_score{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 9\n\
                        grid_route_site_weight{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 18\n\
                        grid_route_site_rho{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0.5\n";
-        let Err(error) = weighted_route_metrics(metrics, "pool-a") else {
+        let Err(error) = weighted_route_metrics(metrics, "pool-a", false) else {
             std::process::abort();
         };
 
@@ -3089,7 +3132,7 @@ mod tests {
                        grid_route_site_rho{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0\n";
 
         assert!(
-            weighted_route_metrics(metrics, "pool-a").is_err(),
+            weighted_route_metrics(metrics, "pool-a", false).is_err(),
             "the test must fail while Gateway metrics prefer the opposite pressure order"
         );
     }

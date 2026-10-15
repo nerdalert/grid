@@ -1547,7 +1547,10 @@ fn set_simulator_fake_metrics_with_endpoint_kv(
         }
     }
 
-    let expected_endpoints = wait_for_simulator_service_endpoints(&ctx)?;
+    let ready_replicas = wait_for_simulator_service_endpoints(&ctx)?;
+    let expected_endpoints = ready_replicas.total().map_err(std::io::Error::other)?;
+    let expected_kv_cache = simulator_kv_cache_mean(vcr1_kv_cache_usage, vcr2_kv_cache_usage, ready_replicas)
+        .map_err(std::io::Error::other)?;
     let expected_endpoint_metric = u32::try_from(expected_endpoints).map(f64::from).map_err(|error| {
         std::io::Error::other(format!(
             "simulator endpoint count exceeds EPP metric precision: {error}"
@@ -1559,11 +1562,10 @@ fn set_simulator_fake_metrics_with_endpoint_kv(
         match kubectl_exec_epp_metrics(cluster, mtls) {
             Ok(text) => match parse_required_epp_metrics(&text) {
                 Ok(metrics) => {
-                    let expected_kv_cache = (vcr1_kv_cache_usage + vcr2_kv_cache_usage) / 2.0;
                     let observed_endpoints = first_prom_value(&text, EPP_READY_METRICS);
                     last_observed = format!(
-                        "queue-size={}, KV-cache mean={}, ready endpoints={observed_endpoints:?}",
-                        metrics.queue_size, metrics.kv_cache
+                        "queue-size={}, KV-cache mean={}, ready endpoints={observed_endpoints:?}, per-deployment ready replicas={ready_replicas:?}",
+                        metrics.queue_size, metrics.kv_cache,
                     );
                     if (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
                         && (metrics.kv_cache - expected_kv_cache).abs() < KV_CACHE_METRIC_TOLERANCE
@@ -1571,7 +1573,8 @@ fn set_simulator_fake_metrics_with_endpoint_kv(
                             .is_some_and(|ready| (ready - expected_endpoint_metric).abs() < f64::EPSILON)
                     {
                         eprintln!(
-                            "  [OK] {cluster}: simulator waiting-requests={waiting_requests}, KV-cache mean={expected_kv_cache:.3}, ready endpoints={expected_endpoints} are live in EPP metrics"
+                            "  [OK] {cluster}: simulator waiting-requests={waiting_requests}, endpoint-weighted KV-cache mean={expected_kv_cache:.3}, ready endpoints={expected_endpoints} (vcr-1={}, vcr-2={}) are live in EPP metrics",
+                            ready_replicas.vcr_1, ready_replicas.vcr_2,
                         );
                         return Ok(());
                     }
@@ -1583,8 +1586,7 @@ fn set_simulator_fake_metrics_with_endpoint_kv(
         std::thread::sleep(DATA_PLANE_INTERVAL);
     }
     Err(format!(
-        "{cluster}: simulator did not expose waiting-requests={waiting_requests}, KV-cache mean={:.6}, and ready-endpoints={expected_endpoints} within timeout; last observation: {last_observed}",
-        (vcr1_kv_cache_usage + vcr2_kv_cache_usage) / 2.0
+        "{cluster}: simulator did not expose waiting-requests={waiting_requests}, endpoint-weighted KV-cache mean={expected_kv_cache:.6}, and ready-endpoints={expected_endpoints} within timeout; last observation: {last_observed}"
     )
     .into())
 }
@@ -1684,6 +1686,94 @@ fn simulator_desired_replicas(context: &str) -> Result<usize, Box<dyn std::error
     Ok(replicas)
 }
 
+/// Ready endpoint counts for the two simulator Deployments behind `vcr-service`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SimulatorReadyReplicas {
+    /// Ready endpoints owned by `vcr-1`.
+    vcr_1: usize,
+    /// Ready endpoints owned by `vcr-2`.
+    vcr_2: usize,
+}
+
+impl SimulatorReadyReplicas {
+    /// Return the total ready endpoints, rejecting arithmetic overflow.
+    fn total(self) -> Result<usize, String> {
+        self.vcr_1
+            .checked_add(self.vcr_2)
+            .ok_or_else(|| "simulator ready endpoint count overflowed".to_owned())
+    }
+}
+
+/// Read each simulator Deployment's ready replica count.
+fn simulator_ready_replicas(context: &str) -> Result<SimulatorReadyReplicas, Box<dyn std::error::Error>> {
+    let mut counts = SimulatorReadyReplicas::default();
+    for deployment in SIMULATOR_DEPLOYMENTS {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                &format!("deployment/{deployment}"),
+                "-o",
+                "json",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "read deployment/{deployment} ready replicas: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let ready = match document.pointer("/status/readyReplicas") {
+            None => 0,
+            Some(value) => usize::try_from(value.as_u64().ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "deployment/{deployment} has an invalid status.readyReplicas value: {value}"
+                ))
+            })?)
+            .map_err(|error| std::io::Error::other(format!("deployment/{deployment} ready replicas: {error}")))?,
+        };
+        match *deployment {
+            "vcr-1" => counts.vcr_1 = ready,
+            "vcr-2" => counts.vcr_2 = ready,
+            _ => return Err(format!("unknown simulator Deployment {deployment}").into()),
+        }
+    }
+    Ok(counts)
+}
+
+/// Calculate the EPP's endpoint-weighted mean for the two simulator Deployments.
+fn simulator_kv_cache_mean(
+    vcr_1_kv_cache: f64,
+    vcr_2_kv_cache: f64,
+    ready_replicas: SimulatorReadyReplicas,
+) -> Result<f64, String> {
+    if !vcr_1_kv_cache.is_finite()
+        || !(0.0..=1.0).contains(&vcr_1_kv_cache)
+        || !vcr_2_kv_cache.is_finite()
+        || !(0.0..=1.0).contains(&vcr_2_kv_cache)
+    {
+        return Err(format!(
+            "simulator KV-cache values must be finite and in [0, 1]: vcr-1={vcr_1_kv_cache}, vcr-2={vcr_2_kv_cache}"
+        ));
+    }
+    let total = ready_replicas.total()?;
+    if total == 0 {
+        return Err("cannot calculate simulator KV-cache mean without ready endpoints".to_owned());
+    }
+    let vcr_1_count = u32::try_from(ready_replicas.vcr_1)
+        .map_err(|error| format!("vcr-1 ready endpoints exceed EPP metric precision: {error}"))?;
+    let vcr_2_count = u32::try_from(ready_replicas.vcr_2)
+        .map_err(|error| format!("vcr-2 ready endpoints exceed EPP metric precision: {error}"))?;
+    let total_count = u32::try_from(total)
+        .map_err(|error| format!("simulator ready endpoints exceed EPP metric precision: {error}"))?;
+    Ok((vcr_1_kv_cache * f64::from(vcr_1_count) + vcr_2_kv_cache * f64::from(vcr_2_count)) / f64::from(total_count))
+}
+
 /// Ready and not-ready pod identities currently published by the VCR Service.
 #[derive(Debug, Default, Eq, PartialEq)]
 struct SimulatorServiceEndpoints {
@@ -1754,30 +1844,39 @@ fn simulator_service_endpoints(context: &str) -> Result<SimulatorServiceEndpoint
 
 /// Wait until the VCR Service publishes the desired ready pods without a stale or
 /// not-ready endpoint before routing proof traffic through its provider Gateway.
-fn wait_for_simulator_service_endpoints(context: &str) -> Result<usize, Box<dyn std::error::Error>> {
+fn wait_for_simulator_service_endpoints(context: &str) -> Result<SimulatorReadyReplicas, Box<dyn std::error::Error>> {
     const STABLE_SAMPLES: u32 = 3;
 
     let expected = simulator_desired_replicas(context)?;
     let deadline = Instant::now() + DATA_PLANE_WAIT;
-    let mut previous: Option<BTreeSet<String>> = None;
+    let mut previous: Option<(BTreeSet<String>, SimulatorReadyReplicas)> = None;
     let mut stable_samples = 0_u32;
     let mut last = String::from("no Endpoints observation");
     while Instant::now() < deadline {
         let endpoints = simulator_service_endpoints(context)?;
+        let ready_replicas = simulator_ready_replicas(context)?;
+        let deployment_endpoint_total = ready_replicas.total().map_err(std::io::Error::other)?;
         last = format!(
-            "ready={:?}, not-ready={:?}, expected-ready={expected}",
-            endpoints.ready, endpoints.not_ready
+            "service-ready={:?}, service-not-ready={:?}, per-deployment-ready={ready_replicas:?}, expected-service-ready={expected}",
+            endpoints.ready, endpoints.not_ready,
         );
-        if endpoints.ready.len() == expected && endpoints.not_ready.is_empty() {
-            if previous.as_ref() == Some(&endpoints.ready) {
+        if endpoints.ready.len() == expected
+            && endpoints.not_ready.is_empty()
+            && deployment_endpoint_total == endpoints.ready.len()
+        {
+            let observation = (endpoints.ready.clone(), ready_replicas);
+            if previous.as_ref() == Some(&observation) {
                 stable_samples = stable_samples.saturating_add(1);
             } else {
                 stable_samples = 1;
-                previous = Some(endpoints.ready.clone());
+                previous = Some(observation);
             }
             if stable_samples >= STABLE_SAMPLES {
-                eprintln!("  [OK] {context}: vcr-service has {expected} stable ready endpoint(s)");
-                return Ok(expected);
+                eprintln!(
+                    "  [OK] {context}: vcr-service has {expected} stable ready endpoint(s), vcr-1={}, vcr-2={}",
+                    ready_replicas.vcr_1, ready_replicas.vcr_2
+                );
+                return Ok(ready_replicas);
             }
         } else {
             previous = None;
@@ -5241,6 +5340,24 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         assert_eq!(endpoints.ready, BTreeSet::from(["ready-uid".to_owned()]));
         assert_eq!(endpoints.not_ready, BTreeSet::from(["terminating-uid".to_owned()]));
         Ok(())
+    }
+
+    #[test]
+    fn simulator_kv_cache_mean_weights_each_ready_endpoint() {
+        let mean = simulator_kv_cache_mean(0.2, 0.8, SimulatorReadyReplicas { vcr_1: 2, vcr_2: 1 });
+
+        assert!(mean.is_ok(), "ready endpoint counts should produce a mean");
+        assert!(
+            mean.is_ok_and(|value| (value - 0.4).abs() < f64::EPSILON),
+            "the mean must weight the two vcr-1 endpoints separately from the one vcr-2 endpoint"
+        );
+    }
+
+    #[test]
+    fn simulator_kv_cache_mean_rejects_missing_ready_endpoints() {
+        let mean = simulator_kv_cache_mean(0.2, 0.8, SimulatorReadyReplicas::default());
+
+        assert!(mean.is_err(), "the mean requires at least one ready endpoint");
     }
 
     #[test]
