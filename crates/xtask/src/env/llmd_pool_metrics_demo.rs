@@ -83,6 +83,9 @@ const SIGNALS_LB_INGRESS_TIMEOUT: Duration = Duration::from_secs(90);
 /// Retry interval for convergence probes.
 const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Tolerance for comparing Prometheus-serialized EPP KV-cache means.
+const KV_CACHE_METRIC_TOLERANCE: f64 = 1e-6;
+
 /// Configured queue capacity (matches MOCK_MAX_NUM_SEQS on VCR pods).
 const QUEUE_CAPACITY: f64 = 4.0;
 
@@ -1551,26 +1554,37 @@ fn set_simulator_fake_metrics_with_endpoint_kv(
         ))
     })?;
     let deadline = Instant::now() + DATA_PLANE_WAIT;
+    let mut last_observed = String::from("no valid EPP metric sample");
     while Instant::now() < deadline {
-        if kubectl_exec_epp_metrics(cluster, mtls).ok().is_some_and(|text| {
-            parse_required_epp_metrics(&text).is_ok_and(|metrics| {
-                let expected_kv_cache = (vcr1_kv_cache_usage + vcr2_kv_cache_usage) / 2.0;
-                let observed_endpoints = first_prom_value(&text, EPP_READY_METRICS);
-                (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
-                    && (metrics.kv_cache - expected_kv_cache).abs() < f64::EPSILON
-                    && observed_endpoints.is_some_and(|ready| (ready - expected_endpoint_metric).abs() < f64::EPSILON)
-            })
-        }) {
-            eprintln!(
-                "  [OK] {cluster}: simulator waiting-requests={waiting_requests}, KV-cache mean={:.3}, ready endpoints={expected_endpoints} are live in EPP metrics",
-                (vcr1_kv_cache_usage + vcr2_kv_cache_usage) / 2.0,
-            );
-            return Ok(());
+        match kubectl_exec_epp_metrics(cluster, mtls) {
+            Ok(text) => match parse_required_epp_metrics(&text) {
+                Ok(metrics) => {
+                    let expected_kv_cache = (vcr1_kv_cache_usage + vcr2_kv_cache_usage) / 2.0;
+                    let observed_endpoints = first_prom_value(&text, EPP_READY_METRICS);
+                    last_observed = format!(
+                        "queue-size={}, KV-cache mean={}, ready endpoints={observed_endpoints:?}",
+                        metrics.queue_size, metrics.kv_cache
+                    );
+                    if (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
+                        && (metrics.kv_cache - expected_kv_cache).abs() < KV_CACHE_METRIC_TOLERANCE
+                        && observed_endpoints
+                            .is_some_and(|ready| (ready - expected_endpoint_metric).abs() < f64::EPSILON)
+                    {
+                        eprintln!(
+                            "  [OK] {cluster}: simulator waiting-requests={waiting_requests}, KV-cache mean={expected_kv_cache:.3}, ready endpoints={expected_endpoints} are live in EPP metrics"
+                        );
+                        return Ok(());
+                    }
+                },
+                Err(error) => last_observed = format!("EPP metrics parse failed: {error}"),
+            },
+            Err(error) => last_observed = format!("EPP metrics scrape failed: {error}"),
         }
         std::thread::sleep(DATA_PLANE_INTERVAL);
     }
     Err(format!(
-        "{cluster}: simulator did not expose waiting-requests={waiting_requests} and ready-endpoints={expected_endpoints} within timeout"
+        "{cluster}: simulator did not expose waiting-requests={waiting_requests}, KV-cache mean={:.6}, and ready-endpoints={expected_endpoints} within timeout; last observation: {last_observed}",
+        (vcr1_kv_cache_usage + vcr2_kv_cache_usage) / 2.0
     )
     .into())
 }

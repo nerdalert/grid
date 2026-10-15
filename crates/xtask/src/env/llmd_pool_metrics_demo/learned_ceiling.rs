@@ -1840,6 +1840,8 @@ fn wait_for_kv_cache_hard_bound(
     let mut stable_samples = 0_u32;
     let mut last = String::from("no runtime sample");
     while Instant::now() < deadline {
+        // Keep transport failures as qualification failures so the wait does not hide underlay drops tracked in Grid
+        // #370.
         let probe = send_probe(forwards.gateway_http, None, "kv-cache-hard-bound-wait", probe_failures)?;
         match observe_runtime(context, forwards) {
             Ok(snapshot) => {
@@ -3191,29 +3193,30 @@ fn record_attributed_request_batch(
     Ok(distribution)
 }
 
+/// Calculate pool B's share from a complete attributed response sample.
+fn pool_b_share(distribution: &RouteDistribution, expected_requests: usize, label: &str) -> Result<f64, String> {
+    let observed = distribution.sites.values().sum::<usize>();
+    if observed != expected_requests {
+        return Err(format!(
+            "{label} attributed {observed} requests, expected the full {expected_requests}-request sample"
+        ));
+    }
+    let pool_b = distribution.sites.get(SITE).copied().unwrap_or_default();
+    let observed = u32::try_from(observed)
+        .map_err(|error| format!("{label} request count does not fit a metric sample: {error}"))?;
+    let pool_b =
+        u32::try_from(pool_b).map_err(|error| format!("{label} pool-B count does not fit a metric sample: {error}"))?;
+    Ok(f64::from(pool_b) / f64::from(observed))
+}
+
 /// Require a matched route sample to reduce the saturated pool's share, not send every request to one site.
 fn kv_cache_route_share_shift(
     queue_free: &RouteDistribution,
     hard_bound: &RouteDistribution,
     expected_requests: usize,
 ) -> Result<(f64, f64), String> {
-    let share = |distribution: &RouteDistribution, label: &str| -> Result<f64, String> {
-        let observed = distribution.sites.values().sum::<usize>();
-        if observed != expected_requests {
-            return Err(format!(
-                "{label} attributed {observed} requests, expected the full {expected_requests}-request sample"
-            ));
-        }
-        let pool_b = distribution.sites.get(SITE).copied().unwrap_or_default();
-        let observed = u32::try_from(observed)
-            .map_err(|error| format!("{label} request count does not fit a metric sample: {error}"))?;
-        let pool_b = u32::try_from(pool_b)
-            .map_err(|error| format!("{label} pool-B count does not fit a metric sample: {error}"))?;
-        Ok(f64::from(pool_b) / f64::from(observed))
-    };
-
-    let soft_share = share(queue_free, "queue-free soft-ceiling sample")?;
-    let hard_share = share(hard_bound, "KV-cache hard-bound sample")?;
+    let soft_share = pool_b_share(queue_free, expected_requests, "queue-free soft-ceiling sample")?;
+    let hard_share = pool_b_share(hard_bound, expected_requests, "KV-cache hard-bound sample")?;
     if soft_share < MIN_SOFT_BASELINE_POOL_B_SHARE {
         return Err(format!(
             "queue-free sample did not establish pool B's expected capacity preference: {:.1}% is below {:.1}%",
@@ -3245,23 +3248,8 @@ fn kv_cache_reported_only_route_share_shift(
     reported_saturated: &RouteDistribution,
     expected_requests: usize,
 ) -> Result<(f64, f64), String> {
-    let share = |distribution: &RouteDistribution, label: &str| -> Result<f64, String> {
-        let observed = distribution.sites.values().sum::<usize>();
-        if observed != expected_requests {
-            return Err(format!(
-                "{label} attributed {observed} requests, expected the full {expected_requests}-request sample"
-            ));
-        }
-        let pool_b = distribution.sites.get(SITE).copied().unwrap_or_default();
-        let observed = u32::try_from(observed)
-            .map_err(|error| format!("{label} request count does not fit a metric sample: {error}"))?;
-        let pool_b = u32::try_from(pool_b)
-            .map_err(|error| format!("{label} pool-B count does not fit a metric sample: {error}"))?;
-        Ok(f64::from(pool_b) / f64::from(observed))
-    };
-
-    let low_pressure_share = share(low_pressure, "low-pressure soft-ceiling sample")?;
-    let saturated_share = share(reported_saturated, "reported-saturation sample")?;
+    let low_pressure_share = pool_b_share(low_pressure, expected_requests, "low-pressure soft-ceiling sample")?;
+    let saturated_share = pool_b_share(reported_saturated, expected_requests, "reported-saturation sample")?;
     if low_pressure_share < MIN_SOFT_BASELINE_POOL_B_SHARE {
         return Err(format!(
             "low-pressure sample did not establish pool B's expected capacity preference: {:.1}% is below {:.1}%",

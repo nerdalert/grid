@@ -131,6 +131,12 @@ cargo xtask env run-grid-glb-demo --forge-config tests/e2e/topologies/grid-glb-d
 GRID_XTASK_OPERATOR_IMAGE="${GRID_XTASK_OPERATOR_IMAGE:?build a source-matched Grid operator; see the llm-d README}" GRID_XTASK_GRID_GATEWAY_IMAGE="${GRID_XTASK_GRID_GATEWAY_IMAGE:?build a source-matched Grid Gateway; see the llm-d README}" cargo xtask env run-grid-llmd-pool-metrics-demo --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"
 ```
 
+For release evidence, use the triggered workflow's immutable EPP and simulator
+image references, or reject the run if either reference lacks a `sha256`
+digest or the recorded container image ID is missing. The command above uses
+mutable defaults when these image variables are unset and does not enforce
+those evidence requirements by itself.
+
 The checked-in Praxis configurations for these Kind qualifications explicitly
 enable both `insecure_options.allow_private_endpoints` and
 `insecure_options.allow_private_upstreams` because their test backends use

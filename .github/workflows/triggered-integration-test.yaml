@@ -1149,13 +1149,20 @@ jobs:
                 --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml \
                 "--${MODE}" --teardown --keep-on-failure --evidence-dir "${EVIDENCE_DIR}" \
                 2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
-              qualification_status=${PIPESTATUS[0]}
+              pipeline_status=("${PIPESTATUS[@]}")
+              set -e
+              qualification_status=${pipeline_status[0]}
+              tee_status=${pipeline_status[1]}
               printf '%s\n' "${qualification_status}" > "${EVIDENCE_DIR}/xtask-exit-status.txt"
+              printf '%s\n' "${tee_status}" > "${EVIDENCE_DIR}/tee-exit-status.txt"
               if [[ "${qualification_status}" -ne 0 ]]; then
                 echo "::error::llm-d pool-metrics xtask exited with status ${qualification_status}"
                 exit "${qualification_status}"
               fi
-              set -e
+              if [[ "${tee_status}" -ne 0 ]]; then
+                echo "::error::llm-d pool-metrics tee exited with status ${tee_status}"
+                exit "${tee_status}"
+              fi
               ;;
             *)
               echo "::error::Unknown qualification '${QUALIFICATION}'"
@@ -1613,23 +1620,29 @@ jobs:
                 CLEANUP_RESULT="partial"
               else
                 STATE_FILE="${LLMD_STATE_FILES[0]}"
-                POOL_A_CLUSTER=$(jq -r '.clusters[] | select(.name == "pool-a") | .kindName' "${STATE_FILE}")
-                RUN_PREFIX="${POOL_A_CLUSTER%-pool-a}"
-                if ! [[ "${RUN_PREFIX}" =~ ^grid-llmd-pm-[0-9]{8}t[0-9]{6}z-[0-9]+$ ]] \
-                  || ! jq -e --arg prefix "${RUN_PREFIX}" '
-                    .network.name == ($prefix + "-net")
-                    and ([.clusters[].kindName] | sort == [($prefix + "-pool-a"), ($prefix + "-pool-b")])
-                  ' "${STATE_FILE}" > /dev/null; then
-                  echo "::warning::llm-d Forge state does not match a unique two-pool run prefix; refusing cleanup"
+                if ! POOL_A_CLUSTER=$(jq -er '.clusters[] | select(.name == "pool-a") | .kindName' "${STATE_FILE}"); then
+                  echo "::warning::Unable to parse pool-a cluster from llm-d Forge state; refusing cleanup"
                   CLEANUP_RESULT="partial"
+                  STATE_FILE=""
                 else
-                  OWNED_CLUSTERS=("${RUN_PREFIX}-pool-a" "${RUN_PREFIX}-pool-b")
-                  OWNED_NETWORKS=("${RUN_PREFIX}-net")
-                  NETWORK_OWNER="${RUN_PREFIX}"
-                  if ! jq -e '.networkCreatedByForge == true or .network.phase == "gone"' "${STATE_FILE}" > /dev/null; then
-                    echo "::warning::llm-d Forge state does not show a run-created or already-removed network"
+                  RUN_PREFIX="${POOL_A_CLUSTER%-pool-a}"
+                  if ! [[ "${RUN_PREFIX}" =~ ^grid-llmd-pm-[0-9]{8}t[0-9]{6}z-[0-9]+$ ]] \
+                    || ! jq -e --arg prefix "${RUN_PREFIX}" '
+                      .network.name == ($prefix + "-net")
+                      and ([.clusters[].kindName] | sort == [($prefix + "-pool-a"), ($prefix + "-pool-b")])
+                    ' "${STATE_FILE}" > /dev/null; then
+                    echo "::warning::llm-d Forge state does not match a unique two-pool run prefix; refusing cleanup"
                     CLEANUP_RESULT="partial"
-                    OWNED_NETWORKS=()
+                    STATE_FILE=""
+                  else
+                    OWNED_CLUSTERS=("${RUN_PREFIX}-pool-a" "${RUN_PREFIX}-pool-b")
+                    OWNED_NETWORKS=("${RUN_PREFIX}-net")
+                    NETWORK_OWNER="${RUN_PREFIX}"
+                    if ! jq -e '.networkCreatedByForge == true or .network.phase == "gone"' "${STATE_FILE}" > /dev/null; then
+                      echo "::warning::llm-d Forge state does not show a run-created or already-removed network"
+                      CLEANUP_RESULT="partial"
+                      OWNED_NETWORKS=()
+                    fi
                   fi
                 fi
               fi

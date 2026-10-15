@@ -1997,7 +1997,7 @@ fn weighted_route_metrics(metrics: &str, preferred_site: &str) -> Result<Weighte
     };
     let (preferred_score, preferred_weight, preferred_rho) = pair(preferred_site)?;
     let (other_score, other_weight, other_rho) = pair(other_site)?;
-    if preferred_score >= other_score {
+    if preferred_score > other_score {
         return Err(format!(
             "Gateway route score does not prefer {preferred_site}: score={preferred_score}, other site {other_site} score={other_score}"
         ));
@@ -3036,6 +3036,28 @@ mod tests {
         assert!(
             (route.preferred_share - (8.0 / (8.0 + 18.0 / (1.0 + 0.999_984_222_461_796_4)))).abs() < f64::EPSILON,
             "the expected share must use capacity divided by one plus smoothed saturation"
+        );
+    }
+
+    #[test]
+    fn weighted_route_expectation_allows_tied_finite_scores() {
+        let metrics = "grid_route_site_score{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0\n\
+                       grid_route_site_weight{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 8\n\
+                       grid_route_site_rho{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0\n\
+                       grid_route_site_score{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0\n\
+                       grid_route_site_weight{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 18\n\
+                       grid_route_site_rho{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0.5\n";
+
+        let route = weighted_route_metrics(metrics, "pool-a");
+
+        assert!(
+            route.is_ok(),
+            "equal finite queue scores still have a valid weighted share"
+        );
+        let route = route.unwrap_or_else(|_| std::process::abort());
+        assert!(
+            (route.preferred_share - (8.0 / (8.0 + 12.0))).abs() < f64::EPSILON,
+            "the tied-score share must still use capacity divided by one plus saturation"
         );
     }
 
