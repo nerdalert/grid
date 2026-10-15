@@ -413,6 +413,20 @@ struct InferenceResponse {
     demo_attribution: String,
 }
 
+/// Captured response and transport diagnostics from one curl probe.
+struct CurlProbeOutput {
+    /// HTTP status returned by curl, with zero representing no HTTP response.
+    status: u16,
+    /// Provider gateway attribution header.
+    provider_gateway: String,
+    /// Demo provider attribution header.
+    demo_attribution: String,
+    /// Exit code returned by curl inside the probe pod.
+    curl_exit_code: i32,
+    /// Standard error emitted by curl inside the probe pod.
+    curl_stderr: String,
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1266,9 +1280,7 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
                 },
                 Err(error) => {
                     let result = format!("verification request failed: {error}");
-                    if last_probe_result.as_deref() != Some(result.as_str()) {
-                        eprintln!("  [FAILOVER] {result}");
-                    }
+                    eprintln!("  [FAILOVER] {result}");
                     last_probe_result = Some(result);
                 },
             }
@@ -1388,9 +1400,7 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
                 },
                 Err(error) => {
                     let result = format!("verification request failed: {error}");
-                    if last_probe_result.as_deref() != Some(result.as_str()) {
-                        eprintln!("  [RECOVERY] {result}");
-                    }
+                    eprintln!("  [RECOVERY] {result}");
                     last_probe_result = Some(result);
                 },
             }
@@ -1980,35 +1990,89 @@ fn send_inference_request(kube_context: &str, model: &str) -> Result<InferenceRe
     let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"test"}}]}}"#,);
     let session_id = format!("probe-{}", format_utc_timestamp());
     let curl_cmd = format!(
-        "curl -s -o /dev/null \
+        "curl -sS -o /dev/null \
          -w 'STATUS:%{{http_code}}\\nPROVIDER_GW:%header{{X-Grid-LlmD-Provider-Gateway}}\\nDEMO_ATTRIB:%header{{x-ai-demo-provider-gateway}}\\n' \
          -X POST http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions \
          -H 'Content-Type: application/json' \
          -H 'X-Session-Id: {session_id}' \
-         -d '{body}'",
+         -d '{body}' 2>/tmp/curl.stderr > /tmp/curl.stdout
+         curl_exit=$?
+         curl_stdout=$(cat /tmp/curl.stdout)
+         curl_stderr=$(cat /tmp/curl.stderr)
+         printf '%s\\n' \"$curl_stdout\"
+         printf 'CURL_EXIT:%s\\n' \"$curl_exit\"
+         printf 'CURL_STDERR_BEGIN\\n'
+         printf '%s' \"$curl_stderr\"
+         printf '\\nCURL_STDERR_END\\n'
+         exit 0",
     );
-    let raw = kubectl_exec_curl_raw(kube_context, &curl_cmd)?;
-    let mut status = 0_u16;
-    let mut provider_gw = String::new();
-    let mut demo_attr = String::new();
-    for line in raw.lines() {
-        if let Some(code) = line.strip_prefix("STATUS:") {
-            status = code.trim().parse().unwrap_or(0);
-        } else if let Some(val) = line.strip_prefix("PROVIDER_GW:") {
-            val.trim().clone_into(&mut provider_gw);
-        } else if let Some(val) = line.strip_prefix("DEMO_ATTRIB:") {
-            val.trim().clone_into(&mut demo_attr);
-        }
+    let raw = kubectl_exec_curl_raw(kube_context, &curl_cmd)
+        .map_err(|error| format!("inference probe session={session_id} failed to run curl: {error}"))?;
+    let probe = parse_curl_probe_output(&raw)?;
+    if probe.status != 200 || probe.curl_exit_code != 0 {
+        let response = if probe.status == 0 {
+            "no HTTP response (HTTP status 000)".to_owned()
+        } else {
+            format!("HTTP {}", probe.status)
+        };
+        return Err(format!(
+            "inference request failed: {response}; session_id={session_id}; curl_exit_code={}; curl_stderr={:?}",
+            probe.curl_exit_code, probe.curl_stderr
+        )
+        .into());
     }
-    if status != 200 {
-        return Err(format!("inference request returned HTTP {status}").into());
-    }
-    if provider_gw.is_empty() || demo_attr.is_empty() {
-        return Err("missing attribution headers in response".into());
+    if probe.provider_gateway.is_empty() || probe.demo_attribution.is_empty() {
+        return Err(format!(
+            "missing attribution headers in HTTP 200 response; session_id={session_id}; curl_exit_code={}; curl_stderr={:?}",
+            probe.curl_exit_code, probe.curl_stderr
+        )
+        .into());
     }
     Ok(InferenceResponse {
-        provider_gateway: provider_gw,
-        demo_attribution: demo_attr,
+        provider_gateway: probe.provider_gateway,
+        demo_attribution: probe.demo_attribution,
+    })
+}
+
+/// Parse curl's HTTP result, exit code, attribution headers, and captured stderr.
+fn parse_curl_probe_output(raw: &str) -> Result<CurlProbeOutput, Box<dyn std::error::Error>> {
+    let (response_lines, stderr_block) = raw
+        .split_once("CURL_STDERR_BEGIN\n")
+        .ok_or_else(|| std::io::Error::other("curl probe output omitted the stderr marker"))?;
+    let (curl_stderr, trailing_output) = stderr_block
+        .split_once("\nCURL_STDERR_END")
+        .ok_or_else(|| std::io::Error::other("curl probe output omitted the stderr terminator"))?;
+    if !trailing_output.trim().is_empty() {
+        return Err(std::io::Error::other("curl probe output had unexpected trailing data").into());
+    }
+
+    let mut status = None;
+    let mut provider_gateway = String::new();
+    let mut demo_attribution = String::new();
+    let mut curl_exit_code = None;
+    for line in response_lines.lines() {
+        if let Some(code) = line.strip_prefix("STATUS:") {
+            status = Some(code.trim().parse::<u16>().map_err(|error| {
+                std::io::Error::other(format!("curl probe output had an invalid HTTP status: {error}"))
+            })?);
+        } else if let Some(value) = line.strip_prefix("PROVIDER_GW:") {
+            value.trim().clone_into(&mut provider_gateway);
+        } else if let Some(value) = line.strip_prefix("DEMO_ATTRIB:") {
+            value.trim().clone_into(&mut demo_attribution);
+        } else if let Some(code) = line.strip_prefix("CURL_EXIT:") {
+            curl_exit_code = Some(code.trim().parse::<i32>().map_err(|error| {
+                std::io::Error::other(format!("curl probe output had an invalid exit code: {error}"))
+            })?);
+        }
+    }
+
+    Ok(CurlProbeOutput {
+        status: status.ok_or_else(|| std::io::Error::other("curl probe output omitted the HTTP status"))?,
+        provider_gateway,
+        demo_attribution,
+        curl_exit_code: curl_exit_code
+            .ok_or_else(|| std::io::Error::other("curl probe output omitted the curl exit code"))?,
+        curl_stderr: curl_stderr.to_owned(),
     })
 }
 
@@ -2088,7 +2152,13 @@ fn kubectl_exec_curl_raw(kube_context: &str, cmd: &str) -> Result<String, Box<dy
         ])
         .output()?;
     if !output.status.success() {
-        return Err(format!("kubectl run failed: {}", String::from_utf8_lossy(&output.stderr).trim()).into());
+        return Err(format!(
+            "kubectl run {pod_name} failed (kubectl exit code {:?}); stdout={:?}; stderr={:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )
+        .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -4313,6 +4383,34 @@ mod tests {
     use serde::Deserialize as _;
 
     use super::*;
+
+    #[test]
+    fn curl_probe_output_preserves_no_response_transport_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
+        let output = parse_curl_probe_output(
+            "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\n",
+        )?;
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.curl_exit_code, 28);
+        assert_eq!(output.curl_stderr, "curl: (28) timed out");
+        assert!(output.provider_gateway.is_empty());
+        assert!(output.demo_attribution.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn curl_probe_output_parses_successful_status_and_attribution() -> Result<(), Box<dyn std::error::Error>> {
+        let output = parse_curl_probe_output(
+            "STATUS:200\nPROVIDER_GW:pool-a\nDEMO_ATTRIB:pool-a-provider\nCURL_EXIT:0\nCURL_STDERR_BEGIN\n\nCURL_STDERR_END\n",
+        )?;
+
+        assert_eq!(output.status, 200);
+        assert_eq!(output.curl_exit_code, 0);
+        assert!(output.curl_stderr.is_empty());
+        assert_eq!(output.provider_gateway, "pool-a");
+        assert_eq!(output.demo_attribution, "pool-a-provider");
+        Ok(())
+    }
 
     #[test]
     fn pool_metrics_topology_uses_deterministic_selection_for_pressure_recovery()
