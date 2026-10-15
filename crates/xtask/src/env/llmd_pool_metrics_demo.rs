@@ -16,7 +16,7 @@
 )]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -1544,26 +1544,35 @@ fn set_simulator_fake_metrics_with_endpoint_kv(
         }
     }
 
+    let expected_endpoints = wait_for_simulator_service_endpoints(&ctx)?;
+    let expected_endpoint_metric = u32::try_from(expected_endpoints).map(f64::from).map_err(|error| {
+        std::io::Error::other(format!(
+            "simulator endpoint count exceeds EPP metric precision: {error}"
+        ))
+    })?;
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     while Instant::now() < deadline {
-        if kubectl_exec_epp_metrics(cluster, mtls)
-            .ok()
-            .and_then(|text| parse_required_epp_metrics(&text).ok())
-            .is_some_and(|metrics| {
+        if kubectl_exec_epp_metrics(cluster, mtls).ok().is_some_and(|text| {
+            parse_required_epp_metrics(&text).is_ok_and(|metrics| {
                 let expected_kv_cache = (vcr1_kv_cache_usage + vcr2_kv_cache_usage) / 2.0;
+                let observed_endpoints = first_prom_value(&text, EPP_READY_METRICS);
                 (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
                     && (metrics.kv_cache - expected_kv_cache).abs() < f64::EPSILON
+                    && observed_endpoints.is_some_and(|ready| (ready - expected_endpoint_metric).abs() < f64::EPSILON)
             })
-        {
+        }) {
             eprintln!(
-                "  [OK] {cluster}: simulator waiting-requests={waiting_requests}, KV-cache mean={:.3} is live in EPP metrics",
+                "  [OK] {cluster}: simulator waiting-requests={waiting_requests}, KV-cache mean={:.3}, ready endpoints={expected_endpoints} are live in EPP metrics",
                 (vcr1_kv_cache_usage + vcr2_kv_cache_usage) / 2.0,
             );
             return Ok(());
         }
         std::thread::sleep(DATA_PLANE_INTERVAL);
     }
-    Err(format!("{cluster}: simulator did not expose waiting-requests={waiting_requests} within timeout").into())
+    Err(format!(
+        "{cluster}: simulator did not expose waiting-requests={waiting_requests} and ready-endpoints={expected_endpoints} within timeout"
+    )
+    .into())
 }
 
 /// Render the complete simulator ConfigMap for the requested fake metrics.
@@ -1621,6 +1630,148 @@ fn simulator_rollout_needed(before: i64, after: i64) -> Result<bool, String> {
         return Err(format!("generation moved backwards ({before} -> {after})"));
     }
     Ok(after > before)
+}
+
+/// Sum the desired replicas of the run-owned simulator Deployments.
+fn simulator_desired_replicas(context: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut replicas = 0_usize;
+    for deployment in SIMULATOR_DEPLOYMENTS {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                &format!("deployment/{deployment}"),
+                "-o",
+                "jsonpath={.spec.replicas}",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "read deployment/{deployment} replica count: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        let value = String::from_utf8_lossy(&output.stdout);
+        let count = if value.trim().is_empty() {
+            1
+        } else {
+            value.trim().parse::<usize>().map_err(|error| {
+                std::io::Error::other(format!("invalid deployment/{deployment} replica count: {error}"))
+            })?
+        };
+        replicas = replicas
+            .checked_add(count)
+            .ok_or_else(|| std::io::Error::other("simulator replica count overflowed"))?;
+    }
+    Ok(replicas)
+}
+
+/// Ready and not-ready pod identities currently published by the VCR Service.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct SimulatorServiceEndpoints {
+    /// Identities of endpoints ready to receive traffic.
+    ready: BTreeSet<String>,
+    /// Identities of endpoints Kubernetes has marked not ready.
+    not_ready: BTreeSet<String>,
+}
+
+/// Parse the Endpoints view that kube-proxy uses for the VCR Service.
+fn parse_simulator_service_endpoints(
+    document: &serde_json::Value,
+) -> Result<SimulatorServiceEndpoints, Box<dyn std::error::Error>> {
+    let mut endpoints = SimulatorServiceEndpoints::default();
+    let subsets = document
+        .get("subsets")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    for subset in subsets {
+        for (field, destination) in [
+            ("addresses", &mut endpoints.ready),
+            ("notReadyAddresses", &mut endpoints.not_ready),
+        ] {
+            let addresses = subset
+                .get(field)
+                .and_then(serde_json::Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for address in addresses {
+                let identity = address
+                    .pointer("/targetRef/uid")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| address.pointer("/targetRef/name").and_then(serde_json::Value::as_str))
+                    .or_else(|| address.get("ip").and_then(serde_json::Value::as_str))
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!("{field} entry has no pod identity or IP: {address}"))
+                    })?;
+                destination.insert(identity.to_owned());
+            }
+        }
+    }
+    Ok(endpoints)
+}
+
+/// Read the Service endpoints that provider Gateways connect to.
+fn simulator_service_endpoints(context: &str) -> Result<SimulatorServiceEndpoints, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "endpoints/vcr-service",
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "read vcr-service Endpoints: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    parse_simulator_service_endpoints(&document)
+}
+
+/// Wait until the VCR Service publishes the desired ready pods without a stale or
+/// not-ready endpoint before routing proof traffic through its provider Gateway.
+fn wait_for_simulator_service_endpoints(context: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    const STABLE_SAMPLES: u32 = 3;
+
+    let expected = simulator_desired_replicas(context)?;
+    let deadline = Instant::now() + DATA_PLANE_WAIT;
+    let mut previous: Option<BTreeSet<String>> = None;
+    let mut stable_samples = 0_u32;
+    let mut last = String::from("no Endpoints observation");
+    while Instant::now() < deadline {
+        let endpoints = simulator_service_endpoints(context)?;
+        last = format!(
+            "ready={:?}, not-ready={:?}, expected-ready={expected}",
+            endpoints.ready, endpoints.not_ready
+        );
+        if endpoints.ready.len() == expected && endpoints.not_ready.is_empty() {
+            if previous.as_ref() == Some(&endpoints.ready) {
+                stable_samples = stable_samples.saturating_add(1);
+            } else {
+                stable_samples = 1;
+                previous = Some(endpoints.ready.clone());
+            }
+            if stable_samples >= STABLE_SAMPLES {
+                eprintln!("  [OK] {context}: vcr-service has {expected} stable ready endpoint(s)");
+                return Ok(expected);
+            }
+        } else {
+            previous = None;
+            stable_samples = 0;
+        }
+        std::thread::sleep(DATA_PLANE_INTERVAL);
+    }
+    Err(format!("{context}: vcr-service endpoints did not converge: {last}").into())
 }
 
 /// Read a Deployment generation before and after a deterministic simulator
@@ -2019,15 +2170,15 @@ fn send_inference_request(
     let probe = parse_curl_probe_output(&raw.stdout).map_err(|error| {
         format!(
             "inference probe output could not be parsed: {}",
-            curl_probe_diagnostics(
+            curl_probe_diagnostics(&CurlProbeDiagnostic {
                 phase,
-                &format_utc_iso(),
-                &session_id,
-                None,
-                None,
-                &format!("kubectl stderr: {}; raw stdout: {:?}", raw.stderr, raw.stdout),
-                &error.to_string(),
-            )
+                observed_at: &format_utc_iso(),
+                request_id: &session_id,
+                http_status: None,
+                curl_exit_code: None,
+                curl_stderr: &format!("kubectl stderr: {}; raw stdout: {:?}", raw.stderr, raw.stdout),
+                reason: &error.to_string(),
+            })
         )
     })?;
     if probe.status != 200 {
@@ -2038,30 +2189,30 @@ fn send_inference_request(
         };
         return Err(format!(
             "inference probe failed: {}",
-            curl_probe_diagnostics(
+            curl_probe_diagnostics(&CurlProbeDiagnostic {
                 phase,
-                &format_utc_iso(),
-                &session_id,
-                Some(probe.status),
-                Some(probe.curl_exit_code),
-                &probe.curl_stderr,
+                observed_at: &format_utc_iso(),
+                request_id: &session_id,
+                http_status: Some(probe.status),
+                curl_exit_code: Some(probe.curl_exit_code),
+                curl_stderr: &probe.curl_stderr,
                 reason,
-            )
+            })
         )
         .into());
     }
     if probe.provider_gateway.is_empty() || probe.demo_attribution.is_empty() {
         return Err(format!(
             "inference probe failed: {}",
-            curl_probe_diagnostics(
+            curl_probe_diagnostics(&CurlProbeDiagnostic {
                 phase,
-                &format_utc_iso(),
-                &session_id,
-                Some(probe.status),
-                Some(probe.curl_exit_code),
-                &probe.curl_stderr,
-                "missing attribution headers in HTTP 200 response",
-            )
+                observed_at: &format_utc_iso(),
+                request_id: &session_id,
+                http_status: Some(probe.status),
+                curl_exit_code: Some(probe.curl_exit_code),
+                curl_stderr: &probe.curl_stderr,
+                reason: "missing attribution headers in HTTP 200 response",
+            })
         )
         .into());
     }
@@ -2071,24 +2222,34 @@ fn send_inference_request(
     })
 }
 
-/// Format the diagnostic context for one rejected inference probe without affecting acceptance.
-fn curl_probe_diagnostics(
-    phase: &str,
-    observed_at: &str,
-    request_id: &str,
+/// Context recorded when one inference probe is rejected.
+struct CurlProbeDiagnostic<'diagnostic> {
+    /// Name of the proof phase that issued this request.
+    phase: &'diagnostic str,
+    /// UTC time at which the probe result was observed.
+    observed_at: &'diagnostic str,
+    /// Unique request identifier.
+    request_id: &'diagnostic str,
+    /// HTTP status, with zero representing no response.
     http_status: Option<u16>,
+    /// Exit code returned by curl.
     curl_exit_code: Option<i32>,
-    curl_stderr: &str,
-    reason: &str,
-) -> serde_json::Value {
+    /// Captured curl or kubectl error output.
+    curl_stderr: &'diagnostic str,
+    /// Reason the probe result was rejected.
+    reason: &'diagnostic str,
+}
+
+/// Format rejected inference-probe context without affecting acceptance.
+fn curl_probe_diagnostics(probe: &CurlProbeDiagnostic<'_>) -> serde_json::Value {
     serde_json::json!({
-        "phase": phase,
-        "observed_at": observed_at,
-        "request_id": request_id,
-        "http_status": http_status.map(|status| format!("{status:03}")),
-        "curl_exit_code": curl_exit_code,
-        "curl_stderr": curl_stderr,
-        "reason": reason,
+        "phase": probe.phase,
+        "observed_at": probe.observed_at,
+        "request_id": probe.request_id,
+        "http_status": probe.http_status.map(|status| format!("{status:03}")),
+        "curl_exit_code": probe.curl_exit_code,
+        "curl_stderr": probe.curl_stderr,
+        "reason": probe.reason,
     })
 }
 
@@ -2138,11 +2299,11 @@ fn parse_curl_probe_output(raw: &str) -> Result<CurlProbeOutput, Box<dyn std::er
 /// Recognize the line kubectl prints after deleting a successful `run --rm` pod.
 fn is_kubectl_curl_probe_cleanup_notice(line: &str) -> bool {
     const PREFIX: &str = "pod \"curl-probe-";
-    const SUFFIX: &str = "\" deleted from grid-system namespace";
+    const SUFFIXES: [&str; 2] = ["\" deleted", "\" deleted from grid-system namespace"];
 
     line.strip_prefix(PREFIX)
-        .and_then(|name| name.strip_suffix(SUFFIX))
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|name| SUFFIXES.iter().find_map(|suffix| name.strip_suffix(suffix)))
+        .is_some_and(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Fetch EPP metrics.
@@ -2199,12 +2360,15 @@ fn kubectl_exec_epp_metrics(cluster: &str, mtls: bool) -> Result<String, Box<dyn
     }
 }
 
-/// Run an arbitrary command via `kubectl run` in a temporary pod.
+/// Captured output from a curl probe run in a temporary pod.
 struct KubectlCurlOutput {
+    /// Standard output from the pod and kubectl.
     stdout: String,
+    /// Standard error from kubectl.
     stderr: String,
 }
 
+/// Run curl via kubectl in a temporary pod and retain its raw output.
 fn kubectl_exec_curl_raw(kube_context: &str, cmd: &str) -> Result<KubectlCurlOutput, Box<dyn std::error::Error>> {
     let pod_name = format!("curl-probe-{}", &format_utc_timestamp()[9..15]);
     let output = Command::new("kubectl")
@@ -4455,8 +4619,6 @@ fn proof_tls_routing() -> ProofResult {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use std::collections::BTreeSet;
-
     use serde::Deserialize as _;
 
     use super::*;
@@ -4464,7 +4626,7 @@ mod tests {
     #[test]
     fn curl_probe_output_preserves_no_response_transport_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
         let output = parse_curl_probe_output(
-            "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\npod \"curl-probe-050906\" deleted from grid-system namespace\n",
+            "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\npod \"curl-probe-050906\" deleted\n",
         )?;
 
         assert_eq!(output.status, 0);
@@ -4472,6 +4634,20 @@ mod tests {
         assert_eq!(output.curl_stderr, "curl: (28) timed out");
         assert!(output.provider_gateway.is_empty());
         assert!(output.demo_attribution.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn curl_probe_output_accepts_kubectl_cleanup_notice_with_namespace_detail() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let output = parse_curl_probe_output(
+            "STATUS:200\nPROVIDER_GW:pool-a\nDEMO_ATTRIB:pool-a\nCURL_EXIT:0\nCURL_STDERR_BEGIN\n\nCURL_STDERR_END\npod \"curl-probe-050906\" deleted from grid-system namespace\n",
+        )?;
+
+        assert_eq!(output.status, 200);
+        assert_eq!(output.provider_gateway, "pool-a");
+        assert_eq!(output.demo_attribution, "pool-a");
+        assert_eq!(output.curl_exit_code, 0);
         Ok(())
     }
 
@@ -4489,15 +4665,15 @@ mod tests {
 
     #[test]
     fn curl_probe_failure_report_keeps_phase_timestamp_exit_code_and_stderr() {
-        let report = curl_probe_diagnostics(
-            "network-partition-traffic",
-            "2026-10-15T04:28:27Z",
-            "grid-poll-0-1",
-            Some(0),
-            Some(28),
-            "curl: (28) Operation timed out\n",
-            "curl returned a transport failure or HTTP status 000",
-        );
+        let report = curl_probe_diagnostics(&CurlProbeDiagnostic {
+            phase: "network-partition-traffic",
+            observed_at: "2026-10-15T04:28:27Z",
+            request_id: "grid-poll-0-1",
+            http_status: Some(0),
+            curl_exit_code: Some(28),
+            curl_stderr: "curl: (28) Operation timed out\n",
+            reason: "curl returned a transport failure or HTTP status 000",
+        });
 
         assert_eq!(
             report.get("phase"),
@@ -5031,6 +5207,26 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
                      llm_d_epp_ready_endpoints{name=\"pool-a\"} 2\n";
         assert!(any_metric_present(text, EPP_READY_METRICS));
         assert!(!any_metric_present("no epp metrics here", EPP_READY_METRICS));
+    }
+
+    #[test]
+    fn simulator_endpoints_parser_separates_ready_pods_from_replacements() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoints = parse_simulator_service_endpoints(&serde_json::json!({
+            "subsets": [{
+                "addresses": [{
+                    "ip": "10.244.0.12",
+                    "targetRef": {"name": "vcr-1-new", "uid": "ready-uid"}
+                }],
+                "notReadyAddresses": [{
+                    "ip": "10.244.0.11",
+                    "targetRef": {"name": "vcr-1-old", "uid": "terminating-uid"}
+                }]
+            }]
+        }))?;
+
+        assert_eq!(endpoints.ready, BTreeSet::from(["ready-uid".to_owned()]));
+        assert_eq!(endpoints.not_ready, BTreeSet::from(["terminating-uid".to_owned()]));
+        Ok(())
     }
 
     #[test]

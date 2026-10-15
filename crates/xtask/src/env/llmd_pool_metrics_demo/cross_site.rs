@@ -15,10 +15,10 @@ use std::{
 };
 
 use super::{
-    CLUSTERS, CONSUMER_TLS_SECRET, DemoContext, GRID_NETWORK_NAME, GRID_SERVING_CONFIGMAP, GRID_SERVING_GATEWAY,
-    GRID_SERVING_GATEWAY_PORT, GRID_SERVING_METRICS_PORT, GRID_SERVING_SITE, GRID_SYSTEM_NS, MetricsTransport,
-    OPERATOR_METRICS_PORT, OVERLAY_CONFIGMAP, PROVIDER_GATEWAY_PORT, PortForwardGuard, ProofResult, VCR_MODEL,
-    curl_probe_diagnostics, find_free_port, format_utc_iso, get_configmap_data_key, kind_context, kubectl,
+    CLUSTERS, CONSUMER_TLS_SECRET, CurlProbeDiagnostic, DemoContext, GRID_NETWORK_NAME, GRID_SERVING_CONFIGMAP,
+    GRID_SERVING_GATEWAY, GRID_SERVING_GATEWAY_PORT, GRID_SERVING_METRICS_PORT, GRID_SERVING_SITE, GRID_SYSTEM_NS,
+    MetricsTransport, OPERATOR_METRICS_PORT, OVERLAY_CONFIGMAP, PROVIDER_GATEWAY_PORT, PortForwardGuard, ProofResult,
+    VCR_MODEL, curl_probe_diagnostics, find_free_port, format_utc_iso, get_configmap_data_key, kind_context, kubectl,
     run_cluster_prefix, set_simulator_waiting_requests, split_image_reference,
 };
 
@@ -2546,15 +2546,15 @@ fn send_site_request_with_timeout(
         .map_err(|error| {
             format!(
                 "Grid Gateway inference probe failed: {}",
-                curl_probe_diagnostics(
+                curl_probe_diagnostics(&CurlProbeDiagnostic {
                     phase,
-                    &format_utc_iso(),
-                    &request_id,
-                    None,
-                    None,
-                    "",
-                    &format!("could not start curl: {error}"),
-                )
+                    observed_at: &format_utc_iso(),
+                    request_id: &request_id,
+                    http_status: None,
+                    curl_exit_code: None,
+                    curl_stderr: "",
+                    reason: &format!("could not start curl: {error}"),
+                })
             )
         })?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -2563,15 +2563,15 @@ fn send_site_request_with_timeout(
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         return Err(format!(
             "Grid Gateway inference probe failed: {}",
-            curl_probe_diagnostics(
+            curl_probe_diagnostics(&CurlProbeDiagnostic {
                 phase,
-                &format_utc_iso(),
-                &request_id,
-                Some(response.status),
-                output.status.code(),
-                &stderr,
-                "curl returned a transport failure or HTTP status 000",
-            )
+                observed_at: &format_utc_iso(),
+                request_id: &request_id,
+                http_status: Some(response.status),
+                curl_exit_code: output.status.code(),
+                curl_stderr: &stderr,
+                reason: "curl returned a transport failure or HTTP status 000",
+            })
         )
         .into());
     }
