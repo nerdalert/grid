@@ -626,17 +626,26 @@ fn ceiling(
     let soft = soft_bound(prior.and_then(|prior| prior.soft), queue_free);
     let kept = kept_hard(prior.filter(|_| !sized.grown), queue_free);
     let backlog_since = sample_spell_since(prior, reading.backlogged_at, window_ms);
-    let hard = hard_bound(
-        kept,
-        reading,
-        Backlog {
-            held: 0.0,
-            soft,
-            since: backlog_since,
-            now_ms: reading.backlogged_at.unwrap_or(now_ms),
-        },
-        availability,
-    );
+    let shrinking = lost_units(reading.units, prior.and_then(|prior| prior.units));
+    // A short-lived drop in ready units can happen while a Deployment replaces a pod. Its
+    // saturated sample describes that temporary smaller pool, not the size the retained
+    // bounds describe. Keep the old hard bound until the smaller size has persisted for the
+    // full shrink window; once retired, the new size can teach its own bound.
+    let hard = if shrinking && !sized.retired {
+        kept
+    } else {
+        hard_bound(
+            kept,
+            reading,
+            Backlog {
+                held: 0.0,
+                soft,
+                since: backlog_since,
+                now_ms: reading.backlogged_at.unwrap_or(now_ms),
+            },
+            availability,
+        )
+    };
     Ceiling {
         soft,
         hard,
@@ -1931,6 +1940,63 @@ mod tests {
         assert!(
             (rho - expected).abs() < 1e-9,
             "smoothed, not snapped: {rho} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn a_transient_endpoint_shrink_cannot_teach_a_smaller_hard_ceiling() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut learned = Learned::default();
+        let availability = AvailabilitySettings::default();
+        let refresh = |now_ms: i64, state: &mut Learned| {
+            RouteSnapshot::from_store(
+                one("a"),
+                Arc::from("hub"),
+                &mut Inputs {
+                    signals: &store,
+                    now_ms,
+                    window_ms: 500,
+                    horizon_ms: 500,
+                    availability: &availability,
+                    learned: state,
+                },
+            )
+        };
+        let sample = |at_ms: i64, running: f64, queue: f64, endpoints: f64, kv: f64| {
+            let labels = r#"grid_site="a",grid_provider="pool-a""#;
+            for (metric, value) in [
+                ("llm_d_epp_average_running_requests", running),
+                ("llm_d_epp_average_queue_size", queue),
+                ("llm_d_epp_ready_endpoints", endpoints),
+                ("llm_d_epp_average_kv_cache_utilization", kv),
+                ("llm_d_epp_std_dev_kv_cache_utilization", 0.0),
+            ] {
+                let line = format!("{metric}{{{labels}}} {value} {at_ms}");
+                store.ingest_at(&line, at_ms, at_ms, "a");
+            }
+        };
+
+        sample(1_000, 20.0, 0.0, 2.0, 0.0);
+        let baseline = refresh(1_000, &mut learned);
+        assert_eq!(baseline.candidates[0].capacity, Some(40.0));
+
+        // While one simulator pod is being replaced, the remaining endpoint is saturated and
+        // queued. That transient nine-request sample must not become the two-endpoint site's
+        // hard bound.
+        sample(2_000, 8.0, 1.0, 1.0, 1.0);
+        let transient = refresh(2_000, &mut learned);
+        assert_eq!(
+            transient.candidates[0].capacity,
+            Some(40.0),
+            "the stable two-endpoint ceiling remains while one endpoint is briefly absent"
+        );
+
+        sample(3_000, 8.0, 1.0, 2.0, 1.0);
+        let restored = refresh(3_000, &mut learned);
+        assert_eq!(
+            restored.candidates[0].capacity,
+            Some(18.0),
+            "the restored two-endpoint sample teaches its actual saturated in-flight count"
         );
     }
 
