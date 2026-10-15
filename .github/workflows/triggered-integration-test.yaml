@@ -983,7 +983,7 @@ jobs:
               docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-gateway:${TAG}"
               echo ""
             fi
-            echo "${GATEWAY_IMAGE_REF}  (pinned gateway — not built by Grid)"
+            echo "${GATEWAY_IMAGE_REF}  (pinned gateway; not built by Grid)"
             docker inspect --format='  ID: {{.Id}}' "${GATEWAY_IMAGE_REF}"
             echo "  Digest: ${RESOLVED_DIGEST}"
             echo ""

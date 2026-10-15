@@ -1816,7 +1816,7 @@ fn verify_weighted_site_distribution(
     gateway_port: u16,
     metrics_port: u16,
     expected_site: &str,
-    require_strict_score_preference: bool,
+    require_strict_pressure_preference: bool,
     phase: &str,
     attribution: &mut RoutingAttributionDiagnostics,
     timeout: Duration,
@@ -1833,7 +1833,7 @@ fn verify_weighted_site_distribution(
     let mut pre_sample_retries = 0_u32;
     while Instant::now() < deadline {
         match read_gateway_metrics(metrics_port).and_then(|metrics| {
-            weighted_route_metrics(&metrics, expected_site, require_strict_score_preference).map_err(Into::into)
+            weighted_route_metrics(&metrics, expected_site, require_strict_pressure_preference).map_err(Into::into)
         }) {
             Ok(current) => {
                 last = format!(
@@ -1856,7 +1856,7 @@ fn verify_weighted_site_distribution(
                     let before_snapshot: Result<_, Box<dyn std::error::Error>> = read_gateway_metrics(metrics_port)
                         .and_then(|metrics| {
                             let state =
-                                weighted_route_metrics(&metrics, expected_site, require_strict_score_preference)
+                                weighted_route_metrics(&metrics, expected_site, require_strict_pressure_preference)
                                     .map_err(Box::<dyn std::error::Error>::from)?;
                             let counts =
                                 route_selection_counts(&metrics).map_err(Box::<dyn std::error::Error>::from)?;
@@ -1902,12 +1902,15 @@ fn verify_weighted_site_distribution(
                         let batch_requests = requests_remaining.min(WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS);
                         let before_metrics = read_gateway_metrics(metrics_port)?;
                         let before_batch =
-                            weighted_route_metrics(&before_metrics, expected_site, require_strict_score_preference)?;
+                            weighted_route_metrics(&before_metrics, expected_site, require_strict_pressure_preference)?;
                         let batch = route_distribution(gateway_port, batch_requests, phase, attribution)?;
                         distribution.merge(batch);
                         let current_metrics = read_gateway_metrics(metrics_port)?;
-                        let after_batch =
-                            weighted_route_metrics(&current_metrics, expected_site, require_strict_score_preference)?;
+                        let after_batch = weighted_route_metrics(
+                            &current_metrics,
+                            expected_site,
+                            require_strict_pressure_preference,
+                        )?;
                         expected_share_windows.push((
                             batch_requests,
                             before_batch.preferred_share,
@@ -1975,7 +1978,7 @@ fn verify_weighted_site_distribution(
         std::thread::sleep(Duration::from_secs(2));
     }
     Err(format!(
-        "Gateway did not expose a stable queue-score order with {expected_site} preferred within {timeout:?}: {last}"
+        "Gateway did not expose a stable queue-score and pressure order with {expected_site} preferred within {timeout:?}: {last}"
     )
     .into())
 }
@@ -1984,7 +1987,7 @@ fn verify_weighted_site_distribution(
 fn weighted_route_metrics(
     metrics: &str,
     preferred_site: &str,
-    require_strict_score_preference: bool,
+    require_strict_pressure_preference: bool,
 ) -> Result<WeightedRouteMetrics, String> {
     let other_site = match preferred_site {
         "pool-a" => "pool-b",
@@ -2012,13 +2015,13 @@ fn weighted_route_metrics(
     };
     let (preferred_score, preferred_weight, preferred_rho) = pair(preferred_site)?;
     let (other_score, other_weight, other_rho) = pair(other_site)?;
-    let score_order_invalid = if require_strict_score_preference {
+    let score_order_invalid = if require_strict_pressure_preference {
         preferred_score >= other_score
     } else {
         preferred_score > other_score
     };
     if score_order_invalid {
-        let relation = if require_strict_score_preference {
+        let relation = if require_strict_pressure_preference {
             "is not strictly lower than"
         } else {
             "is higher than"
@@ -2030,6 +2033,11 @@ fn weighted_route_metrics(
     if preferred_weight <= 0.0 || other_weight <= 0.0 || preferred_rho < 0.0 || other_rho < 0.0 {
         return Err(format!(
             "Gateway route metrics are outside the weighted selector domain: {preferred_site} weight={preferred_weight}, rho={preferred_rho}; {other_site} weight={other_weight}, rho={other_rho}"
+        ));
+    }
+    if require_strict_pressure_preference && preferred_rho >= other_rho {
+        return Err(format!(
+            "Gateway pressure rho for {preferred_site} is not strictly lower than {other_site}: rho={preferred_rho}, other rho={other_rho}"
         ));
     }
     // Keep this expectation aligned with `between_two` in the Grid Gateway filter.
@@ -3101,6 +3109,24 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0.5
         assert!(
             route.is_err_and(|error| error.contains("is not strictly lower")),
             "a tied score must not satisfy the recovery preference assertion"
+        );
+    }
+
+    #[test]
+    fn pressure_transition_rejects_equal_rho_even_when_the_route_score_is_lower() {
+        let metrics = r#"grid_route_site_score{site="pool-a",cluster="llmd-pool-a-provider"} 0
+grid_route_site_weight{site="pool-a",cluster="llmd-pool-a-provider"} 18
+grid_route_site_rho{site="pool-a",cluster="llmd-pool-a-provider"} 0
+grid_route_site_score{site="pool-b",cluster="llmd-pool-b-provider"} 9
+grid_route_site_weight{site="pool-b",cluster="llmd-pool-b-provider"} 18
+grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
+"#;
+
+        let route = weighted_route_metrics(metrics, "pool-a", true);
+
+        assert!(
+            route.is_err_and(|error| error.contains("rho for pool-a is not strictly lower")),
+            "a lower score must not prove the pressure signal changed when rho is tied"
         );
     }
 

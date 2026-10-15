@@ -31,7 +31,7 @@ no healthy routable site gets 503.
 | Waiting per endpoint | `llm_d_epp_average_queue_size`, `inference_pool_per_pod_queue_size` | The EPP, relayed as is. |
 | Held before scheduling | `llm_d_epp_flow_control_queue_size` | The EPP, relayed as is. |
 | Ready endpoints | `llm_d_epp_ready_endpoints` | The EPP, relayed as is. Zero reads as not ready. |
-| KV-cache fullness | `llm_d_epp_average_kv_cache_utilization`, `llm_d_epp_stddev_kv_cache_utilization` | The EPP, relayed as is. Mean and spread are joined per scrape. |
+| KV-cache fullness | `llm_d_epp_average_kv_cache_utilization`, `llm_d_epp_std_dev_kv_cache_utilization` | The EPP, relayed as is. Mean and spread are joined per scrape. |
 
 The gateway concludes in-flight as running plus waiting per endpoint, times ready endpoints,
 plus what flow control holds. The operator's `grid_provider_*` series are its own conclusions

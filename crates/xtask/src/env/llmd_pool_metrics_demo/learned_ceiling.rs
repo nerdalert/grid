@@ -926,11 +926,7 @@ fn run_lifecycle(
         forwards,
         &original_uid,
         0,
-        |snapshot| {
-            snapshot
-                .ceiling
-                .is_some_and(|value| (value - high_ceiling).abs() < f64::EPSILON)
-        },
+        |snapshot| idle_ceiling_is_retained(snapshot.gateway_capacity.in_flight, snapshot.ceiling, high_ceiling),
         "idle-ceiling-retained",
     )?;
     record_phase(context, "idle-ceiling-retained", &idle, None, phases)?;
@@ -1825,6 +1821,11 @@ where
         std::thread::sleep(POLL);
     }
     Err(format!("timed out waiting for {phase}; last observation: {last}").into())
+}
+
+/// Require the Gateway itself to observe zero in-flight load while retaining its learned ceiling.
+fn idle_ceiling_is_retained(gateway_in_flight: Option<f64>, ceiling: Option<f64>, learned_ceiling: f64) -> bool {
+    gateway_in_flight == Some(0.0) && ceiling.is_some_and(|value| (value - learned_ceiling).abs() < f64::EPSILON)
 }
 
 /// Require a deployed KV-cache sample to create a hard bound below a previously learned soft bound.
@@ -4635,10 +4636,10 @@ mod tests {
         READY_METRIC, RUN_EXCLUSION_LABEL, RUNNING_METRIC, RouteDistribution, SITE, access_policy_json_patch,
         capacity_metrics_are_cleared, counted_saturation_is_absent, expected_kv_cache_origin_in_flight,
         gateway_config_observation_count, gateway_config_values_match, hard_bound_without_soft_is_valid,
-        hard_only_epp_in_flight, kv_cache_hard_bound_is_valid, kv_cache_reported_only_route_share_shift,
-        kv_cache_route_share_shift, lifecycle_ceiling_sequence_valid, local_relay_matches, metric_values,
-        no_waiting_or_held_work, parse_epp_readings, policy_with_run_exclusion, probe_failure_value,
-        qualification_succeeded, reported_only_kv_cache_is_valid, returned_ceiling_is_valid,
+        hard_only_epp_in_flight, idle_ceiling_is_retained, kv_cache_hard_bound_is_valid,
+        kv_cache_reported_only_route_share_shift, kv_cache_route_share_shift, lifecycle_ceiling_sequence_valid,
+        local_relay_matches, metric_values, no_waiting_or_held_work, parse_epp_readings, policy_with_run_exclusion,
+        probe_failure_value, qualification_succeeded, reported_only_kv_cache_is_valid, returned_ceiling_is_valid,
         validate_response_attribution,
     };
 
@@ -4715,6 +4716,26 @@ mod tests {
         assert!(
             expected_kv_cache_origin_in_flight(&parsed, KV_REPORTED_ONLY_WAITING_REQUESTS).is_ok(),
             "the full proof's asymmetric endpoint sample must satisfy its exact EPP stimulus"
+        );
+    }
+
+    #[test]
+    fn idle_ceiling_requires_gateway_zero_in_flight_and_the_learned_ceiling() {
+        assert!(
+            idle_ceiling_is_retained(Some(0.0), Some(12.0), 12.0),
+            "an idle Gateway with the learned ceiling should satisfy the wait"
+        );
+        assert!(
+            !idle_ceiling_is_retained(Some(4.0), Some(12.0), 12.0),
+            "a retained ceiling while the Gateway still sees in-flight work is not idle"
+        );
+        assert!(
+            !idle_ceiling_is_retained(None, Some(12.0), 12.0),
+            "a missing Gateway in-flight metric must not count as idle"
+        );
+        assert!(
+            !idle_ceiling_is_retained(Some(0.0), Some(11.0), 12.0),
+            "a changed ceiling must not satisfy retention"
         );
     }
 
