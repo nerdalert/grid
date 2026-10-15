@@ -6,7 +6,43 @@ The AI Grid Network (AGN) Operator defines these resources to describe sites,
 provider capacity, and routing policy. The established API identities remain
 unchanged by the project-name update.
 
-All CRDs are cluster-scoped.
+All CRDs are cluster-scoped and served at `v1alpha1`.
+
+## SiteInvite
+
+Declares an invitation on the signer cluster. The signer pins the site name and
+jurisdictions, optionally binds the invite to a public key digest, and limits
+its lifetime (default `24h`, from `5m` through `168h`). The spec is immutable;
+delete and recreate an invite to change it.
+
+```yaml
+apiVersion: grid.praxis.fast/v1alpha1
+kind: SiteInvite
+metadata:
+  name: east2
+spec:
+  siteName: east2
+  jurisdictions:
+    - eu-west
+  lifetime: 24h
+  allowDeletedName: false
+  # publicKeySHA256: <64 lowercase hex characters>
+```
+
+The status reports the public token ID, the Secret reference holding the
+one-time token, its expiry, redemption details, and conditions. Treat the
+referenced Secret as a credential and deliver it and the grid CA bundle to the
+joining site's operator namespace out of band. The token itself is never
+published in status.
+
+In Kubernetes, the controller reads SiteInvite objects, stores each token in a
+Secret, and revokes unused tokens when an admin deletes an invite.
+Standalone enrollment does not start the controller. Enrollment enforces an
+optional key binding. Jurisdiction assignment and the human approval gate remain
+pending, so a redeemed token currently issues a certificate inline.
+
+The chart stores token Secrets in its release namespace by default. Configure a
+dedicated namespace in the chart values to separate access to those credentials.
 
 ## GridNetwork
 

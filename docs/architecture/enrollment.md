@@ -178,8 +178,10 @@ above with a persistent backend.
 
 ## Direction
 
-The flow above is what ships, driven by chart values and a Job that mints the
-invites. A platform install needs the same flow driven from objects: an invite
-as a SiteInvite the provider admin creates, carrying the approval mode and the
-site's jurisdictions, and the site's join as a Grid kind the operator acts on.
-Neither kind exists yet.
+The flow above ships, driven by chart values and a Job that mints invites.
+In Kubernetes, the enrollment service reconciles SiteInvite objects into
+token Secrets and revokes unused tokens when an admin deletes an invite.
+Standalone enrollment keeps its existing flow. The service enforces an optional
+key binding, but jurisdiction assignment and the approval gate remain pending.
+Redemption still issues immediately. See
+[SiteInvite usage](crds.md#siteinvite).

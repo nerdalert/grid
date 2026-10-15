@@ -55,13 +55,28 @@ fn unique(prefix: &str) -> String {
 /// here.
 fn new_token(site: &str, digest: &str) -> NewSiteToken {
     NewSiteToken {
+        token_id: None,
         token_sha256: digest.to_owned(),
+        public_key_sha256: None,
         site_name: site.to_owned(),
         grid_network_ref: "demo-grid".to_owned(),
         issued_by: "sam".to_owned(),
         expires_at: OffsetDateTime::now_utc().saturating_add(Duration::hours(1)),
         allow_deleted_name: false,
     }
+}
+
+#[tokio::test]
+async fn retrying_a_token_id_accepts_postgres_timestamp_precision() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let mut token = new_token(&unique("retry"), &unique("digest"));
+    token.token_id = Some(uuid::Uuid::new_v4());
+    token.expires_at = OffsetDateTime::now_utc().saturating_add(Duration::hours(1));
+
+    let id = store.mint_site_token(token.clone()).await.expect("first mint");
+    assert_eq!(store.mint_site_token(token).await.expect("retry mint"), id);
 }
 
 /// A signer that issues a stub certificate for the pinned name under a fresh
@@ -521,6 +536,7 @@ fn renewal(site: &str, presented: &str, requested: &str) -> enrollment::Renewal 
 fn resign(site: &str) -> Result<Issued, StoreError> {
     sign_for(&Pin {
         site_name: site.to_owned(),
+        public_key_sha256: None,
     })
 }
 

@@ -203,6 +203,7 @@ Retry-After when present, and stop on 401 and 403.
 | not_found | 404 | No such token or enrollment. |
 | timeout | 408 | The request ran past the server's limit. |
 | name_taken | 409 | Another enrollment holds the site name. |
+| key_mismatch | 409 | The request key differs from the token's bound key; the token stays unspent. |
 | reserved_site | 409 | The name is the enrollment bootstrap's. |
 | token_outstanding | 409 | A live token already pins the site name. |
 | name_deleted | 409 | The name's enrollment was deleted; mint with allowDeletedName. |
@@ -255,6 +256,8 @@ pub enum ErrorError {
     Timeout,
     #[serde(rename = "name_taken")]
     NameTaken,
+    #[serde(rename = "key_mismatch")]
+    KeyMismatch,
     #[serde(rename = "reserved_site")]
     ReservedSite,
     #[serde(rename = "token_outstanding")]
@@ -283,6 +286,7 @@ impl ::std::fmt::Display for ErrorError {
             Self::NotFound => f.write_str("not_found"),
             Self::Timeout => f.write_str("timeout"),
             Self::NameTaken => f.write_str("name_taken"),
+            Self::KeyMismatch => f.write_str("key_mismatch"),
             Self::ReservedSite => f.write_str("reserved_site"),
             Self::TokenOutstanding => f.write_str("token_outstanding"),
             Self::NameDeleted => f.write_str("name_deleted"),
@@ -310,6 +314,7 @@ impl ::std::str::FromStr for ErrorError {
             "not_found" => Ok(Self::NotFound),
             "timeout" => Ok(Self::Timeout),
             "name_taken" => Ok(Self::NameTaken),
+            "key_mismatch" => Ok(Self::KeyMismatch),
             "reserved_site" => Ok(Self::ReservedSite),
             "token_outstanding" => Ok(Self::TokenOutstanding),
             "name_deleted" => Ok(Self::NameDeleted),
