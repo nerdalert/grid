@@ -9,17 +9,21 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
 use super::{
-    CLUSTERS, CONSUMER_TLS_SECRET, CurlProbeDiagnostic, DemoContext, GRID_NETWORK_NAME, GRID_SERVING_CONFIGMAP,
-    GRID_SERVING_GATEWAY, GRID_SERVING_GATEWAY_PORT, GRID_SERVING_METRICS_PORT, GRID_SERVING_SITE, GRID_SYSTEM_NS,
-    MetricsTransport, OPERATOR_METRICS_PORT, OVERLAY_CONFIGMAP, PROVIDER_GATEWAY_PORT, PortForwardGuard, ProofResult,
-    VCR_MODEL, curl_probe_diagnostics, find_free_port, format_utc_iso, get_configmap_data_key, kind_context, kubectl,
-    run_cluster_prefix, set_simulator_waiting_requests, split_image_reference,
+    CLUSTERS, CONSUMER_TLS_SECRET, CurlProbeDiagnostic, DemoContext, EppMetrics, GRID_NETWORK_NAME,
+    GRID_SERVING_CONFIGMAP, GRID_SERVING_GATEWAY, GRID_SERVING_GATEWAY_PORT, GRID_SERVING_METRICS_PORT,
+    GRID_SERVING_SITE, GRID_SYSTEM_NS, MetricsTransport, OPERATOR_METRICS_PORT, OVERLAY_CONFIGMAP,
+    PROVIDER_GATEWAY_PORT, PortForwardGuard, ProofResult, VCR_MODEL, collect_image_evidence, curl_probe_diagnostics,
+    find_free_port, format_utc_iso, format_utc_rfc3339, get_configmap_data_key, kind_context, kubectl,
+    kubectl_exec_epp_metrics, learned_ceiling::source_identity, parse_required_epp_metrics, run_cluster_prefix,
+    set_simulator_waiting_requests, set_simulator_waiting_requests_observed, simulator_metrics, split_image_reference,
 };
 
 /// One live peer is sufficient for the two-site topology used by this proof.
@@ -57,6 +61,410 @@ type ServingCandidatePair = (String, String);
 type ServingCandidatePairsResult = Result<BTreeSet<ServingCandidatePair>, Box<dyn std::error::Error>>;
 /// Process-wide request counter so separate routing samples never reuse a session identifier.
 static SITE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Interval between samples in the signal-only convergence measurements.
+const SIGNAL_CONVERGENCE_POLL: Duration = Duration::from_secs(2);
+
+/// One timestamped scrape in a convergence observation window.
+#[derive(Clone)]
+struct TimedPoint {
+    /// UTC time when this sample completed.
+    observed_at: String,
+    /// Monotonic time when this sample completed.
+    observed_instant: Instant,
+    /// Bounded diagnostic values from the sample.
+    values: serde_json::Value,
+}
+
+/// Last old-state and first new-state samples for one convergence stage.
+#[derive(Clone, Default)]
+struct ObservationWindow {
+    /// Last sample that did not show the target state.
+    last_not_target: Option<TimedPoint>,
+    /// First sample that showed the target state.
+    first_target: Option<TimedPoint>,
+    /// Number of successful samples retained for the stage.
+    sample_count: usize,
+    /// Actual spacing between successful sample completions.
+    successful_sample_intervals_ms: Vec<f64>,
+    /// Timestamped scrape errors that occurred while polling the stage.
+    sample_errors: Vec<serde_json::Value>,
+    /// Completion time of the preceding successful sample.
+    last_sample_instant: Option<Instant>,
+}
+
+impl ObservationWindow {
+    /// Retain an observation as either old state or the first target state.
+    fn observe(&mut self, point: TimedPoint, target: bool) {
+        if let Some(previous) = self.last_sample_instant {
+            self.successful_sample_intervals_ms
+                .push(point.observed_instant.saturating_duration_since(previous).as_secs_f64() * 1000.0);
+        }
+        self.last_sample_instant = Some(point.observed_instant);
+        self.sample_count = self.sample_count.saturating_add(1);
+        if target {
+            self.first_target.get_or_insert(point);
+        } else {
+            self.last_not_target = Some(point);
+        }
+    }
+
+    /// Preserve a failed scrape without treating it as either old or target state.
+    fn record_error(&mut self, error: &str) {
+        self.sample_errors.push(serde_json::json!({
+            "observed_at": format_utc_rfc3339().unwrap_or_else(|timestamp_error| {
+                format!("timestamp unavailable: {timestamp_error}")
+            }),
+            "error": error
+        }));
+    }
+
+    /// Add sample cadence and errors to either a successful or partial stage record.
+    fn sample_evidence(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sample_count": self.sample_count,
+            "successful_sample_intervals_ms": self.successful_sample_intervals_ms,
+            "sample_errors": self.sample_errors
+        })
+    }
+
+    /// Render one stage with polling-bounded elapsed times.
+    fn evidence(&self, start: Instant, previous: Option<&Self>) -> serde_json::Value {
+        let Some(first_target) = &self.first_target else {
+            return serde_json::json!({
+                "status": "not_observed",
+                "last_not_target": self.last_not_target.as_ref().map(|point| {
+                    serde_json::json!({"observed_at": point.observed_at, "values": point.values})
+                }),
+                "poll_sleep_interval_ms": SIGNAL_CONVERGENCE_POLL.as_secs_f64() * 1000.0,
+                "samples": self.sample_evidence()
+            });
+        };
+        serde_json::json!({
+            "status": "observed",
+            "last_not_target": self.last_not_target.as_ref().map(|point| {
+                serde_json::json!({"observed_at": point.observed_at, "values": point.values})
+            }),
+            "first_target": {
+                "observed_at": first_target.observed_at,
+                "values": first_target.values
+            },
+            "elapsed_from_change_request_ms": observation_elapsed_bounds_ms(start, self),
+            "elapsed_from_previous_stage_ms": previous.and_then(|before| observation_stage_bounds_ms(before, self)),
+            "observation_window_ms": self.last_not_target.as_ref().map(|last| {
+                first_target.observed_instant
+                    .saturating_duration_since(last.observed_instant)
+                    .as_secs_f64() * 1000.0
+            }),
+            "poll_sleep_interval_ms": SIGNAL_CONVERGENCE_POLL.as_secs_f64() * 1000.0,
+            "samples": self.sample_evidence(),
+            "interpretation": "sampled transition time is bounded by the last old-state and first target-state observations"
+        })
+    }
+}
+
+/// Timing record for one simulator-signal change through the receiving operator and Gateway.
+struct SignalOnlyTiming {
+    /// Route-change request start in UTC.
+    requested_at: String,
+    /// Monotonic request start used for duration calculations.
+    requested_instant: Instant,
+    /// Completion of the pool-A simulator configuration write and rollout.
+    pool_a_simulator_applied: Option<TimedPoint>,
+    /// Completion of the pool-B simulator configuration write and rollout.
+    pool_b_simulator_applied: Option<TimedPoint>,
+    /// Direct EPP observations at both source sites.
+    source_epp: Option<ObservationWindow>,
+    /// Local and relayed samples observed by the Gateway's site operator.
+    receiving_operator: Option<ObservationWindow>,
+    /// Effective preferred-site state exposed by the Gateway route metrics.
+    gateway_preference: Option<ObservationWindow>,
+    /// Existing weighted routing assertion start time.
+    traffic_assertion_started: Option<TimedPoint>,
+    /// Existing weighted routing assertion result and completion time.
+    traffic_assertion_completed: Option<TimedPoint>,
+    /// Grid Gateway pod UID before the signal-only change.
+    gateway_pod_uid_before: String,
+    /// Applied serving-config reload count before the signal-only change.
+    gateway_applied_reload_count_before: f64,
+    /// Gateway pod and applied-reload counter after the signal-only change.
+    gateway_invariance: Option<serde_json::Value>,
+}
+
+/// Port-forward endpoints held open for the live signal-only routing proof.
+#[derive(Clone, Copy)]
+struct SignalOnlyEndpoints<'endpoint> {
+    /// Serving Gateway's inference endpoint.
+    gateway_http_port: u16,
+    /// Serving Gateway's metrics endpoint.
+    gateway_metrics_port: u16,
+    /// Serving site's operator metrics endpoint.
+    operator_metrics_port: u16,
+    /// Kubernetes context that owns the serving Gateway.
+    local_context: &'endpoint str,
+}
+
+impl SignalOnlyTiming {
+    /// Start a route-change measurement immediately before mutating simulator pressure.
+    fn new(gateway_pod_uid: String, applied_reload_count: f64) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            requested_at: format_utc_rfc3339()?,
+            requested_instant: Instant::now(),
+            pool_a_simulator_applied: None,
+            pool_b_simulator_applied: None,
+            source_epp: None,
+            receiving_operator: None,
+            gateway_preference: None,
+            traffic_assertion_started: None,
+            traffic_assertion_completed: None,
+            gateway_pod_uid_before: gateway_pod_uid,
+            gateway_applied_reload_count_before: applied_reload_count,
+            gateway_invariance: None,
+        })
+    }
+
+    /// Serialize all measured stages, including any stage left incomplete on failure.
+    fn evidence(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "signal_only_route_convergence",
+            "from_preferred_site": "pool-a",
+            "to_preferred_site": "pool-b",
+            "requested_at": self.requested_at,
+            "simulator_configuration": {
+                "pool_a_update_completed": self.pool_a_simulator_applied.as_ref().map(|point| {
+                    serde_json::json!({
+                        "observed_at": point.observed_at,
+                        "elapsed_from_request_ms": point.observed_instant
+                            .saturating_duration_since(self.requested_instant)
+                            .as_secs_f64() * 1000.0,
+                        "values": point.values
+                    })
+                }),
+                "pool_b_update_completed": self.pool_b_simulator_applied.as_ref().map(|point| {
+                    serde_json::json!({
+                        "observed_at": point.observed_at,
+                        "elapsed_from_request_ms": point.observed_instant
+                            .saturating_duration_since(self.requested_instant)
+                            .as_secs_f64() * 1000.0,
+                        "values": point.values
+                    })
+                })
+            },
+            "gateway_pod_uid_before": self.gateway_pod_uid_before,
+            "gateway_applied_reload_count_before": self.gateway_applied_reload_count_before,
+            "gateway_process_invariance": self.gateway_invariance,
+            "source_epp": self.source_epp.as_ref().map(|stage| stage.evidence(self.requested_instant, None)),
+            "receiving_operator": self.receiving_operator.as_ref().map(|stage| {
+                stage.evidence(self.requested_instant, self.source_epp.as_ref())
+            }),
+            "gateway_effective_preference": self.gateway_preference.as_ref().map(|stage| {
+                stage.evidence(self.requested_instant, self.receiving_operator.as_ref())
+            }),
+            "end_to_end_request_to_gateway_preference_ms": self.gateway_preference.as_ref().map(|stage| {
+                observation_elapsed_bounds_ms(self.requested_instant, stage)
+            }),
+            "existing_traffic_assertion": {
+                "started_at": self.traffic_assertion_started.as_ref().map(|point| point.observed_at.as_str()),
+                "completed_at": self.traffic_assertion_completed.as_ref().map(|point| point.observed_at.as_str()),
+                "elapsed_ms": self.traffic_assertion_started.as_ref().zip(self.traffic_assertion_completed.as_ref()).map(|(start, end)| {
+                    end.observed_instant.saturating_duration_since(start.observed_instant).as_secs_f64() * 1000.0
+                }),
+                "result": self.traffic_assertion_completed.as_ref().map(|point| point.values.clone())
+            }
+        })
+    }
+}
+
+/// Direct EPP signals sampled at both sites before and after a simulator change.
+#[derive(Clone, Copy)]
+struct EppSignalPair {
+    /// Pool-a's own EPP signal.
+    pool_a: EppMetrics,
+    /// Pool-b's own EPP signal.
+    pool_b: EppMetrics,
+}
+
+/// Capture a timestamped direct EPP scrape from each source site.
+fn read_epp_signal_pair(mtls: bool) -> Result<(EppSignalPair, TimedPoint), Box<dyn std::error::Error>> {
+    let first_site_text = kubectl_exec_epp_metrics("pool-a", mtls)?;
+    let first_site = parse_required_epp_metrics(&first_site_text)?;
+    let first_site_observed_at = format_utc_rfc3339()?;
+    let second_site_text = kubectl_exec_epp_metrics("pool-b", mtls)?;
+    let second_site = parse_required_epp_metrics(&second_site_text)?;
+    let second_site_observed_at = format_utc_rfc3339()?;
+    let point = timed_point(serde_json::json!({
+        "pool_a": {
+            "observed_at": first_site_observed_at,
+            "average_queue_size": first_site.queue_size,
+            "average_kv_cache_utilization": first_site.kv_cache
+        },
+        "pool_b": {
+            "observed_at": second_site_observed_at,
+            "average_queue_size": second_site.queue_size,
+            "average_kv_cache_utilization": second_site.kv_cache
+        }
+    }))?;
+    Ok((
+        EppSignalPair {
+            pool_a: first_site,
+            pool_b: second_site,
+        },
+        point,
+    ))
+}
+
+/// Whether direct EPP metrics show the requested simulator pressure at both sites.
+fn epp_signal_pair_matches_pressure(
+    actual: &EppSignalPair,
+    scoring_flavor: super::ScoringFlavor,
+    first_site_waiting: u32,
+    second_site_waiting: u32,
+) -> bool {
+    let (first_site_queue, first_site_kv) = simulator_metrics(first_site_waiting, scoring_flavor);
+    let (second_site_queue, second_site_kv) = simulator_metrics(second_site_waiting, scoring_flavor);
+    let matches = |reading: EppMetrics, queue: u32, kv_cache: f64| {
+        (reading.queue_size - f64::from(queue)).abs() < f64::EPSILON && (reading.kv_cache - kv_cache).abs() < 1e-6
+    };
+    matches(actual.pool_a, first_site_queue, first_site_kv) && matches(actual.pool_b, second_site_queue, second_site_kv)
+}
+
+/// Whether operator metrics show the expected relative in-flight pressure.
+fn operator_pressure_matches(metrics: &str, lower_pressure_site: &str) -> bool {
+    let a = provider_in_flight_value(metrics, "pool-a");
+    let b = provider_in_flight_value(metrics, "pool-b");
+    match (lower_pressure_site, a, b) {
+        ("pool-a", Some(a), Some(b)) => a < b,
+        ("pool-b", Some(a), Some(b)) => b < a,
+        _ => false,
+    }
+}
+
+/// Capture provider in-flight values visible to the receiving pool-a operator.
+fn operator_pressure_values(metrics: &str) -> serde_json::Value {
+    serde_json::json!({
+        "pool_a_in_flight": sample_value(
+            metrics,
+            "grid_provider_in_flight_requests",
+            &[("grid_site", "pool-a"), ("grid_provider", "llmd-pool-a-provider")]
+        ),
+        "pool_b_in_flight": sample_value(
+            metrics,
+            "grid_provider_in_flight_requests",
+            &[("grid_site", "pool-b"), ("grid_provider", "llmd-pool-b-provider")]
+        ),
+        "pool_b_peer_poll_successes": metric_counter(
+            metrics,
+            "grid_peer_poll_total",
+            &[("peer", "pool-b"), ("outcome", "ok")]
+        )
+    })
+}
+
+/// Wait for the operator's relayed EPP values to reflect the requested pressure order.
+fn wait_for_pressure_order(
+    port: u16,
+    lower_pressure_site: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let expected_lower = if lower_pressure_site == "pool-a" {
+        "pool-a"
+    } else {
+        "pool-b"
+    };
+    let expected_higher = if expected_lower == "pool-a" { "pool-b" } else { "pool-a" };
+    let mut last = String::from("operator samples unavailable");
+    while Instant::now() < deadline {
+        match read_operator_metrics(port) {
+            Ok(metrics) => {
+                last = operator_pressure_values(&metrics).to_string();
+                let target = operator_pressure_matches(&metrics, expected_lower);
+                if target {
+                    return Ok(());
+                }
+            },
+            Err(error) => {
+                last = error.to_string();
+            },
+        }
+        std::thread::sleep(SIGNAL_CONVERGENCE_POLL);
+    }
+    Err(format!(
+        "operator did not relay the expected pressure order ({expected_lower} below {expected_higher}): {last}"
+    )
+    .into())
+}
+
+/// Capture the Gateway's weighted selector values for the expected preferred site.
+fn gateway_preference_values(metrics: &str, expected_site: &str, strict: bool) -> serde_json::Value {
+    match weighted_route_metrics(metrics, expected_site, strict) {
+        Ok(route) => serde_json::json!({
+            "preferred_site": expected_site,
+            "preferred_score": route.preferred_score,
+            "other_score": route.other_score,
+            "preferred_weight": route.preferred_weight,
+            "other_weight": route.other_weight,
+            "preferred_rho": route.preferred_rho,
+            "other_rho": route.other_rho,
+            "predicted_preferred_share": route.preferred_share
+        }),
+        Err(error) => serde_json::json!({
+            "preferred_site": expected_site,
+            "expected_preference_observed": false,
+            "diagnostic": error
+        }),
+    }
+}
+
+/// Timestamp one completed observation with monotonic and UTC clocks.
+fn timed_point(values: serde_json::Value) -> Result<TimedPoint, Box<dyn std::error::Error>> {
+    let observed_instant = Instant::now();
+    let observed_at = format_utc_rfc3339()?;
+    Ok(TimedPoint {
+        observed_at,
+        observed_instant,
+        values,
+    })
+}
+
+/// Bound request-to-observation time using the last old and first target samples.
+fn observation_elapsed_bounds_ms(start: Instant, window: &ObservationWindow) -> serde_json::Value {
+    let Some(first_target) = &window.first_target else {
+        return serde_json::json!({"status": "not_observed"});
+    };
+    let lower_bound_ms = window.last_not_target.as_ref().map_or(0.0, |last| {
+        last.observed_instant.saturating_duration_since(start).as_secs_f64() * 1000.0
+    });
+    let upper_bound_ms = first_target
+        .observed_instant
+        .saturating_duration_since(start)
+        .as_secs_f64()
+        * 1000.0;
+    serde_json::json!({
+        "lower_bound_ms": lower_bound_ms,
+        "upper_bound_ms": upper_bound_ms,
+        "interpretation": "actual transition occurred after the last old-state sample and no later than the first target-state sample"
+    })
+}
+
+/// Bound one stage's latency from the prior stage's observation window.
+fn observation_stage_bounds_ms(previous: &ObservationWindow, current: &ObservationWindow) -> Option<serde_json::Value> {
+    let previous_old = previous.last_not_target.as_ref()?;
+    let previous_new = previous.first_target.as_ref()?;
+    let current_old = current.last_not_target.as_ref()?;
+    let current_new = current.first_target.as_ref()?;
+    Some(serde_json::json!({
+        "lower_bound_ms": current_old
+            .observed_instant
+            .saturating_duration_since(previous_new.observed_instant)
+            .as_secs_f64() * 1000.0,
+        "upper_bound_ms": current_new
+            .observed_instant
+            .saturating_duration_since(previous_old.observed_instant)
+            .as_secs_f64() * 1000.0,
+        "interpretation": "stage latency is bounded by both stages' last old-state and first target-state samples"
+    }))
+}
 
 /// One exact node attachment to the run-owned cross-cluster Docker network.
 struct NetworkAttachment {
@@ -377,8 +785,33 @@ fn docker_network_id(network: &str) -> Result<String, Box<dyn std::error::Error>
 pub(super) fn proof(context: &DemoContext) -> ProofResult {
     let mut observations = Vec::new();
     let mut attribution = RoutingAttributionDiagnostics::default();
+    let mut convergence_transitions = Vec::new();
+    let started_instant = Instant::now();
+    let started_at = format_utc_rfc3339().unwrap_or_else(|error| format!("timestamp unavailable: {error}"));
+    let source_identity = match source_identity() {
+        Ok((sha, tracked_worktree_clean, fingerprint)) => serde_json::json!({
+            "sha": sha,
+            "tracked_worktree_clean": tracked_worktree_clean,
+            "worktree_sha256": fingerprint
+        }),
+        Err(error) => serde_json::json!({"error": error.to_string()}),
+    };
+    let image_manifest_result = collect_image_evidence(&context.images)
+        .map_err(|error| error.to_string())
+        .and_then(|images| {
+            validate_image_identities(&images)?;
+            serde_json::to_value(images).map_err(|error| error.to_string())
+        });
+    let image_manifest = image_manifest_result
+        .as_ref()
+        .map_or_else(|error| serde_json::json!({"error": error}), Clone::clone);
     record(&mut observations, "cross-site signal proof started".to_owned());
-    let result = run(context, &mut observations, &mut attribution);
+    let result = run(
+        context,
+        &mut observations,
+        &mut attribution,
+        &mut convergence_transitions,
+    );
     if let Err(error) = &result {
         record(&mut observations, format!("primary proof assertion failed: {error}"));
     }
@@ -427,10 +860,49 @@ pub(super) fn proof(context: &DemoContext) -> ProofResult {
     if let Err(error) = &result {
         record(&mut observations, format!("cross-site signal proof failed: {error}"));
     }
-    let success = run_succeeded
+    let mut success = run_succeeded
         && observations
             .iter()
             .all(|item| !item.contains("final restoration failed"));
+    if source_identity.get("error").is_some() {
+        success = false;
+    }
+    if let Err(error) = &image_manifest_result {
+        success = false;
+        record(
+            &mut observations,
+            format!("[EVIDENCE][FAIL] runtime image identity evidence unavailable: {error}"),
+        );
+    }
+    let primary_error = result.as_ref().err().map(ToString::to_string);
+    match write_convergence_evidence(
+        context,
+        &started_at,
+        started_instant,
+        success,
+        primary_error.as_deref(),
+        &source_identity,
+        &image_manifest,
+        &convergence_transitions,
+    ) {
+        Ok(path) => record(
+            &mut observations,
+            format!("convergence timing evidence: {}", path.display()),
+        ),
+        Err(error) => {
+            success = false;
+            record(
+                &mut observations,
+                format!("[EVIDENCE][FAIL] could not write convergence timing: {error}"),
+            );
+        },
+    }
+    if let Some(error) = source_identity.get("error").and_then(serde_json::Value::as_str) {
+        record(
+            &mut observations,
+            format!("[EVIDENCE][FAIL] source identity unavailable: {error}"),
+        );
+    }
     record(
         &mut observations,
         if success {
@@ -446,6 +918,230 @@ pub(super) fn proof(context: &DemoContext) -> ProofResult {
     }
 }
 
+/// Persist the per-run convergence timing record beside the main xtask evidence.
+fn write_convergence_evidence(
+    context: &DemoContext,
+    started_at: &str,
+    started_instant: Instant,
+    success: bool,
+    error: Option<&str>,
+    source_identity: &serde_json::Value,
+    image_manifest: &serde_json::Value,
+    transitions: &[serde_json::Value],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = context.evidence_dir.join("cross-site-convergence.json");
+    let evidence = serde_json::json!({
+        "schema_version": 1,
+        "source": source_identity,
+        "image_manifest": image_manifest,
+        "started_at": started_at,
+        "completed_at": format_utc_rfc3339()?,
+        "proof_elapsed_ms": started_instant.elapsed().as_secs_f64() * 1000.0,
+        "success": success,
+        "error": error,
+        "poll_sleep_interval_ms": SIGNAL_CONVERGENCE_POLL.as_secs_f64() * 1000.0,
+        "signal_only_transitions": transitions,
+        "topology_convergence_evidence": "learned-ceiling-lifecycle/evidence.json, phases with kind=route_config_convergence_timing"
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&evidence)?)?;
+    Ok(path)
+}
+
+/// Require each requested local image reference to resolve to a Docker image ID.
+fn validate_image_identities(images: &BTreeMap<String, String>) -> Result<(), String> {
+    for required_role in ["operator", "gateway", "grid-gateway", "epp", "vcr", "overlay-sync"] {
+        if !images.contains_key(required_role) {
+            return Err(format!("required {required_role} image identity is missing"));
+        }
+    }
+    for (role, image) in images {
+        let image_id = image
+            .rsplit_once(" (")
+            .and_then(|(_, identity)| identity.strip_suffix(')'))
+            .ok_or_else(|| format!("{role} image evidence has no resolved image ID: {image:?}"))?;
+        let Some(hex_id) = image_id.strip_prefix("sha256:") else {
+            return Err(format!(
+                "{role} image evidence is not an immutable Docker image ID: {image_id:?}"
+            ));
+        };
+        if hex_id.len() != 64 || !hex_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "{role} image evidence has an invalid Docker image ID: {image_id:?}"
+            ));
+        }
+    }
+    if images.is_empty() {
+        return Err("no resolved image identities were recorded".to_owned());
+    }
+    Ok(())
+}
+
+/// Measure the live signal path independently from the surrounding outage proofs.
+fn run_signal_only_shift(
+    context: &DemoContext,
+    endpoints: SignalOnlyEndpoints<'_>,
+    observations: &mut Vec<String>,
+    attribution: &mut RoutingAttributionDiagnostics,
+    convergence_transitions: &mut Vec<serde_json::Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
+    let gateway_uid = gateway_pod_uid(endpoints.local_context)?;
+    let gateway_reloads_before_shift = applied_gateway_reload_count(endpoints.gateway_metrics_port)?;
+    let (source_baseline, source_baseline_point) = read_epp_signal_pair(mtls)?;
+    if epp_signal_pair_matches_pressure(&source_baseline, context.scoring_flavor, 9, 0) {
+        return Err(
+            "the direct EPP source already showed the target pressure before the signal-only transition".into(),
+        );
+    }
+    let receiving_baseline_metrics = read_operator_metrics(endpoints.operator_metrics_port)?;
+    if operator_pressure_matches(&receiving_baseline_metrics, "pool-b") {
+        return Err("the receiving operator already preferred pool-b before the signal-only transition".into());
+    }
+    let gateway_baseline_metrics = read_gateway_metrics(endpoints.gateway_metrics_port)?;
+    if weighted_route_metrics(&gateway_baseline_metrics, "pool-b", true).is_ok() {
+        return Err("the Gateway already preferred pool-b before the signal-only transition".into());
+    }
+    let mut signal_timing = Box::new(SignalOnlyTiming::new(gateway_uid, gateway_reloads_before_shift)?);
+    let pressure_shift_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let first_site_epp = set_simulator_waiting_requests_observed("pool-a", 9, context.scoring_flavor, mtls)?;
+        signal_timing.pool_a_simulator_applied = Some(timed_point(serde_json::json!({
+            "cluster": "pool-a",
+            "waiting_requests": 9,
+            "scoring_strategy": context.scoring_flavor.label(),
+            "completion_includes": "persistent ConfigMap update, simulator rollout, endpoint readiness, and matching EPP metrics",
+            "confirmed_epp_metrics": {
+                "average_queue_size": first_site_epp.queue_size,
+                "average_kv_cache_utilization": first_site_epp.kv_cache
+            },
+            "timestamp_is_upper_bound_after_epp_confirmation": true
+        }))?);
+        let second_site_epp = set_simulator_waiting_requests_observed("pool-b", 0, context.scoring_flavor, mtls)?;
+        signal_timing.pool_b_simulator_applied = Some(timed_point(serde_json::json!({
+            "cluster": "pool-b",
+            "waiting_requests": 0,
+            "scoring_strategy": context.scoring_flavor.label(),
+            "completion_includes": "persistent ConfigMap update, simulator rollout, endpoint readiness, and matching EPP metrics",
+            "confirmed_epp_metrics": {
+                "average_queue_size": second_site_epp.queue_size,
+                "average_kv_cache_utilization": second_site_epp.kv_cache
+            },
+            "timestamp_is_upper_bound_after_epp_confirmation": true
+        }))?);
+
+        let mut source_window = ObservationWindow::default();
+        source_window.observe(source_baseline_point, false);
+        let mut receiving_window = ObservationWindow::default();
+        receiving_window.observe(
+            timed_point(operator_pressure_values(&receiving_baseline_metrics))?,
+            false,
+        );
+        let mut gateway_window = ObservationWindow::default();
+        gateway_window.observe(
+            timed_point(gateway_preference_values(&gateway_baseline_metrics, "pool-b", true))?,
+            false,
+        );
+        let convergence_result = wait_for_signal_convergence(
+            mtls,
+            context.scoring_flavor,
+            &mut source_window,
+            endpoints.operator_metrics_port,
+            &mut receiving_window,
+            endpoints.gateway_metrics_port,
+            &mut gateway_window,
+            Duration::from_secs(120),
+        );
+        signal_timing.source_epp = Some(source_window);
+        signal_timing.receiving_operator = Some(receiving_window);
+        signal_timing.gateway_preference = Some(gateway_window);
+        convergence_result?;
+
+        signal_timing.traffic_assertion_started = Some(timed_point(serde_json::json!({
+            "phase": "live-pressure-shift",
+            "assertion": "weighted route distribution"
+        }))?);
+        match verify_weighted_site_distribution(
+            endpoints.gateway_http_port,
+            endpoints.gateway_metrics_port,
+            "pool-b",
+            true,
+            "live-pressure-shift",
+            attribution,
+            Duration::from_secs(120),
+        ) {
+            Ok(distribution) => {
+                record(observations, format!("live pressure shift: {distribution}"));
+                signal_timing.traffic_assertion_completed = Some(timed_point(serde_json::json!({
+                    "success": true,
+                    "distribution": distribution
+                }))?);
+            },
+            Err(error) => {
+                signal_timing.traffic_assertion_completed = Some(timed_point(serde_json::json!({
+                    "success": false,
+                    "error": error.to_string()
+                }))?);
+                return Err(error);
+            },
+        }
+
+        Ok(())
+    })();
+    let gateway_uid_after = gateway_pod_uid(endpoints.local_context).map_err(|error| error.to_string());
+    let gateway_reload_count_after =
+        applied_gateway_reload_count(endpoints.gateway_metrics_port).map_err(|error| error.to_string());
+    let uid_unchanged = gateway_uid_after
+        .as_ref()
+        .is_ok_and(|uid| uid == &signal_timing.gateway_pod_uid_before);
+    let reload_count_unchanged = gateway_reload_count_after
+        .as_ref()
+        .is_ok_and(|count| (*count - signal_timing.gateway_applied_reload_count_before).abs() <= f64::EPSILON);
+    signal_timing.gateway_invariance = Some(serde_json::json!({
+        "pod_uid_after": gateway_uid_after.as_ref().ok(),
+        "pod_uid_error": gateway_uid_after.as_ref().err(),
+        "pod_uid_unchanged": uid_unchanged,
+        "applied_reload_count_after": gateway_reload_count_after.as_ref().ok(),
+        "applied_reload_count_error": gateway_reload_count_after.as_ref().err(),
+        "applied_reload_count_unchanged": reload_count_unchanged
+    }));
+    let mut pressure_shift_result = pressure_shift_result;
+    let invariance_error = if let Err(error) = &gateway_uid_after {
+        Some(format!(
+            "could not read Grid Gateway pod UID after signal-only change: {error}"
+        ))
+    } else if let Err(error) = &gateway_reload_count_after {
+        Some(format!(
+            "could not read Grid Gateway applied reload count after signal-only change: {error}"
+        ))
+    } else if !uid_unchanged {
+        Some(format!(
+            "Grid Gateway pod changed during the A-to-B signal shift: {} -> {}",
+            signal_timing.gateway_pod_uid_before,
+            gateway_uid_after.as_ref().map_or("unavailable", String::as_str)
+        ))
+    } else if !reload_count_unchanged {
+        Some("Grid Gateway reloaded serving configuration during the signal-only pressure shift".to_owned())
+    } else {
+        None
+    };
+    if pressure_shift_result.is_ok()
+        && let Some(error) = invariance_error
+    {
+        pressure_shift_result = Err(error.into());
+    }
+    if uid_unchanged && reload_count_unchanged {
+        record(
+            observations,
+            format!(
+                "Grid Gateway pod UID remained {}; its applied serving-config reload count stayed unchanged at {}",
+                signal_timing.gateway_pod_uid_before, signal_timing.gateway_applied_reload_count_before
+            ),
+        );
+    }
+    convergence_transitions.push(signal_timing.evidence());
+    pressure_shift_result?;
+    Ok(())
+}
+
 /// Execute the ordered signal, routing, outage, recovery, and identity checks.
 #[expect(
     clippy::too_many_lines,
@@ -455,6 +1151,7 @@ fn run(
     context: &DemoContext,
     observations: &mut Vec<String>,
     attribution: &mut RoutingAttributionDiagnostics,
+    convergence_transitions: &mut Vec<serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let image = context
         .images
@@ -540,36 +1237,19 @@ fn run(
         Duration::from_secs(120),
     )
     .map(|distribution| record(observations, format!("lower-pressure baseline: {distribution}")))?;
-    let gateway_uid = gateway_pod_uid(&local_context)?;
-    let gateway_reloads_before_shift = applied_gateway_reload_count(gateway_metrics_port)?;
-
-    set_simulator_waiting_requests("pool-a", 9, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
-    wait_for_pressure_order(operator_metrics_port, "pool-b", Duration::from_secs(120))?;
-    verify_weighted_site_distribution(
-        gateway_http_port,
-        gateway_metrics_port,
-        "pool-b",
-        true,
-        "live-pressure-shift",
-        attribution,
-        Duration::from_secs(120),
-    )
-    .map(|distribution| record(observations, format!("live pressure shift: {distribution}")))?;
-    let gateway_uid_after_shift = gateway_pod_uid(&local_context)?;
-    if gateway_uid != gateway_uid_after_shift {
-        return Err(format!(
-            "Grid Gateway pod changed during the A-to-B signal shift: {gateway_uid} -> {gateway_uid_after_shift}"
-        )
-        .into());
-    }
-    if (applied_gateway_reload_count(gateway_metrics_port)? - gateway_reloads_before_shift).abs() > f64::EPSILON {
-        return Err("Grid Gateway reloaded serving configuration during the signal-only pressure shift".into());
-    }
-    record(
+    run_signal_only_shift(
+        context,
+        SignalOnlyEndpoints {
+            gateway_http_port,
+            gateway_metrics_port,
+            operator_metrics_port,
+            local_context: &local_context,
+        },
         observations,
-        format!("Grid Gateway pod UID remained {gateway_uid}; its serving-config reload count stayed unchanged"),
-    );
+        attribution,
+        convergence_transitions,
+    )?;
+    let gateway_uid = gateway_pod_uid(&local_context)?;
 
     let metrics_before_signal_loss = read_gateway_metrics(gateway_metrics_port)?;
     let active_site_metrics = require_active_signal_gauges(&metrics_before_signal_loss, "pool-a", POOL_A_PROVIDER)?;
@@ -2145,41 +2825,73 @@ fn wait_for_site_distribution(
     )
 }
 
-/// Wait for the operator's relayed EPP values to reflect the requested low-pressure site.
-fn wait_for_pressure_order(
-    port: u16,
-    lower_pressure_site: &str,
+/// Sample the source EPPs, receiving operator, and Gateway in order until all see the pressure shift.
+fn wait_for_signal_convergence(
+    mtls: bool,
+    scoring_flavor: super::ScoringFlavor,
+    source_window: &mut ObservationWindow,
+    operator_port: u16,
+    receiving_window: &mut ObservationWindow,
+    gateway_port: u16,
+    gateway_window: &mut ObservationWindow,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
-    let (expected_lower, expected_higher) = if lower_pressure_site == "pool-a" {
-        ("pool-a", "pool-b")
-    } else {
-        ("pool-b", "pool-a")
-    };
-    let mut last = String::from("operator samples unavailable");
+    let mut last_source = String::from("no direct EPP samples after the pressure change");
+    let mut last_receiving = String::from("no receiving-operator samples after the pressure change");
+    let mut last_gateway = String::from("no Gateway samples after the pressure change");
     while Instant::now() < deadline {
-        if let Ok(metrics) = read_operator_metrics(port) {
-            let a = sample_value(
-                &metrics,
-                "grid_provider_in_flight_requests",
-                &[("grid_site", "pool-a"), ("grid_provider", "llmd-pool-a-provider")],
-            );
-            let b = sample_value(
-                &metrics,
-                "grid_provider_in_flight_requests",
-                &[("grid_site", "pool-b"), ("grid_provider", "llmd-pool-b-provider")],
-            );
-            last = format!("pool-a={a:?}, pool-b={b:?}");
-            let (low, high) = if expected_lower == "pool-a" { (a, b) } else { (b, a) };
-            if low.zip(high).is_some_and(|(low, high)| low < high) {
-                return Ok(());
+        if source_window.first_target.is_none() {
+            match read_epp_signal_pair(mtls) {
+                Ok((sample, point)) => {
+                    last_source.clone_from(&point.values.to_string());
+                    let target = epp_signal_pair_matches_pressure(&sample, scoring_flavor, 9, 0);
+                    source_window.observe(point, target);
+                },
+                Err(error) => {
+                    last_source = error.to_string();
+                    source_window.record_error(&last_source);
+                },
             }
         }
-        std::thread::sleep(Duration::from_secs(2));
+        if receiving_window.first_target.is_none() {
+            match read_operator_metrics(operator_port) {
+                Ok(metrics) => {
+                    last_receiving = operator_pressure_values(&metrics).to_string();
+                    let point = timed_point(operator_pressure_values(&metrics))?;
+                    let target = operator_pressure_matches(&metrics, "pool-b");
+                    receiving_window.observe(point, target);
+                },
+                Err(error) => {
+                    last_receiving = error.to_string();
+                    receiving_window.record_error(&last_receiving);
+                },
+            }
+        }
+        if gateway_window.first_target.is_none() {
+            match read_gateway_metrics(gateway_port) {
+                Ok(metrics) => {
+                    let route = weighted_route_metrics(&metrics, "pool-b", true);
+                    last_gateway = route.as_ref().map_or_else(Clone::clone, |value| format!("{value:?}"));
+                    let point = timed_point(gateway_preference_values(&metrics, "pool-b", true))?;
+                    gateway_window.observe(point, route.is_ok());
+                },
+                Err(error) => {
+                    last_gateway = error.to_string();
+                    gateway_window.record_error(&last_gateway);
+                },
+            }
+        }
+        if source_window.first_target.is_some()
+            && receiving_window.first_target.is_some()
+            && gateway_window.first_target.is_some()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(SIGNAL_CONVERGENCE_POLL);
     }
     Err(format!(
-        "operator did not relay the expected pressure order ({expected_lower} below {expected_higher}): {last}"
+        "signal convergence did not complete within {timeout:?}; source EPP={last_source}; receiving operator={last_receiving}; Gateway={last_gateway}"
     )
     .into())
 }
@@ -3450,6 +4162,87 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
                 "X-Grid-Llmd-Provider-Gateway",
                 "Content-Type"
             ]
+        );
+    }
+
+    #[test]
+    fn observation_window_retains_sample_cadence_and_errors() {
+        let start = Instant::now();
+        let mut window = ObservationWindow::default();
+        window.observe(
+            TimedPoint {
+                observed_at: "sample-old".to_owned(),
+                observed_instant: start,
+                values: serde_json::json!({"preferred_site": "pool-a"}),
+            },
+            false,
+        );
+        window.record_error("temporary scrape error");
+        window.observe(
+            TimedPoint {
+                observed_at: "sample-new".to_owned(),
+                observed_instant: start + Duration::from_secs(2),
+                values: serde_json::json!({"preferred_site": "pool-b"}),
+            },
+            true,
+        );
+
+        let evidence = window.evidence(start, None);
+        assert_eq!(evidence["status"], "observed");
+        assert_eq!(evidence["samples"]["sample_count"], 2);
+        assert_eq!(
+            evidence["samples"]["sample_errors"][0]["error"],
+            "temporary scrape error"
+        );
+        assert_eq!(evidence["samples"]["successful_sample_intervals_ms"][0], 2000.0);
+        assert_eq!(evidence["last_not_target"]["observed_at"], "sample-old");
+        assert_eq!(evidence["first_target"]["observed_at"], "sample-new");
+    }
+
+    #[test]
+    fn incomplete_observation_window_keeps_partial_failure_evidence() {
+        let mut window = ObservationWindow::default();
+        window.record_error("operator metrics unavailable");
+        let evidence = window.evidence(Instant::now(), None);
+
+        assert_eq!(evidence["status"], "not_observed");
+        assert_eq!(
+            evidence["samples"]["sample_errors"][0]["error"],
+            "operator metrics unavailable"
+        );
+        assert_eq!(evidence["samples"]["sample_count"], 0);
+    }
+
+    #[test]
+    fn stage_bounds_use_both_previous_and_current_observation_windows() {
+        let start = Instant::now();
+        let point = |offset_seconds: u64, name: &str| TimedPoint {
+            observed_at: name.to_owned(),
+            observed_instant: start + Duration::from_secs(offset_seconds),
+            values: serde_json::Value::Null,
+        };
+        let mut source = ObservationWindow::default();
+        source.observe(point(0, "source-old"), false);
+        source.observe(point(2, "source-new"), true);
+        let mut receiving = ObservationWindow::default();
+        receiving.observe(point(3, "operator-old"), false);
+        receiving.observe(point(5, "operator-new"), true);
+
+        let bounds = observation_stage_bounds_ms(&source, &receiving).unwrap_or_else(|| std::process::abort());
+        assert_eq!(bounds["lower_bound_ms"], 1000.0);
+        assert_eq!(bounds["upper_bound_ms"], 5000.0);
+    }
+
+    #[test]
+    fn convergence_evidence_requires_resolved_local_image_ids() {
+        let roles = ["operator", "gateway", "grid-gateway", "epp", "vcr", "overlay-sync"];
+        let valid = roles
+            .into_iter()
+            .map(|role| (role.to_owned(), format!("{role}:source (sha256:{})", "a".repeat(64))))
+            .collect();
+        assert!(validate_image_identities(&valid).is_ok());
+        assert!(
+            validate_image_identities(&BTreeMap::from([("gateway".to_owned(), "ai:local ()".to_owned())])).is_err()
         );
     }
 }

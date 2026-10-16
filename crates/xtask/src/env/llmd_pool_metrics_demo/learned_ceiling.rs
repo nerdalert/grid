@@ -27,8 +27,8 @@ use super::{
         RouteDistribution, SiteRouteResponse, has_connected_swim_peer, read_connected_sites, read_gateway_metrics,
         read_operator_metrics, send_site_request, start_ready_port_forward,
     },
-    format_utc_iso, get_configmap_data_key, kind_context, kubectl, kubectl_exec_epp_metrics, run_cluster_prefix,
-    set_simulator_fake_metrics, set_simulator_fake_metrics_with_endpoint_kv,
+    format_utc_iso, format_utc_rfc3339, get_configmap_data_key, kind_context, kubectl, kubectl_exec_epp_metrics,
+    run_cluster_prefix, set_simulator_fake_metrics, set_simulator_fake_metrics_with_endpoint_kv,
 };
 use crate::env::verify::PortForwardGuard;
 
@@ -210,6 +210,10 @@ struct GatewayCapacityMetrics {
 /// One timestamped view of operator, mounted, Gateway, and EPP state.
 #[derive(Clone)]
 struct RuntimeSnapshot {
+    /// UTC wall-clock time when the operator ConfigMap sample completed.
+    operator_observed_at: String,
+    /// Monotonic instant when the operator ConfigMap sample completed.
+    operator_observed_instant: Instant,
     /// Operator-generated serving JSON.
     operator_config: String,
     /// Operator ConfigMap content digest.
@@ -246,6 +250,12 @@ struct RuntimeSnapshot {
     gateway_metrics: String,
     /// Grid Gateway's cumulative applied and reused serving-config watcher observations.
     gateway_reloads: f64,
+    /// Grid Gateway's cumulative applied serving-config reloads.
+    gateway_applied_reloads: f64,
+    /// UTC wall-clock time when mounted config and Gateway metrics were sampled.
+    gateway_observed_at: String,
+    /// Monotonic instant when mounted config and Gateway metrics were sampled.
+    gateway_observed_instant: Instant,
     /// Finite ceiling value, if the Gateway exports one for this pair.
     ceiling: Option<f64>,
     /// Raw ceiling gauge value, including the literal `NaN` when cleared.
@@ -264,6 +274,33 @@ struct RuntimeSnapshot {
     horizon_ms: u64,
     /// Gateway load-store retention configured in the mounted serving file.
     window_secs: u64,
+}
+
+/// Timestamped publication revision observed in the serving ConfigMap.
+type PublishedRevision = (String, String, String, Instant);
+/// Timestamped Gateway sample for an applied serving revision.
+type RevisionObservation = (String, Instant);
+
+/// Inputs shared by the route-convergence evidence builders.
+struct RouteConfigTimingContext<'context> {
+    /// Name of the add/remove phase being measured.
+    phase: &'context str,
+    /// UTC timestamp for the route-change request.
+    change_requested_at: &'context str,
+    /// Monotonic instant for the route-change request.
+    change_requested_instant: Instant,
+    /// Gateway pod UID captured before the route change.
+    gateway_uid: &'context str,
+    /// Applied reload count captured before the route change.
+    previous_applied_reload_count: f64,
+    /// Last operator observation before it published the new revision.
+    last_operator_without_target: &'context (String, Instant),
+    /// Last Gateway observation before it loaded the exact published revision.
+    last_gateway_without_target: &'context (String, Instant),
+    /// First exact revision observed in the operator's serving ConfigMap.
+    published_revision: Option<&'context PublishedRevision>,
+    /// First exact revision observed as mounted and applied by the Gateway.
+    gateway_loaded_revision: Option<&'context RevisionObservation>,
 }
 
 /// Evidence envelope written independently for this proof.
@@ -537,7 +574,7 @@ fn qualification_succeeded(primary_succeeded: bool, restoration_errors: &[String
 }
 
 /// Capture the source commit and a digest of all source changes present at proof start.
-fn source_identity() -> Result<(String, bool, String), Box<dyn std::error::Error>> {
+pub(super) fn source_identity() -> Result<(String, bool, String), Box<dyn std::error::Error>> {
     let revision = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
     if !revision.status.success() {
         return Err(format!(
@@ -940,6 +977,8 @@ fn run_lifecycle(
             format!("cannot withdraw provider while SWIM is disconnected: connectedSites={connected_before}").into(),
         );
     }
+    let removal_requested_at = format_utc_rfc3339()?;
+    let removal_requested_instant = Instant::now();
     let excluded_policy = patch_access_policy_to_exclude_run_site(original)?;
     trigger_gridnetwork_reconcile_strict(SITE)?;
     trigger_gridnetwork_reconcile_strict(GRID_SERVING_SITE)?;
@@ -960,6 +999,8 @@ fn run_lifecycle(
         &idle,
         0,
         "pair-removed-and-accepted",
+        &removal_requested_at,
+        removal_requested_instant,
         phases,
         probe_failures,
     )?;
@@ -1073,6 +1114,8 @@ fn run_lifecycle(
     let before_return = observe_runtime(context, forwards)?;
     let mut expected_returned = original_candidates.clone();
     expected_returned.insert((SITE.to_owned(), CLUSTER.to_owned()));
+    let return_requested_at = format_utc_rfc3339()?;
+    let return_requested_instant = Instant::now();
     patch_access_policy(original)?;
     trigger_gridnetwork_reconcile_strict(SITE)?;
     trigger_gridnetwork_reconcile_strict(GRID_SERVING_SITE)?;
@@ -1085,6 +1128,8 @@ fn run_lifecycle(
         &before_return,
         LOW_RUNNING_REQUESTS,
         "same-pair-returned-under-low-load",
+        &return_requested_at,
+        return_requested_instant,
         phases,
         probe_failures,
     )?;
@@ -2475,6 +2520,111 @@ fn wait_for_signal(
     Err(format!("timed out waiting for {phase}; last observation: {last}").into())
 }
 
+/// Serialize an exact mounted-revision observation without inflating the poller's stack frame.
+fn route_config_loaded_timing_value(
+    snapshot: &RuntimeSnapshot,
+    timing: &RouteConfigTimingContext<'_>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let (revision, resource_version, published_at, published_instant) = timing
+        .published_revision
+        .ok_or("exact Gateway load has no recorded operator publication")?;
+    let (loaded_at, loaded_instant) = timing
+        .gateway_loaded_revision
+        .ok_or("exact Gateway load has no recorded Gateway sample")?;
+    let (lower_bound_ms, upper_bound_ms) = convergence_latency_bounds_ms(
+        timing.last_operator_without_target.1,
+        *published_instant,
+        timing.last_gateway_without_target.1,
+        *loaded_instant,
+    );
+    Ok(json!({
+        "kind": "route_config_convergence_timing",
+        "status": "exact_revision_loaded",
+        "phase": timing.phase,
+        "route_change_requested_at": timing.change_requested_at,
+        "route_change_request_to_gateway_loaded_upper_bound_ms": loaded_instant
+            .saturating_duration_since(timing.change_requested_instant)
+            .as_secs_f64() * 1000.0,
+        "operator_publication": {
+            "revision": revision,
+            "resource_version": resource_version,
+            "last_pre_change_revision_observed_at": timing.last_operator_without_target.0,
+            "first_changed_revision_observed_at": published_at,
+            "observation_interval_ms": published_instant
+                .saturating_duration_since(timing.last_operator_without_target.1)
+                .as_secs_f64() * 1000.0
+        },
+        "gateway_load": {
+            "revision": revision,
+            "mounted_digest": snapshot.mounted_digest,
+            "pod_uid": snapshot.gateway_uid,
+            "applied_reload_count_before": timing.previous_applied_reload_count,
+            "applied_reload_count_at_first_exact_load": snapshot.gateway_applied_reloads,
+            "last_not_loaded_revision_observed_at": timing.last_gateway_without_target.0,
+            "first_exact_revision_loaded_observed_at": loaded_at,
+            "observation_interval_ms": loaded_instant
+                .saturating_duration_since(timing.last_gateway_without_target.1)
+                .as_secs_f64() * 1000.0
+        },
+        "publish_to_gateway_loaded": {
+            "lower_bound_ms": lower_bound_ms,
+            "upper_bound_ms": upper_bound_ms,
+            "first_observation_delta_ms": loaded_instant
+                .saturating_duration_since(*published_instant)
+                .as_secs_f64() * 1000.0,
+            "interpretation": "sampled transition bounds use the last old and first changed operator observations and the last non-loaded and first exact-revision Gateway observations"
+        },
+        "poll_sleep_interval_ms": POLL.as_secs_f64() * 1000.0,
+        "gateway_uid_unchanged_at_load": snapshot.gateway_uid == timing.gateway_uid,
+        "operator_revision_matches_mounted_gateway": snapshot.operator_digest == snapshot.mounted_digest
+    }))
+}
+
+/// Serialize a Gateway replacement observation independently of the timing poller.
+fn route_config_gateway_replaced_timing_value(
+    snapshot: &RuntimeSnapshot,
+    timing: &RouteConfigTimingContext<'_>,
+) -> Value {
+    json!({
+        "kind": "route_config_convergence_timing",
+        "status": "gateway_pod_replaced",
+        "phase": timing.phase,
+        "route_change_requested_at": timing.change_requested_at,
+        "expected_gateway_pod_uid": timing.gateway_uid,
+        "observed_gateway_pod_uid": snapshot.gateway_uid,
+        "operator_revision": snapshot.operator_digest,
+        "operator_resource_version": snapshot.operator_resource_version,
+        "mounted_revision": snapshot.mounted_digest,
+        "applied_reload_count": snapshot.gateway_applied_reloads,
+        "operator_observed_at": snapshot.operator_observed_at,
+        "gateway_observed_at": snapshot.gateway_observed_at,
+        "poll_sleep_interval_ms": POLL.as_secs_f64() * 1000.0
+    })
+}
+
+/// Serialize partial observations when the operator or Gateway never reached the target revision.
+fn route_config_partial_timing_value(timing: &RouteConfigTimingContext<'_>, last_runtime_summary: &str) -> Value {
+    json!({
+        "kind": "route_config_convergence_timing",
+        "status": "convergence_not_observed",
+        "phase": timing.phase,
+        "route_change_requested_at": timing.change_requested_at,
+        "last_pre_change_revision_observed_at": timing.last_operator_without_target.0,
+        "first_changed_revision_observation": timing.published_revision.map(|(digest, resource_version, observed_at, _)| {
+            json!({
+                "revision": digest,
+                "resource_version": resource_version,
+                "observed_at": observed_at
+            })
+        }),
+        "first_exact_revision_loaded_observation": timing.gateway_loaded_revision.map(|(observed_at, _)| observed_at),
+        "last_not_loaded_gateway_observation_at": timing.last_gateway_without_target.0,
+        "last_runtime_summary": last_runtime_summary,
+        "poll_sleep_interval_ms": POLL.as_secs_f64() * 1000.0,
+        "interpretation": "partial samples retained; no convergence duration is reported unless both exact publication and Gateway load are observed"
+    })
+}
+
 /// Wait for a fresh operator serving revision and the Gateway's observation of it.
 #[expect(
     clippy::too_many_arguments,
@@ -2489,6 +2639,8 @@ fn wait_for_topology_state(
     previous: &RuntimeSnapshot,
     expected_running: u32,
     phase: &str,
+    change_requested_at: &str,
+    change_requested_instant: Instant,
     phases: &mut Vec<Value>,
     probe_failures: &mut Vec<Value>,
 ) -> Result<RuntimeSnapshot, Box<dyn std::error::Error>> {
@@ -2496,11 +2648,30 @@ fn wait_for_topology_state(
     let mut stable_since = None;
     let mut stable_samples = 0_u32;
     let mut last = String::from("no runtime sample");
+    let mut last_operator_without_target = (
+        previous.operator_observed_at.clone(),
+        previous.operator_observed_instant,
+    );
+    let mut last_gateway_without_target = (previous.gateway_observed_at.clone(), previous.gateway_observed_instant);
+    let mut published_revision: Option<PublishedRevision> = None;
+    let mut gateway_loaded_revision: Option<RevisionObservation> = None;
     while Instant::now() < deadline {
         match observe_runtime(context, forwards) {
             Ok(snapshot) => {
                 last = snapshot_summary(&snapshot);
                 if snapshot.gateway_uid != gateway_uid {
+                    let timing = RouteConfigTimingContext {
+                        phase,
+                        change_requested_at,
+                        change_requested_instant,
+                        gateway_uid,
+                        previous_applied_reload_count: previous.gateway_applied_reloads,
+                        last_operator_without_target: &last_operator_without_target,
+                        last_gateway_without_target: &last_gateway_without_target,
+                        published_revision: published_revision.as_ref(),
+                        gateway_loaded_revision: gateway_loaded_revision.as_ref(),
+                    };
+                    phases.push(route_config_gateway_replaced_timing_value(&snapshot, &timing));
                     return Err(format!(
                         "Gateway pod UID changed during {phase}: {gateway_uid} -> {}",
                         snapshot.gateway_uid
@@ -2509,15 +2680,67 @@ fn wait_for_topology_state(
                 }
                 let pairs = candidate_set(&snapshot.candidates);
                 let mounted_pairs = candidate_set(&snapshot.mounted_candidates);
-                let accepted_revision = pair_present(&snapshot.candidates) == pair_present_expected
+                let operator_has_expected_revision = pair_present(&snapshot.candidates) == pair_present_expected
                     && pair_present(&snapshot.mounted_candidates) == pair_present_expected
                     && pairs == *expected_candidates
                     && mounted_pairs == *expected_candidates
                     && snapshot.operator_digest != previous.operator_digest
                     && snapshot.operator_resource_version != previous.operator_resource_version
-                    && snapshot.operator_digest_annotation == snapshot.operator_digest
+                    && snapshot.operator_digest_annotation == snapshot.operator_digest;
+                if published_revision.is_none()
+                    && snapshot.mounted_digest == previous.operator_digest
+                    && (snapshot.gateway_applied_reloads - previous.gateway_applied_reloads).abs() <= f64::EPSILON
+                {
+                    last_gateway_without_target =
+                        (snapshot.gateway_observed_at.clone(), snapshot.gateway_observed_instant);
+                }
+                if published_revision.is_none() && !operator_has_expected_revision {
+                    last_operator_without_target = (
+                        snapshot.operator_observed_at.clone(),
+                        snapshot.operator_observed_instant,
+                    );
+                }
+                if operator_has_expected_revision {
+                    let is_new_target = published_revision
+                        .as_ref()
+                        .is_none_or(|(digest, ..)| digest != &snapshot.operator_digest);
+                    if is_new_target {
+                        published_revision = Some((
+                            snapshot.operator_digest.clone(),
+                            snapshot.operator_resource_version.clone(),
+                            snapshot.operator_observed_at.clone(),
+                            snapshot.operator_observed_instant,
+                        ));
+                        gateway_loaded_revision = None;
+                    }
+                }
+                let target_revision = published_revision.as_ref().map(|(digest, ..)| digest.as_str());
+                let gateway_reports_target = target_revision.is_some_and(|digest| {
+                    snapshot.mounted_digest == digest
+                        && snapshot.gateway_applied_reloads > previous.gateway_applied_reloads
+                });
+                if gateway_reports_target && gateway_loaded_revision.is_none() {
+                    gateway_loaded_revision =
+                        Some((snapshot.gateway_observed_at.clone(), snapshot.gateway_observed_instant));
+                    let timing = RouteConfigTimingContext {
+                        phase,
+                        change_requested_at,
+                        change_requested_instant,
+                        gateway_uid,
+                        previous_applied_reload_count: previous.gateway_applied_reloads,
+                        last_operator_without_target: &last_operator_without_target,
+                        last_gateway_without_target: &last_gateway_without_target,
+                        published_revision: published_revision.as_ref(),
+                        gateway_loaded_revision: gateway_loaded_revision.as_ref(),
+                    };
+                    phases.push(route_config_loaded_timing_value(&snapshot, &timing)?);
+                } else if !gateway_reports_target && target_revision.is_some() {
+                    last_gateway_without_target =
+                        (snapshot.gateway_observed_at.clone(), snapshot.gateway_observed_instant);
+                }
+                let accepted_revision = operator_has_expected_revision
                     && snapshot.mounted_digest == snapshot.operator_digest
-                    && snapshot.gateway_reloads > previous.gateway_reloads;
+                    && gateway_reports_target;
                 let signals_valid = require_signal_values(&snapshot, f64::from(expected_running));
                 if accepted_revision && signals_valid.is_ok() {
                     let expected_site = (!pair_present_expected).then_some("pool-a");
@@ -2532,7 +2755,13 @@ fn wait_for_topology_state(
                         Some(&response_evidence),
                         phases,
                     )?;
+                    let target_digest = published_revision
+                        .as_ref()
+                        .map(|(digest, ..)| digest.as_str())
+                        .ok_or("accepted Gateway revision has no recorded operator publication")?;
                     let still_state = reloaded.gateway_uid == gateway_uid
+                        && reloaded.operator_digest == target_digest
+                        && reloaded.gateway_applied_reloads > previous.gateway_applied_reloads
                         && require_topology_transition(previous, &reloaded, pair_present_expected, expected_candidates)
                         && require_signal_values(&reloaded, f64::from(expected_running)).is_ok();
                     if still_state {
@@ -2571,6 +2800,18 @@ fn wait_for_topology_state(
         }
         std::thread::sleep(POLL);
     }
+    let timing = RouteConfigTimingContext {
+        phase,
+        change_requested_at,
+        change_requested_instant,
+        gateway_uid,
+        previous_applied_reload_count: previous.gateway_applied_reloads,
+        last_operator_without_target: &last_operator_without_target,
+        last_gateway_without_target: &last_gateway_without_target,
+        published_revision: published_revision.as_ref(),
+        gateway_loaded_revision: gateway_loaded_revision.as_ref(),
+    };
+    phases.push(route_config_partial_timing_value(&timing, &last));
     Err(format!("timed out waiting for {phase}; last observation: {last}").into())
 }
 
@@ -2680,6 +2921,8 @@ fn observe_runtime(
 ) -> Result<RuntimeSnapshot, Box<dyn std::error::Error>> {
     let local_context = kind_context(GRID_SERVING_SITE);
     let config_map = kube_json(&local_context, "get", &format!("configmap/{GRID_SERVING_CONFIGMAP}"))?;
+    let operator_observed_instant = Instant::now();
+    let operator_observed_at = format_utc_rfc3339()?;
     let operator_config = config_map
         .pointer("/data/serving-config.json")
         .and_then(Value::as_str)
@@ -2762,7 +3005,10 @@ fn observe_runtime(
         "pool-A relayed pool-B readiness",
     )?;
     let gateway_metrics = read_gateway_metrics(forwards.gateway_metrics)?;
+    let gateway_observed_instant = Instant::now();
+    let gateway_observed_at = format_utc_rfc3339()?;
     let gateway_reloads = gateway_config_observation_count(&gateway_metrics)?;
+    let gateway_applied_reloads = gateway_applied_reload_count(&gateway_metrics)?;
     let ceiling_raw = metric_sample(
         &gateway_metrics,
         CEILING_METRIC,
@@ -2800,6 +3046,8 @@ fn observe_runtime(
     };
 
     Ok(RuntimeSnapshot {
+        operator_observed_at,
+        operator_observed_instant,
         operator_config,
         operator_digest,
         operator_digest_annotation,
@@ -2818,6 +3066,9 @@ fn observe_runtime(
         local_operator_metric_samples: relevant_operator_metric_lines(&local_operator_metrics),
         gateway_metrics: relevant_gateway_metric_lines(&gateway_metrics),
         gateway_reloads,
+        gateway_applied_reloads,
+        gateway_observed_at,
+        gateway_observed_instant,
         ceiling,
         ceiling_raw,
         ceiling_is_nan,
@@ -3385,6 +3636,8 @@ fn record_phase(
     let record = json!({
         "phase": name,
         "observed_at": format_utc_iso(),
+        "operator_config_observed_at": snapshot.operator_observed_at,
+        "gateway_state_observed_at": snapshot.gateway_observed_at,
         "operator_revision": {
             "content_digest": snapshot.operator_digest,
             "annotation_digest": snapshot.operator_digest_annotation,
@@ -3426,6 +3679,7 @@ fn record_phase(
             "pod_uid": snapshot.gateway_uid,
             "image": snapshot.gateway_image_identity,
             "config_watcher_observation_count": snapshot.gateway_reloads,
+            "applied_config_reload_count": snapshot.gateway_applied_reloads,
             "ceiling_metric": CEILING_METRIC,
             "ceiling_value": finite_ceiling,
             "ceiling_raw": snapshot.ceiling_raw,
@@ -4443,6 +4697,34 @@ fn gateway_config_observation_count(text: &str) -> Result<f64, Box<dyn std::erro
     Ok(observations)
 }
 
+/// Read the Gateway's applied-serving-config counter, excluding unchanged-config observations.
+fn gateway_applied_reload_count(text: &str) -> Result<f64, Box<dyn std::error::Error>> {
+    required_metric(
+        text,
+        "grid_serving_config_reload_total",
+        &[("result", "applied")],
+        "applied serving-config reloads",
+    )
+}
+
+/// Bound publish-to-load latency using the last old and first new observation at each stage.
+fn convergence_latency_bounds_ms(
+    last_operator_old: Instant,
+    first_operator_new: Instant,
+    last_gateway_old: Instant,
+    first_gateway_new: Instant,
+) -> (f64, f64) {
+    let lower = last_gateway_old
+        .saturating_duration_since(first_operator_new)
+        .as_secs_f64()
+        * 1000.0;
+    let upper = first_gateway_new
+        .saturating_duration_since(last_operator_old)
+        .as_secs_f64()
+        * 1000.0;
+    (lower, upper)
+}
+
 /// Read one optional Gateway gauge for the exact pool-B candidate pair.
 fn optional_metric_value(text: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
     metric_sample(text, name, labels)
@@ -4604,7 +4886,7 @@ fn safe_digest(digest: &str) -> String {
 /// Render a compact last-observation summary for timeout diagnostics.
 fn snapshot_summary(snapshot: &RuntimeSnapshot) -> String {
     format!(
-        "revision={} rv={} mounted={} candidates={:?} running={} queue={} kv_cache={}±{:?} ready={} per_endpoint={:?} held={:?}/{} origin={} relay={:?} reloads={} ceiling={:?}/{:?} soft={:?} hard={:?} rho_reported={:?} rho_counted={:?} in_flight={:?} pod={}",
+        "revision={} rv={} mounted={} candidates={:?} running={} queue={} kv_cache={}±{:?} ready={} per_endpoint={:?} held={:?}/{} origin={} relay={:?} reloads={} applied={} ceiling={:?}/{:?} soft={:?} hard={:?} rho_reported={:?} rho_counted={:?} in_flight={:?} pod={}",
         snapshot.operator_digest,
         snapshot.operator_resource_version,
         snapshot.mounted_digest,
@@ -4620,6 +4902,7 @@ fn snapshot_summary(snapshot: &RuntimeSnapshot) -> String {
         snapshot.origin_in_flight,
         snapshot.local_in_flight,
         snapshot.gateway_reloads,
+        snapshot.gateway_applied_reloads,
         snapshot.ceiling,
         snapshot.ceiling_raw,
         snapshot.gateway_capacity.soft_ceiling,
@@ -4633,7 +4916,10 @@ fn snapshot_summary(snapshot: &RuntimeSnapshot) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        time::{Duration, Instant},
+    };
 
     use serde_json::json;
 
@@ -4643,12 +4929,13 @@ mod tests {
         KV_HARD_BOUND_ROUTE_REQUESTS, KV_HARD_BOUND_WAITING_REQUESTS, KV_REPORTED_ONLY_WAITING_REQUESTS,
         LOW_RUNNING_REQUESTS, MIN_REPORTED_KV_POOL_B_SHARE_REDUCTION, MIN_SOFT_BASELINE_POOL_B_SHARE, QUEUE_METRIC,
         READY_METRIC, RUN_EXCLUSION_LABEL, RUNNING_METRIC, RouteDistribution, SITE, access_policy_json_patch,
-        capacity_metrics_are_cleared, counted_saturation_is_absent, expected_kv_cache_origin_in_flight,
-        gateway_config_observation_count, gateway_config_values_match, hard_bound_without_soft_is_valid,
-        hard_only_epp_in_flight, idle_ceiling_is_retained, kv_cache_hard_bound_is_valid,
-        kv_cache_reported_only_route_share_shift, kv_cache_route_share_shift, lifecycle_ceiling_sequence_valid,
-        local_relay_matches, metric_values, no_waiting_or_held_work, parse_epp_readings, policy_with_run_exclusion,
-        probe_failure_value, qualification_succeeded, reported_only_kv_cache_is_valid, returned_ceiling_is_valid,
+        capacity_metrics_are_cleared, convergence_latency_bounds_ms, counted_saturation_is_absent,
+        expected_kv_cache_origin_in_flight, gateway_applied_reload_count, gateway_config_observation_count,
+        gateway_config_values_match, hard_bound_without_soft_is_valid, hard_only_epp_in_flight,
+        idle_ceiling_is_retained, kv_cache_hard_bound_is_valid, kv_cache_reported_only_route_share_shift,
+        kv_cache_route_share_shift, lifecycle_ceiling_sequence_valid, local_relay_matches, metric_values,
+        no_waiting_or_held_work, parse_epp_readings, policy_with_run_exclusion, probe_failure_value,
+        qualification_succeeded, reported_only_kv_cache_is_valid, returned_ceiling_is_valid,
         validate_response_attribution,
     };
 
@@ -5459,6 +5746,33 @@ mod tests {
                 "invalid or non-accepted watcher metrics must not establish readiness: {metrics:?}"
             );
         }
+    }
+
+    #[test]
+    fn route_config_latency_is_bounded_by_observation_windows() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let (lower, upper) = convergence_latency_bounds_ms(at(0), at(2), at(5), at(7));
+
+        assert!(
+            (lower - 3_000.0).abs() < f64::EPSILON,
+            "lower bound should be last not-loaded sample minus first publication sample"
+        );
+        assert!(
+            (upper - 7_000.0).abs() < f64::EPSILON,
+            "upper bound should be first loaded sample minus last old publication sample"
+        );
+    }
+
+    #[test]
+    fn applied_reload_counter_excludes_reused_configs() {
+        let metrics = "grid_serving_config_reload_total{result=\"applied\"} 4\n\
+                       grid_serving_config_reload_total{result=\"reused\"} 12\n";
+        assert_eq!(
+            gateway_applied_reload_count(metrics).unwrap_or_else(|_| std::process::abort()),
+            4.0,
+            "a route revision requires an applied reload, not only a reused config observation"
+        );
     }
 
     #[test]

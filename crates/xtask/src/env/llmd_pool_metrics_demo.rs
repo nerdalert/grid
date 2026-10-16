@@ -1436,8 +1436,18 @@ fn set_simulator_waiting_requests(
     scoring_flavor: ScoringFlavor,
     mtls: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    set_simulator_waiting_requests_observed(cluster, waiting_requests, scoring_flavor, mtls).map(|_| ())
+}
+
+/// Set deterministic pressure and return the EPP sample that confirmed the requested values.
+fn set_simulator_waiting_requests_observed(
+    cluster: &str,
+    waiting_requests: u32,
+    scoring_flavor: ScoringFlavor,
+    mtls: bool,
+) -> Result<EppMetrics, Box<dyn std::error::Error>> {
     let (waiting_requests, kv_cache_usage) = simulator_metrics(waiting_requests, scoring_flavor);
-    set_simulator_fake_metrics(cluster, waiting_requests, 0, kv_cache_usage, mtls)
+    set_simulator_fake_metrics_with_endpoint_kv(cluster, waiting_requests, 0, kv_cache_usage, kv_cache_usage, mtls)
 }
 
 /// Persist all fake simulator metrics and roll its run-owned pods.
@@ -1456,6 +1466,7 @@ fn set_simulator_fake_metrics(
         kv_cache_usage,
         mtls,
     )
+    .map(|_| ())
 }
 
 /// Persist pool metrics with a distinct KV-cache value on each run-owned endpoint.
@@ -1470,7 +1481,7 @@ fn set_simulator_fake_metrics_with_endpoint_kv(
     vcr1_kv_cache_usage: f64,
     vcr2_kv_cache_usage: f64,
     mtls: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<EppMetrics, Box<dyn std::error::Error>> {
     let ctx = kind_context(cluster);
     for (deployment, configmap) in SIMULATOR_CONFIGMAPS {
         let kv_cache_usage = match *deployment {
@@ -1576,7 +1587,7 @@ fn set_simulator_fake_metrics_with_endpoint_kv(
                             "  [OK] {cluster}: simulator waiting-requests={waiting_requests}, endpoint-weighted KV-cache mean={expected_kv_cache:.3}, ready endpoints={expected_endpoints} (vcr-1={}, vcr-2={}) are live in EPP metrics",
                             ready_replicas.vcr_1, ready_replicas.vcr_2,
                         );
-                        return Ok(());
+                        return Ok(metrics);
                     }
                 },
                 Err(error) => last_observed = format!("EPP metrics parse failed: {error}"),
@@ -1957,6 +1968,7 @@ fn kubectl_get_deployment_env(
 // ---------------------------------------------------------------------------
 
 /// Scraped EPP pool metrics (used for convergence gating, not scorecard display).
+#[derive(Clone, Copy)]
 struct EppMetrics {
     /// Average queue size (raw, unnormalized).
     queue_size: f64,
@@ -3556,6 +3568,11 @@ fn format_utc_iso() -> String {
         &ts[11..13],
         &ts[13..15]
     )
+}
+
+/// Format a high-resolution UTC timestamp for convergence measurements.
+fn format_utc_rfc3339() -> Result<String, time::error::Format> {
+    time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)
 }
 
 /// Check if a year is a leap year.
