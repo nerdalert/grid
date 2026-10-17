@@ -1052,11 +1052,16 @@ fn run_signal_only_shift(
         signal_timing.gateway_preference = Some(gateway_window);
         convergence_result?;
 
+        let traffic_assertion = match context.scoring_flavor {
+            super::ScoringFlavor::QueueDepth => "exclusive route to the unqueued site",
+            super::ScoringFlavor::KvCachePressure => "weighted route distribution",
+        };
         signal_timing.traffic_assertion_started = Some(timed_point(serde_json::json!({
             "phase": "live-pressure-shift",
-            "assertion": "weighted route distribution"
+            "assertion": traffic_assertion
         }))?);
-        match verify_weighted_site_distribution(
+        match verify_pressure_routing(
+            context.scoring_flavor,
             endpoints.gateway_http_port,
             endpoints.gateway_metrics_port,
             "pool-b",
@@ -1224,7 +1229,8 @@ fn run(
         ),
     );
 
-    verify_weighted_site_distribution(
+    verify_pressure_routing(
+        context.scoring_flavor,
         gateway_http_port,
         gateway_metrics_port,
         "pool-a",
@@ -1324,7 +1330,8 @@ fn run(
     set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
     set_simulator_waiting_requests("pool-b", 9, context.scoring_flavor, mtls)?;
     wait_for_relay_samples(operator_metrics_port, Duration::from_secs(120))?;
-    verify_weighted_site_distribution(
+    verify_pressure_routing(
+        context.scoring_flavor,
         gateway_http_port,
         gateway_metrics_port,
         "pool-a",
@@ -1342,7 +1349,8 @@ fn run(
     set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
     set_simulator_waiting_requests("pool-b", 9, context.scoring_flavor, mtls)?;
     wait_for_pressure_order(operator_metrics_port, "pool-a", Duration::from_secs(120))?;
-    let pre_pin_route = verify_weighted_site_distribution(
+    let pre_pin_route = verify_pressure_routing(
+        context.scoring_flavor,
         gateway_http_port,
         gateway_metrics_port,
         "pool-a",
@@ -1583,7 +1591,8 @@ fn run(
         Duration::from_secs(90),
     )?;
     wait_for_pressure_order(operator_metrics_port, "pool-b", Duration::from_secs(90))?;
-    verify_weighted_site_distribution(
+    verify_pressure_routing(
+        context.scoring_flavor,
         gateway_http_port,
         gateway_metrics_port,
         "pool-b",
@@ -1701,7 +1710,8 @@ fn prove_network_partition(
     set_simulator_waiting_requests("pool-a", 9, context.scoring_flavor, mtls)?;
     set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
     wait_for_pressure_order(operator_port, "pool-b", Duration::from_secs(120))?;
-    verify_weighted_site_distribution(
+    verify_pressure_routing(
+        context.scoring_flavor,
         gateway_port,
         gateway_metrics_port,
         "pool-b",
@@ -1773,7 +1783,8 @@ fn prove_network_partition(
         successful_polls_before,
         Duration::from_secs(90),
     )?;
-    verify_weighted_site_distribution(
+    verify_pressure_routing(
+        context.scoring_flavor,
         gateway_port,
         gateway_metrics_port,
         "pool-b",
@@ -2486,6 +2497,167 @@ fn weighted_selector_sample_delta(
         ));
     }
     Ok(format!("selector path delta={delta:?}"))
+}
+
+/// Require every response in a queue-pressure sample to use the sole unqueued site.
+fn single_site_selector_sample_delta(
+    before: RouteSelectionCounts,
+    after: RouteSelectionCounts,
+    requests: usize,
+) -> Result<String, String> {
+    let delta = RouteSelectionCounts {
+        between_two: after.between_two - before.between_two,
+        two_choices: after.two_choices - before.two_choices,
+        lone: after.lone - before.lone,
+        by_capacity: after.by_capacity - before.by_capacity,
+    };
+    let expected = f64::from(
+        u32::try_from(requests).map_err(|error| format!("request count does not fit a metric sample: {error}"))?,
+    );
+    if (delta.lone - expected).abs() > f64::EPSILON
+        || delta.between_two.abs() > f64::EPSILON
+        || delta.two_choices.abs() > f64::EPSILON
+        || delta.by_capacity.abs() > f64::EPSILON
+    {
+        return Err(format!(
+            "Gateway selector counters do not match {requests} requests through the lone-site path: before={before:?}, after={after:?}, delta={delta:?}"
+        ));
+    }
+    Ok(format!("selector path delta={delta:?}"))
+}
+
+/// Select the traffic assertion that matches the active pressure signal's routing semantics.
+///
+/// Queue-depth scenarios produce a real backlog, which the current selector deliberately
+/// excludes from weighted spreading. KV-cache scenarios keep queues empty and therefore
+/// continue to qualify the two-site weighted distribution.
+fn verify_pressure_routing(
+    scoring_flavor: super::ScoringFlavor,
+    gateway_port: u16,
+    metrics_port: u16,
+    expected_site: &str,
+    require_strict_pressure_preference: bool,
+    phase: &str,
+    attribution: &mut RoutingAttributionDiagnostics,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match scoring_flavor {
+        super::ScoringFlavor::QueueDepth => verify_single_site_distribution(
+            gateway_port,
+            metrics_port,
+            expected_site,
+            require_strict_pressure_preference,
+            phase,
+            attribution,
+            timeout,
+        ),
+        super::ScoringFlavor::KvCachePressure => verify_weighted_site_distribution(
+            gateway_port,
+            metrics_port,
+            expected_site,
+            require_strict_pressure_preference,
+            phase,
+            attribution,
+            timeout,
+        ),
+    }
+}
+
+/// Verify that queue pressure selects only the expected unqueued site.
+fn verify_single_site_distribution(
+    gateway_port: u16,
+    metrics_port: u16,
+    expected_site: &str,
+    require_strict_pressure_preference: bool,
+    phase: &str,
+    attribution: &mut RoutingAttributionDiagnostics,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut previous = None;
+    let mut stable_samples = 0_u32;
+    let mut last = String::from("Gateway route metrics unavailable");
+    let (before_state, before_counts) = loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Gateway did not expose stable pressure metrics preferring {expected_site} within {timeout:?}: {last}"
+            )
+            .into());
+        }
+        match read_gateway_metrics(metrics_port).and_then(|metrics| {
+            weighted_route_metrics(&metrics, expected_site, require_strict_pressure_preference).map_err(Into::into)
+        }) {
+            Ok(state) => {
+                last = format!("expected_site={expected_site}, state={state:?}");
+                if previous.is_some_and(|before| weighted_route_metrics_stable(before, state)) {
+                    stable_samples = stable_samples.saturating_add(1);
+                } else {
+                    stable_samples = 1;
+                }
+                previous = Some(state);
+                if stable_samples >= 2 {
+                    let stable_state = previous.ok_or("stable Gateway state disappeared before recheck")?;
+                    let rechecked = read_gateway_metrics(metrics_port).and_then(|metrics| {
+                        weighted_route_metrics(&metrics, expected_site, require_strict_pressure_preference)
+                            .map(|rechecked_state| (metrics, rechecked_state))
+                            .map_err(Into::into)
+                    });
+                    match rechecked {
+                        Ok((metrics, rechecked_state))
+                            if weighted_route_metrics_stable(stable_state, rechecked_state) =>
+                        {
+                            let counts = route_selection_counts(&metrics)?;
+                            break (rechecked_state, counts);
+                        },
+                        Ok(_) => {
+                            previous = None;
+                            stable_samples = 0;
+                            "Gateway pressure metrics changed during the pre-sample recheck".clone_into(&mut last);
+                        },
+                        Err(error) => {
+                            previous = None;
+                            stable_samples = 0;
+                            last = format!("Gateway pressure metrics unavailable during pre-sample recheck: {error}");
+                        },
+                    }
+                }
+            },
+            Err(error) => {
+                previous = None;
+                stable_samples = 0;
+                last = error.to_string();
+            },
+        }
+        std::thread::sleep(SIGNAL_CONVERGENCE_POLL);
+    };
+
+    let distribution = route_distribution(gateway_port, WEIGHTED_ROUTE_SAMPLE_REQUESTS, phase, attribution)?;
+    let after_metrics = read_gateway_metrics(metrics_port)?;
+    let after_state = weighted_route_metrics(&after_metrics, expected_site, require_strict_pressure_preference)?;
+    let after_counts = route_selection_counts(&after_metrics)?;
+    let selector_evidence =
+        single_site_selector_sample_delta(before_counts, after_counts, WEIGHTED_ROUTE_SAMPLE_REQUESTS).map_err(
+            |error| format!("{error}; before_state={before_state:?}; after_state={after_state:?}; {distribution}"),
+        )?;
+    let total = distribution.sites.values().sum::<usize>();
+    let selected = distribution.sites.get(expected_site).copied().unwrap_or_default();
+    if total != WEIGHTED_ROUTE_SAMPLE_REQUESTS || selected != WEIGHTED_ROUTE_SAMPLE_REQUESTS {
+        return Err(format!(
+            "queue-pressure route sample sent {total} attributed responses to {:?}; expected all {} requests at {expected_site}; {selector_evidence}; before_state={before_state:?}; after_state={after_state:?}",
+            distribution.sites, WEIGHTED_ROUTE_SAMPLE_REQUESTS
+        )
+        .into());
+    }
+    if !weighted_route_metrics_stable(before_state, after_state) {
+        return Err(format!(
+            "Gateway pressure preference changed during the exclusive route sample: before={before_state:?}; after={after_state:?}; {distribution}"
+        )
+        .into());
+    }
+    let after_route_metrics = route_metric_diagnostics(&after_metrics);
+    Ok(format!(
+        "queue-depth selected only the unqueued site={expected_site}; {selector_evidence}; {distribution}; stable route metrics={after_route_metrics}"
+    ))
 }
 
 /// Wait for Gateway pressure metrics, then compare one attributed sample to the merged weighted selector.
@@ -3954,6 +4126,51 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
         assert!(
             weighted_selector_sample_delta(before, after, 256).is_err(),
             "a sample that changed candidate count or selection tier must fail"
+        );
+    }
+
+    #[test]
+    fn queue_pressure_route_sample_requires_every_request_to_use_the_lone_site_path() {
+        let before = RouteSelectionCounts {
+            between_two: 5.0,
+            two_choices: 2.0,
+            lone: 4.0,
+            by_capacity: 3.0,
+        };
+        let after = RouteSelectionCounts {
+            between_two: 5.0,
+            two_choices: 2.0,
+            lone: 260.0,
+            by_capacity: 3.0,
+        };
+
+        let delta = single_site_selector_sample_delta(before, after, 256);
+
+        assert!(delta.is_ok(), "all requests should select the sole unqueued site");
+        assert!(
+            delta.is_ok_and(|evidence| evidence.contains("lone: 256")),
+            "the evidence should identify the exclusive single-site selector path"
+        );
+    }
+
+    #[test]
+    fn queue_pressure_route_sample_rejects_weighted_or_fallback_selection() {
+        let before = RouteSelectionCounts {
+            between_two: 5.0,
+            two_choices: 2.0,
+            lone: 4.0,
+            by_capacity: 3.0,
+        };
+        let after = RouteSelectionCounts {
+            between_two: 5.0,
+            two_choices: 2.0,
+            lone: 259.0,
+            by_capacity: 4.0,
+        };
+
+        assert!(
+            single_site_selector_sample_delta(before, after, 256).is_err(),
+            "a fallback-path request must not be counted as exclusive routing"
         );
     }
 
