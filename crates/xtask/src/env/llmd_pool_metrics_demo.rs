@@ -2443,6 +2443,7 @@ fn kubectl_exec_epp_metrics(cluster: &str, mtls: bool) -> Result<String, Box<dyn
             .args([
                 "--context",
                 &ctx,
+                "--request-timeout=5s",
                 "-n",
                 GRID_SYSTEM_NS,
                 "exec",
@@ -2469,6 +2470,7 @@ fn kubectl_exec_epp_metrics(cluster: &str, mtls: bool) -> Result<String, Box<dyn
             .args([
                 "--context",
                 &ctx,
+                "--request-timeout=5s",
                 "get",
                 "--raw",
                 "/api/v1/namespaces/grid-system/services/llmd-epp-metrics:9090/proxy/metrics",

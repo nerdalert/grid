@@ -994,10 +994,13 @@ fn run_signal_only_shift(
         );
     }
     let receiving_baseline_metrics = read_operator_metrics(endpoints.operator_metrics_port)?;
+    // Timestamp the pre-change sample now; both simulator rollouts below can take tens of seconds.
+    let receiving_baseline_point = timed_point(operator_pressure_values(&receiving_baseline_metrics))?;
     if operator_pressure_matches(&receiving_baseline_metrics, "pool-b") {
         return Err("the receiving operator already preferred pool-b before the signal-only transition".into());
     }
     let gateway_baseline_metrics = read_gateway_metrics(endpoints.gateway_metrics_port)?;
+    let gateway_baseline_point = timed_point(gateway_preference_values(&gateway_baseline_metrics, "pool-b", true))?;
     if weighted_route_metrics(&gateway_baseline_metrics, "pool-b", true).is_ok() {
         return Err("the Gateway already preferred pool-b before the signal-only transition".into());
     }
@@ -1031,15 +1034,9 @@ fn run_signal_only_shift(
         let mut source_window = ObservationWindow::default();
         source_window.observe(source_baseline_point, false);
         let mut receiving_window = ObservationWindow::default();
-        receiving_window.observe(
-            timed_point(operator_pressure_values(&receiving_baseline_metrics))?,
-            false,
-        );
+        receiving_window.observe(receiving_baseline_point, false);
         let mut gateway_window = ObservationWindow::default();
-        gateway_window.observe(
-            timed_point(gateway_preference_values(&gateway_baseline_metrics, "pool-b", true))?,
-            false,
-        );
+        gateway_window.observe(gateway_baseline_point, false);
         let convergence_result = wait_for_signal_convergence(
             mtls,
             context.scoring_flavor,
@@ -3745,6 +3742,10 @@ fn kubectl_patch_json(
 mod tests {
     use super::*;
 
+    fn json_at<'value>(value: &'value serde_json::Value, pointer: &str) -> &'value serde_json::Value {
+        value.pointer(pointer).unwrap_or_else(|| std::process::abort())
+    }
+
     #[test]
     fn repeated_sample_sequence_gets_a_unique_request_identity() {
         let first = unique_site_request_id(0);
@@ -4188,15 +4189,24 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
         );
 
         let evidence = window.evidence(start, None);
-        assert_eq!(evidence["status"], "observed");
-        assert_eq!(evidence["samples"]["sample_count"], 2);
+        assert_eq!(json_at(&evidence, "/status").as_str(), Some("observed"));
+        assert_eq!(json_at(&evidence, "/samples/sample_count").as_u64(), Some(2));
         assert_eq!(
-            evidence["samples"]["sample_errors"][0]["error"],
-            "temporary scrape error"
+            json_at(&evidence, "/samples/sample_errors/0/error").as_str(),
+            Some("temporary scrape error")
         );
-        assert_eq!(evidence["samples"]["successful_sample_intervals_ms"][0], 2000.0);
-        assert_eq!(evidence["last_not_target"]["observed_at"], "sample-old");
-        assert_eq!(evidence["first_target"]["observed_at"], "sample-new");
+        let sample_interval_ms = json_at(&evidence, "/samples/successful_sample_intervals_ms/0")
+            .as_f64()
+            .unwrap_or_else(|| std::process::abort());
+        assert!((sample_interval_ms - 2000.0).abs() < f64::EPSILON);
+        assert_eq!(
+            json_at(&evidence, "/last_not_target/observed_at").as_str(),
+            Some("sample-old")
+        );
+        assert_eq!(
+            json_at(&evidence, "/first_target/observed_at").as_str(),
+            Some("sample-new")
+        );
     }
 
     #[test]
@@ -4205,12 +4215,12 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
         window.record_error("operator metrics unavailable");
         let evidence = window.evidence(Instant::now(), None);
 
-        assert_eq!(evidence["status"], "not_observed");
+        assert_eq!(json_at(&evidence, "/status").as_str(), Some("not_observed"));
         assert_eq!(
-            evidence["samples"]["sample_errors"][0]["error"],
-            "operator metrics unavailable"
+            json_at(&evidence, "/samples/sample_errors/0/error").as_str(),
+            Some("operator metrics unavailable")
         );
-        assert_eq!(evidence["samples"]["sample_count"], 0);
+        assert_eq!(json_at(&evidence, "/samples/sample_count").as_u64(), Some(0));
     }
 
     #[test]
@@ -4229,8 +4239,14 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
         receiving.observe(point(5, "operator-new"), true);
 
         let bounds = observation_stage_bounds_ms(&source, &receiving).unwrap_or_else(|| std::process::abort());
-        assert_eq!(bounds["lower_bound_ms"], 1000.0);
-        assert_eq!(bounds["upper_bound_ms"], 5000.0);
+        let lower_bound_ms = json_at(&bounds, "/lower_bound_ms")
+            .as_f64()
+            .unwrap_or_else(|| std::process::abort());
+        let upper_bound_ms = json_at(&bounds, "/upper_bound_ms")
+            .as_f64()
+            .unwrap_or_else(|| std::process::abort());
+        assert!((lower_bound_ms - 1000.0).abs() < f64::EPSILON);
+        assert!((upper_bound_ms - 5000.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -4240,9 +4256,13 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
             .into_iter()
             .map(|role| (role.to_owned(), format!("{role}:source (sha256:{})", "a".repeat(64))))
             .collect();
-        assert!(validate_image_identities(&valid).is_ok());
-        assert!(
-            validate_image_identities(&BTreeMap::from([("gateway".to_owned(), "ai:local ()".to_owned())])).is_err()
-        );
+        match validate_image_identities(&valid) {
+            Ok(()) => {},
+            Err(_) => std::process::abort(),
+        }
+        match validate_image_identities(&BTreeMap::from([("gateway".to_owned(), "ai:local ()".to_owned())])) {
+            Err(_) => {},
+            Ok(()) => std::process::abort(),
+        }
     }
 }

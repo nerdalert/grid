@@ -5768,9 +5768,9 @@ mod tests {
     fn applied_reload_counter_excludes_reused_configs() {
         let metrics = "grid_serving_config_reload_total{result=\"applied\"} 4\n\
                        grid_serving_config_reload_total{result=\"reused\"} 12\n";
-        assert_eq!(
-            gateway_applied_reload_count(metrics).unwrap_or_else(|_| std::process::abort()),
-            4.0,
+        let applied_reloads = gateway_applied_reload_count(metrics).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            (applied_reloads - 4.0).abs() < f64::EPSILON,
             "a route revision requires an applied reload, not only a reused config observation"
         );
     }
