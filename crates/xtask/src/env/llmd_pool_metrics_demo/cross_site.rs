@@ -2460,9 +2460,15 @@ struct RouteSelectionCounts {
 /// Read the live selector path counters from the Grid Gateway.
 fn route_selection_counts(metrics: &str) -> Result<RouteSelectionCounts, String> {
     let counter = |path: &str| {
-        sample_value(metrics, "grid_route_selections_total", &[("path", path)])
-            .filter(|value| value.is_finite() && *value >= 0.0)
-            .ok_or_else(|| format!("Gateway has no finite selector counter for path={path}"))
+        match sample_value(metrics, "grid_route_selections_total", &[("path", path)]) {
+            // Prometheus exporters may omit a counter series until its first increment.
+            // An unobserved selector path therefore has a valid cumulative count of zero.
+            None => Ok(0.0),
+            Some(value) if value.is_finite() && value >= 0.0 => Ok(value),
+            Some(value) => Err(format!(
+                "Gateway has an invalid selector counter for path={path}: {value}"
+            )),
+        }
     };
     Ok(RouteSelectionCounts {
         between_two: counter("between_two")?,
@@ -4105,6 +4111,30 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
         assert!(
             delta.is_ok_and(|evidence| evidence.contains("between_two: 256")),
             "the recorded path delta should identify all weighted selections"
+        );
+    }
+
+    #[test]
+    fn route_selection_counts_treat_unobserved_paths_as_zero() {
+        let before = route_selection_counts("grid_route_selections_total{path=\"lone\"} 4\n");
+        let after = route_selection_counts("grid_route_selections_total{path=\"lone\"} 260\n");
+
+        assert!(
+            before.is_ok(),
+            "unused selector paths may be absent from Prometheus output"
+        );
+        assert!(after.is_ok(), "unused selector paths may remain absent after a sample");
+        let before = before.unwrap_or_else(|_| std::process::abort());
+        let after = after.unwrap_or_else(|_| std::process::abort());
+        let delta = single_site_selector_sample_delta(before, after, 256);
+        assert!(
+            delta.is_ok(),
+            "the lone-path sample should pass with other counters omitted"
+        );
+
+        assert!(
+            route_selection_counts("grid_route_selections_total{path=\"lone\"} NaN\n").is_err(),
+            "an emitted non-finite counter remains invalid"
         );
     }
 
