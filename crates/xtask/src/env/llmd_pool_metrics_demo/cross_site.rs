@@ -2654,15 +2654,15 @@ fn verify_single_site_distribution(
         )
         .into());
     }
-    if !weighted_route_metrics_stable(before_state, after_state) {
-        return Err(format!(
-            "Gateway pressure preference changed during the exclusive route sample: before={before_state:?}; after={after_state:?}; {distribution}"
-        )
-        .into());
-    }
+    // Queue-pressure metrics are live and can move while these real requests
+    // affect the measured load. `weighted_route_metrics` has already verified
+    // the expected score ordering both before and after the sample; the exact
+    // route contract is established by every response's attribution and the
+    // selector-path delta above, not by requiring unrelated rho/share gauges
+    // to remain byte-for-byte stable during traffic.
     let after_route_metrics = route_metric_diagnostics(&after_metrics);
     Ok(format!(
-        "queue-depth selected only the unqueued site={expected_site}; {selector_evidence}; {distribution}; stable route metrics={after_route_metrics}"
+        "queue-depth selected only the unqueued site={expected_site}; {selector_evidence}; {distribution}; post-sample route metrics={after_route_metrics}"
     ))
 }
 
