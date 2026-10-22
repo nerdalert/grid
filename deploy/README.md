@@ -47,19 +47,20 @@ hand-edit them. Each generated directory keeps the `values.yaml` that renders
 it. Cloud-specific Kustomize overlays reuse a generated base and patch its
 Services.
 
-- `operator/` is the platform base: the image set through `params.env`, the namespace left
-  to the consumer, metrics TLS from the enrolled site identity, and no platform assumptions.
-  A platform operator vendors this directory, or a flavor of it, and places it in its own
-  namespace.
+- `operator/` is the platform base: the image and the namespace set through `params.env`,
+  metrics TLS from the enrolled site identity, and no platform assumptions. A platform
+  operator vendors this directory, or a flavor of it, and sets `namespace` in `params.env`
+  to place it in its own namespace.
 - Generated `overlays/<flavor>/` directories use the base values plus the flavor's
   `values.yaml` as a delta, rendered against the API versions in its `api-versions` file.
-  `overlays/openshift/` takes metrics TLS from the service CA and adds a NetworkPolicy that
-  admits the platform's monitoring namespaces.
-- `overlays/openshift-aws/` reuses `overlays/openshift/` and adds the AWS NLB
-  annotation to the SWIM and signals Services, matching Helm's `platform: aws`.
-  The default AWS Classic Load Balancer rejects UDP, leaving SWIM without an
-  address and the operator unready. Platform consumers must select this overlay
-  on AWS and vendor both directories; it does not detect the cloud provider.
+  `overlays/openshift/` takes metrics TLS from the service CA, adds a NetworkPolicy that
+  admits the platform's monitoring namespaces, and adds a ServiceMonitor for user workload
+  monitoring, whose selector and TLS server name follow `namespace` in `params.env`.
+- `overlays/openshift/` also sets `platform: any`: internal load balancers for the SWIM and
+  signals Services on AWS (NLBs with cross-zone load balancing, since the default Classic
+  Load Balancer rejects UDP), Azure and GCP (with global access, so other regions reach
+  them). Each cloud reads only its own keys, so the same render serves every OpenShift
+  install.
 - The SWIM and signals Services are `LoadBalancer`, because the operator refuses any other
   type for the Service it advertises and peer sites reach both through it. A cluster with
   no LoadBalancer provider leaves the operator waiting for an address and never ready. The
@@ -78,8 +79,9 @@ make deploy-check
 ```
 
 `deploy-check` requires Helm, yq v4, jq, and Kustomize. It verifies that the
-AWS overlay requests NLBs for the separate UDP SWIM and TCP signals Services
-and changes only those two annotations relative to the OpenShift base.
+generated directories match the chart, and that the OpenShift render requests
+internal load balancers on AWS, Azure and GCP for the separate UDP SWIM and TCP signals
+Services.
 
 ### Install Steps
 
@@ -103,9 +105,6 @@ kubectl apply -k deploy/operator/ -n grid-system
 
 # or OpenShift
 kubectl apply -k deploy/overlays/openshift/ -n grid-system
-
-# or OpenShift on AWS
-kubectl apply -k deploy/overlays/openshift-aws/ -n grid-system
 
 # or kind, which brings its own namespace
 kubectl apply -k deploy/overlays/kind/

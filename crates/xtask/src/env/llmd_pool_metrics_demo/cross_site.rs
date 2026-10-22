@@ -9,7 +9,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    process::{Command, Stdio},
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
@@ -971,8 +971,7 @@ fn prepare_poll_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     for cluster in CLUSTERS {
         restart_operator(cluster)?;
     }
-    apply_grid_gateway_config(&endpoints)?;
-    install_grid_gateway(image)?;
+    install_grid_gateway(image, &endpoints)?;
     wait_for_grid_serving_snapshot(Duration::from_secs(120))?;
     Ok(())
 }
@@ -1290,6 +1289,7 @@ fn provider_gateway_endpoint(site: &str) -> Result<serde_json::Value, Box<dyn st
     let sni = format!("{site}.grid.internal");
     Ok(serde_json::json!({
         "cluster": cluster,
+        "site": site,
         "address": format!("{host}:{PROVIDER_GATEWAY_PORT}"),
         "sni": sni,
         "transport": { "mode": "mutual_tls", "sni": sni }
@@ -1331,63 +1331,8 @@ fn patch_network_for_poll(cluster: &str, endpoints: &[serde_json::Value]) -> Res
     kubectl_patch_json(&ctx, &format!("gridnetwork/{GRID_NETWORK_NAME}"), &patch)
 }
 
-/// Build static provider-hop config, then install the chart-managed Grid Gateway.
-fn apply_grid_gateway_config(endpoints: &[serde_json::Value]) -> Result<(), Box<dyn std::error::Error>> {
-    let clusters: Vec<_> = endpoints
-        .iter()
-        .map(|endpoint| {
-            serde_json::json!({
-                "name": endpoint.get("cluster"),
-                "tls": {
-                    "ca": { "ca_path": "/etc/praxis/tls/ca.crt" },
-                    "client_cert": {
-                        "cert_path": "/etc/praxis/tls/tls.crt",
-                        "key_path": "/etc/praxis/tls/tls.key"
-                    },
-                    "sni": endpoint.get("sni"),
-                    "verify": true
-                },
-                "endpoints": [endpoint.get("address")]
-            })
-        })
-        .collect();
-    let config = serde_json::json!({
-        "insecure_options": {
-            "allow_private_endpoints": true,
-            "allow_private_upstreams": true
-        },
-        "listeners": [{
-            "name": "proxy",
-            "address": "0.0.0.0:8080",
-            "filter_chains": ["main"]
-        }],
-        "filter_chains": [{
-            "name": "main",
-            "filters": [
-                { "filter": "model_to_header", "header": "X-Gateway-Model-Name" },
-                { "filter": "grid_site_route", "model_header": "X-Gateway-Model-Name" },
-                { "filter": "load_balancer", "clusters": clusters }
-            ]
-        }],
-        "admin": { "address": "127.0.0.1:9901" },
-        "shutdown_timeout_secs": 5
-    });
-    let config_yaml = serde_yaml::to_string(&config)?;
-    let config_map = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": "grid-serving-gateway-config",
-            "namespace": GRID_SYSTEM_NS,
-            "labels": { "grid.praxis-proxy.io/run-prefix": run_cluster_prefix() }
-        },
-        "data": { "praxis.yaml": config_yaml }
-    });
-    apply_json(&kind_context(GRID_SERVING_SITE), &config_map)
-}
-
 /// Install the embedded Grid Gateway with a TLS metrics listener for proof evidence.
-fn install_grid_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn install_grid_gateway(image: &str, endpoints: &[serde_json::Value]) -> Result<(), Box<dyn std::error::Error>> {
     let (repository, tag) = split_image_reference(image)?;
     let chart = crate::workspace_root().join("charts/praxis-gateway");
     let chart = chart.to_str().ok_or("Praxis Gateway chart path is not UTF-8")?;
@@ -1412,24 +1357,51 @@ fn install_grid_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
         format!("image.tag={tag}"),
         "image.flavor=grid-gateway".to_owned(),
         "image.pullPolicy=Never".to_owned(),
-        "config.existingConfigMap=grid-serving-gateway-config".to_owned(),
+        "praxisConfig.source=render".to_owned(),
+        format!("grid.siteName={GRID_SERVING_SITE}"),
+        "praxisConfig.render.role=consumer".to_owned(),
+        "praxisConfig.render.auth.mode=none".to_owned(),
         "service.type=ClusterIP".to_owned(),
-        format!("gridServing.network={GRID_NETWORK_NAME}"),
-        format!("gridServing.gatewayRef={GRID_SERVING_GATEWAY}"),
-        format!("gridServing.configMap={GRID_SERVING_CONFIGMAP}"),
-        format!("tls.existingSecret={CONSUMER_TLS_SECRET}"),
-        format!("tls.caSecret={CONSUMER_TLS_SECRET}"),
+        format!("praxisConfig.render.gridServing.networkName={GRID_NETWORK_NAME}"),
+        format!("praxisConfig.render.gridServing.gatewayRefName={GRID_SERVING_GATEWAY}"),
+        format!("praxisConfig.render.gridServing.configMapName={GRID_SERVING_CONFIGMAP}"),
+        format!("gridIdentity.tlsSecretName={CONSUMER_TLS_SECRET}"),
+        format!("gridIdentity.caSecretName={CONSUMER_TLS_SECRET}"),
         "networkPolicy.from[0].namespaceSelector.matchLabels.kubernetes\\.io/metadata\\.name=grid-system".to_owned(),
         "metricsListener.existingSecret=consumer-gateway-tls".to_owned(),
         "metricsListener.fromNamespaces[0]=grid-system".to_owned(),
     ] {
         command.args(["--set-string", &value]);
     }
+    for endpoint in endpoints {
+        let cluster = endpoint
+            .get("cluster")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("provider gateway endpoint has no cluster")?;
+        let site = endpoint
+            .get("site")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} has no site"))?;
+        let address = endpoint
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} has no address"))?;
+        let sni = endpoint
+            .get("sni")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} has no SNI"))?;
+        for value in [
+            format!("praxisConfig.render.backends.{cluster}.endpoint={address}"),
+            format!("praxisConfig.render.backends.{cluster}.site={site}"),
+            format!("praxisConfig.render.backends.{cluster}.transport.mode=mutual_tls"),
+            format!("praxisConfig.render.backends.{cluster}.transport.sni={sni}"),
+        ] {
+            command.args(["--set-string", &value]);
+        }
+    }
     command.args([
         "--set",
-        "gridServing.enabled=true",
-        "--set",
-        "tls.enabled=true",
+        "praxisConfig.render.gridServing.enabled=true",
         "--set",
         "networkPolicy.enabled=true",
         "--set",
@@ -2977,27 +2949,6 @@ fn kubectl_json(context: &str, verb: &str, resource: &str) -> Result<serde_json:
         .into());
     }
     Ok(serde_json::from_slice(&output.stdout)?)
-}
-
-/// Apply a JSON Kubernetes object from stdin.
-fn apply_json(context: &str, object: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = Command::new("kubectl")
-        .args(["--context", context, "apply", "-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let stdin = child.stdin.take().ok_or("kubectl apply has no stdin")?;
-    serde_json::to_writer(stdin, object)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "kubectl apply run-owned object: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(())
 }
 
 /// Merge-patch a Kubernetes resource.

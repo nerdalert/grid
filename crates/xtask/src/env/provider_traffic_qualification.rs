@@ -2,7 +2,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write as _,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -31,7 +30,7 @@ const CLUSTERS: &[&str] = &["provider-a", "provider-b", "provider-c"];
 /// The single consumer gateway used by the focused request-routing proof.
 const CONSUMER_SITE: &str = "provider-a";
 
-/// Consumer gateway TLS secret name (matches Helm `existingSecret` reference).
+/// Consumer gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const CONSUMER_TLS_SECRET: &str = "consumer-gateway-tls";
 
 /// Evidence JSON schema version.
@@ -55,7 +54,7 @@ const OVERLAY_CONFIGMAP: &str = "grid-overlay-grid-provider-traffic-consumer-gat
 /// Physical Kind cluster prefix assigned to this qualification run.
 static RUN_CLUSTER_PREFIX: OnceLock<String> = OnceLock::new();
 
-/// Provider credential secret name (matches Helm `credentials[0].name`).
+/// Provider credential Secret name (matches Helm `providerCredentials[0].secretName`).
 const VCR_INFERENCE_CREDENTIAL: &str = "vcr-inference-credential";
 
 /// Stable terminal separator that also remains readable in captured logs.
@@ -83,7 +82,7 @@ const PROVIDER_RESOURCES: &[(&str, &str)] = &[
     ("provider-c", "vcr-provider-c-provider"),
 ];
 
-/// Provider gateway TLS secret name (matches Helm `existingSecret` reference).
+/// Provider gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const PROVIDER_TLS_SECRET: &str = "provider-gateway-tls";
 
 /// Same-CA client identity with an organization rejected by `peer_identity_trust`.
@@ -2741,6 +2740,7 @@ fn generated_consumer_endpoints() -> Result<Vec<serde_json::Value>, Box<dyn std:
         .map(|(site, resource)| {
             Ok(serde_json::json!({
                 "cluster": resource,
+                "site": site,
                 "address": read_provider_gateway_address(site)?,
                 "transport": {
                     "mode": "mutual_tls",
@@ -2749,6 +2749,46 @@ fn generated_consumer_endpoints() -> Result<Vec<serde_json::Value>, Box<dyn std:
             }))
         })
         .collect()
+}
+
+/// Keep xtask-only site metadata out of the `GridNetwork` endpoint contract.
+fn grid_network_cluster_endpoints(
+    endpoints: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            let cluster = endpoint
+                .get("cluster")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("provider gateway endpoint has no cluster")?;
+            let address = endpoint
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("provider gateway endpoint {cluster} has no address"))?;
+            let transport = endpoint
+                .get("transport")
+                .cloned()
+                .ok_or_else(|| format!("provider gateway endpoint {cluster} has no transport"))?;
+            Ok(serde_json::json!({
+                "cluster": cluster,
+                "address": address,
+                "transport": transport
+            }))
+        })
+        .collect()
+}
+
+/// Read the provider site from the endpoint's explicit routing identity.
+fn provider_gateway_endpoint_site<'endpoint>(
+    endpoint: &'endpoint serde_json::Value,
+    cluster: &str,
+) -> Result<&'endpoint str, Box<dyn std::error::Error>> {
+    endpoint
+        .get("site")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("provider gateway endpoint {cluster} has no site"))
+        .map_err(Into::into)
 }
 
 /// Opt the run-owned provider-a `GatewayRef` into the operator-generated config.
@@ -2791,12 +2831,13 @@ fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> 
         return Err("consumer-gateway already has praxisConfig; refusing to replace unexpected fixture state".into());
     }
 
+    let endpoints = generated_consumer_endpoints()?;
     let consumer_config = serde_json::json!({
         "generate": true,
         "enableProjectedCredentials": true,
         "supportsProjectedCredentials": false,
         "configMapName": "praxis-consumer-config",
-        "clusterEndpoints": generated_consumer_endpoints()?,
+        "clusterEndpoints": grid_network_cluster_endpoints(&endpoints)?,
         "tlsCertMountPath": "/etc/praxis/tls"
     });
     let patch = serde_json::json!([{
@@ -3201,8 +3242,7 @@ fn activate_embedded_serving_gateway() -> AssertionResult {
         crate::env::image_overrides::load_docker_image_into_kind(&image, &kind_name)?;
     }
 
-    apply_embedded_gateway_config(&cluster_context("provider-a"), &endpoints)?;
-    install_embedded_gateway(repository_root, &image)?;
+    install_embedded_gateway(repository_root, &image, &endpoints)?;
     wait_for_deployment(GRID_SERVING_GATEWAY, GRID_SYSTEM_NS, &cluster_context("provider-a"))?;
     let serving_log = wait_for_embedded_serving_log(&initial_serving, &cluster_context("provider-a"), 0, TIMEOUT)?;
     let baseline = send_embedded_lifecycle_request(None)?;
@@ -3450,90 +3490,16 @@ fn restart_grid_operator(cluster: &str) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// Apply the embedded gateway's static listener/backend plumbing; Grid owns the changing candidates.
-#[expect(
-    clippy::too_many_lines,
-    reason = "this renders listener plumbing and static endpoint inventory in one run-owned ConfigMap"
-)]
-fn apply_embedded_gateway_config(
-    context: &str,
-    endpoints: &[serde_json::Value],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let clusters: Vec<_> = endpoints
-        .iter()
-        .map(|endpoint| {
-            let cluster = endpoint
-                .get("cluster")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("generated endpoint has no cluster name")?;
-            let address = endpoint
-                .get("address")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("generated endpoint has no address")?;
-            let sni = endpoint
-                .pointer("/transport/sni")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("generated endpoint has no TLS server name")?;
-            Ok(serde_json::json!({
-                "name": cluster,
-                "tls": {
-                    "ca": { "ca_path": "/etc/praxis/tls/ca.crt" },
-                    "client_cert": {
-                        "cert_path": "/etc/praxis/tls/tls.crt",
-                        "key_path": "/etc/praxis/tls/tls.key"
-                    },
-                    "sni": sni,
-                    "verify": true
-                },
-                "endpoints": [address]
-            }))
-        })
-        .collect::<Result<_, &str>>()?;
-    let config = serde_json::json!({
-        "insecure_options": {
-            "allow_private_endpoints": true,
-            "allow_private_upstreams": true
-        },
-        "listeners": [{
-            "name": "proxy",
-            "address": "0.0.0.0:8080",
-            "filter_chains": ["main"]
-        }],
-        "filter_chains": [{
-            "name": "main",
-            "filters": [
-                { "filter": "model_to_header", "header": "X-Gateway-Model-Name" },
-                { "filter": "grid_site_route", "model_header": "X-Gateway-Model-Name" },
-                { "filter": "load_balancer", "clusters": clusters }
-            ]
-        }],
-        "admin": { "metrics_address": "127.0.0.1:9901" },
-        "shutdown_timeout_secs": 5
-    });
-    let config_yaml = serde_yaml::to_string(&config)?;
-    let run_id = RUN_CLUSTER_PREFIX
-        .get()
-        .ok_or("run-owned cluster prefix was not initialized")?;
-    let config_map = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": "grid-serving-gateway-config",
-            "namespace": GRID_SYSTEM_NS,
-            "labels": { "grid.praxis-proxy.io/run-id": run_id }
-        },
-        "data": { "praxis.yaml": config_yaml }
-    });
-    kubectl_apply_json(context, &config_map)?;
-    Ok(())
-}
-
-/// Install the chart-managed embedded consumer against the Grid serving `ConfigMap`.
+/// Install the chart-managed embedded consumer with its provider-hop endpoints.
 #[expect(
     clippy::too_many_lines,
     reason = "Helm inputs and run-owned rollout verification form one bounded install operation"
 )]
-fn install_embedded_gateway(root: &Path, image: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn install_embedded_gateway(
+    root: &Path,
+    image: &str,
+    endpoints: &[serde_json::Value],
+) -> Result<(), Box<dyn std::error::Error>> {
     let (repository, tag) = parse_image_ref(image);
     let chart = root.join("charts/praxis-gateway");
     let chart = chart.to_str().ok_or("Praxis Gateway chart path is not UTF-8")?;
@@ -3558,17 +3524,43 @@ fn install_embedded_gateway(root: &Path, image: &str) -> Result<(), Box<dyn std:
         format!("image.tag={tag}"),
         "image.flavor=grid-gateway".to_owned(),
         "image.pullPolicy=Never".to_owned(),
-        "config.existingConfigMap=grid-serving-gateway-config".to_owned(),
+        "praxisConfig.source=render".to_owned(),
+        format!("grid.siteName={CONSUMER_SITE}"),
+        "praxisConfig.render.role=consumer".to_owned(),
+        "praxisConfig.render.auth.mode=none".to_owned(),
         "service.type=ClusterIP".to_owned(),
-        format!("gridServing.network={GRID_NETWORK_NAME}"),
-        format!("gridServing.gatewayRef={GRID_SERVING_GATEWAY}"),
-        format!("gridServing.configMap={GRID_SERVING_CONFIGMAP}"),
-        format!("tls.existingSecret={CONSUMER_TLS_SECRET}"),
-        format!("tls.caSecret={CONSUMER_TLS_SECRET}"),
+        format!("praxisConfig.render.gridServing.networkName={GRID_NETWORK_NAME}"),
+        format!("praxisConfig.render.gridServing.gatewayRefName={GRID_SERVING_GATEWAY}"),
+        format!("praxisConfig.render.gridServing.configMapName={GRID_SERVING_CONFIGMAP}"),
+        format!("gridIdentity.tlsSecretName={CONSUMER_TLS_SECRET}"),
+        format!("gridIdentity.caSecretName={CONSUMER_TLS_SECRET}"),
     ] {
         command.args(["--set-string", &value]);
     }
-    command.args(["--set", "gridServing.enabled=true", "--set", "tls.enabled=true"]);
+    for endpoint in endpoints {
+        let cluster = endpoint
+            .get("cluster")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("provider gateway endpoint has no cluster")?;
+        let address = endpoint
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} has no address"))?;
+        let sni = endpoint
+            .pointer("/transport/sni")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} has no SNI"))?;
+        let site = provider_gateway_endpoint_site(endpoint, cluster)?;
+        for value in [
+            format!("praxisConfig.render.backends.{cluster}.endpoint={address}"),
+            format!("praxisConfig.render.backends.{cluster}.site={site}"),
+            format!("praxisConfig.render.backends.{cluster}.transport.mode=mutual_tls"),
+            format!("praxisConfig.render.backends.{cluster}.transport.sni={sni}"),
+        ] {
+            command.args(["--set-string", &value]);
+        }
+    }
+    command.args(["--set", "praxisConfig.render.gridServing.enabled=true"]);
     let output = command.output()?;
     if !output.status.success() {
         return Err(format!(
@@ -3844,31 +3836,6 @@ fn kubectl_patch_merge(
     Ok(())
 }
 
-/// Apply JSON through stdin, so generated `ConfigMap` data is not shell-interpreted.
-fn kubectl_apply_json(context: &str, resource: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = Command::new("kubectl")
-        .args(["--context", context, "-n", GRID_SYSTEM_NS, "apply", "-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let bytes = serde_json::to_vec(resource)?;
-    child
-        .stdin
-        .take()
-        .ok_or("kubectl stdin was not piped")?
-        .write_all(&bytes)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "could not apply run-owned ConfigMap: {}",
-            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 800)
-        )
-        .into());
-    }
-    Ok(())
-}
-
 /// Return the local container-engine image ID for an exact image reference.
 fn docker_image_id(image: &str) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("docker")
@@ -3980,7 +3947,7 @@ fn activate_generated_consumer_config() -> Result<serde_json::Value, Box<dyn std
                 .flatten()
         })
         .any(|mount| {
-            mount.get("name").and_then(serde_json::Value::as_str) == Some("credential-vcr-inference-credential")
+            mount.get("name").and_then(serde_json::Value::as_str) == Some("credential-0")
                 && mount.get("mountPath").and_then(serde_json::Value::as_str)
                     == Some("/run/secrets/grid-credentials/grid-system/vcr-inference-credential")
                 && mount.get("readOnly").and_then(serde_json::Value::as_bool) == Some(true)
@@ -6564,6 +6531,41 @@ mod tests {
                     }]
                 }
             })
+        );
+    }
+
+    #[test]
+    fn grid_network_cluster_endpoints_drop_xtask_site_metadata() {
+        let endpoints = serde_json::json!([{
+            "cluster": "provider-a",
+            "site": "provider-a",
+            "address": "203.0.113.10:8443",
+            "transport": { "mode": "mutual_tls", "sni": "provider-a.example" }
+        }]);
+        let actual = grid_network_cluster_endpoints(endpoints.as_array().unwrap_or_else(|| std::process::abort()))
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            actual,
+            vec![serde_json::json!({
+                "cluster": "provider-a",
+                "address": "203.0.113.10:8443",
+                "transport": { "mode": "mutual_tls", "sni": "provider-a.example" }
+            })],
+            "GridNetwork endpoints must omit xtask-only site metadata"
+        );
+    }
+
+    #[test]
+    fn embedded_gateway_uses_explicit_site_not_sni_suffix() {
+        let endpoint = serde_json::json!({
+            "cluster": "provider-a",
+            "site": "provider-a",
+            "transport": { "mode": "mutual_tls", "sni": "provider-a.example" }
+        });
+        let site = provider_gateway_endpoint_site(&endpoint, "provider-a").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            site, "provider-a",
+            "embedded gateway backends must use the explicit provider site"
         );
     }
 

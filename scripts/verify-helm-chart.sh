@@ -15,6 +15,63 @@ DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.7.0"
 
 # Helpers
 
+# Asserts ADMISSION refused a write, not RBAC. Grants the probe account create on Secrets
+# in the namespace under test first, because without it RBAC refuses the request before any
+# policy is consulted and the probe passes having proven nothing.
+policy_deny_probe() {
+  local label="$1" tries="$2" ns="$3" sa="$4"; shift 4
+  local role="probe-create-secrets" out i
+  kubectl --context "$KCTX" create namespace "$ns" >/dev/null 2>&1 || true
+  kubectl --context "$KCTX" -n "$ns" create role "$role" \
+    --verb=create,delete --resource=secrets >/dev/null 2>&1 || true
+  kubectl --context "$KCTX" -n "$ns" create rolebinding "$role" \
+    --role="$role" --user="$sa" >/dev/null 2>&1 || true
+  for ((i = 0; i < tries; i++)); do
+    out=$("$@" 2>&1 || true)
+    case "$out" in
+      *"denied request"*) pass "kind: $label"
+        kubectl --context "$KCTX" -n "$ns" delete rolebinding "$role" >/dev/null 2>&1 || true
+        kubectl --context "$KCTX" -n "$ns" delete role "$role" >/dev/null 2>&1 || true
+        return 0 ;;
+    esac
+    sleep 2
+  done
+  fail "kind: $label -- saw: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+  kubectl --context "$KCTX" -n "$ns" delete rolebinding "$role" >/dev/null 2>&1 || true
+  kubectl --context "$KCTX" -n "$ns" delete role "$role" >/dev/null 2>&1 || true
+  return 1
+}
+
+# Asserts a write is refused, by admission or by RBAC, and prints what it actually saw
+# when it is not. A bare grep reports every unexpected message as "admitted".
+deny_probe() {
+  local label="$1" tries="$2"; shift 2
+  local i out
+  for ((i = 0; i < tries; i++)); do
+    out=$("$@" 2>&1 || true)
+    case "$out" in
+      *"denied request"*|*" is forbidden"*) pass "kind: $label"; return 0 ;;
+    esac
+    sleep 2
+  done
+  fail "kind: $label -- saw: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+  return 1
+}
+
+# Retries a command until its output contains the expected text, since a created
+# ValidatingAdmissionPolicy is not yet an enforcing one: compilation and the API server's
+# policy cache are asynchronous, so the first probe after install can race activation.
+await_output() {
+  local want="$1" tries="${2:-30}" i out
+  shift 2 || shift
+  for ((i = 0; i < tries; i++)); do
+    out=$("$@" 2>&1 || true)
+    case "$out" in *"$want"*) return 0 ;; esac
+    sleep 2
+  done
+  return 1
+}
+
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
 
@@ -282,7 +339,7 @@ if render verify-links "$CHART_DIR" --namespace grid-system --show-only template
 fi
 # Every grid workload pod disables service links, not just the operator.
 for spec in "charts/grid-enrollment:3" "charts/grid-mock-providers:1" \
-  "charts/praxis-gateway:1:--set-string config.existingConfigMap=verify"; do
+  "charts/praxis-gateway:1:--set-string praxisConfig.byo.configMapName=verify"; do
   IFS=: read -r chart want extra <<<"$spec"
   # shellcheck disable=SC2086 # extra is a flag list
   render verify-links "$chart" $extra || continue
@@ -464,7 +521,7 @@ echo "======================================================================"
 
 # Common required argument for the gateway chart. The image intentionally uses
 # the chart default so this path validates the official Praxis AI contract.
-GW_REQ=(--set config.existingConfigMap=test-config)
+GW_REQ=(--set praxisConfig.byo.configMapName=test-config)
 
 # Helm lint
 echo ""
@@ -494,27 +551,27 @@ fi
 
 # Variant renderings
 try_template "$GW_DIR" "edge gateway" "${GW_REQ[@]}" \
-  --set nameOverride=edge-gateway \
+  --set fullnameOverride=edge-gateway \
   --set service.type=LoadBalancer \
-  --set overlay.enabled=true --set overlay.existingConfigMap=grid-overlay \
-  --set tls.enabled=true --set tls.existingSecret=edge-tls
+  --set overlay.configMapName=grid-overlay --set grid.networkName=example --set grid.siteName=edge \
+  --set gridIdentity.tlsSecretName=edge-tls --set gridIdentity.caSecretName=grid-ca
 try_template "$GW_DIR" "provider gateway" "${GW_REQ[@]}" \
   --set nameOverride=provider-gateway \
   --set port.containerPort=8443 --set port.name=https-mtls \
   --set service.type=LoadBalancer --set service.port=8443 \
-  --set tls.enabled=true --set tls.existingSecret=provider-tls
+  --set gridIdentity.tlsSecretName=provider-tls --set gridIdentity.caSecretName=grid-ca
 try_template "$GW_DIR" "gtm emulator" "${GW_REQ[@]}" \
   --set nameOverride=gtm-emulator \
   --set port.containerPort=8443 --set port.name=https \
   --set service.type=LoadBalancer --set service.port=8443 \
-  --set tls.enabled=true --set tls.existingSecret=gtm-tls
+  --set gridIdentity.tlsSecretName=gtm-tls --set gridIdentity.caSecretName=grid-ca
 try_template "$GW_DIR" "service disabled" "${GW_REQ[@]}" --set service.enabled=false
 try_template "$GW_DIR" "custom image" "${GW_REQ[@]}" \
   --set image.repository=praxis-ai --set image.tag=glb-demo --set image.pullPolicy=Never
 try_template "$GW_DIR" "gateway with credentials" "${GW_REQ[@]}" \
-  --set 'credentials[0].name=cred-a' --set 'credentials[0].mountPath=/etc/praxis/credentials/a' \
-  --set 'credentials[1].name=cred-b' --set 'credentials[1].mountPath=/etc/praxis/credentials/b' \
-  --set 'credentials[1].optional=true'
+  --set 'providerCredentials[0].secretName=cred-a' --set 'providerCredentials[0].mountPath=/etc/praxis/credentials/a' \
+  --set 'providerCredentials[1].secretName=cred-b' --set 'providerCredentials[1].mountPath=/etc/praxis/credentials/b' \
+  --set 'providerCredentials[1].optional=true'
 try_template "$GW_DIR" "hostile podLabels gateway" "${GW_REQ[@]}" \
   --set-string 'podLabels.app\.kubernetes\.io/name=hostile'
 
@@ -562,7 +619,7 @@ try_template "charts/grid-enrollment" "example hub-site hub-grid-enrollment rout
   -f "$HS_VALUES/hub-grid-enrollment.yaml" --set route.enabled=true --set-string route.host=enroll.apps.example.com
 # The digest placeholders fail closed until replaced.
 HS_PINNED=(--set "peers.hub.digest=$HS_DIGEST")
-HS_GW_PINNED=(--set "gatewayConfig.peerTrust.digest=$HS_DIGEST")
+HS_GW_PINNED=(--set "praxisConfig.render.peerTrust.digest=$HS_DIGEST")
 for side in hub site; do
   try_template "$CHART_DIR" "example hub-site $side-grid-operator" --namespace grid -f "$HS_VALUES/$side-grid-operator.yaml"
 done
@@ -573,8 +630,17 @@ try_template "$GW_DIR" "example hub-site hub-praxis-gateway" --namespace grid -f
 try_template "$GW_DIR" "example hub-site site-praxis-gateway" --namespace grid -f "$HS_VALUES/site-praxis-gateway.yaml" \
   "${HS_GW_PINNED[@]}"
 try_template "$GW_DIR" "example hub-site site-praxis-gateway spiffe" --namespace grid \
-  -f "$HS_VALUES/site-praxis-gateway.yaml" --set gatewayConfig.peerTrust.mode=spiffe --set gatewayConfig.peerTrust.digest="" \
-  --set gatewayConfig.peerTrust.spiffeId=spiffe://grid.internal/site/hub
+  -f "$HS_VALUES/site-praxis-gateway.yaml" --set praxisConfig.render.peerTrust.mode=spiffe --set praxisConfig.render.peerTrust.digest="" \
+  --set praxisConfig.render.peerTrust.spiffeId=spiffe://grid.internal/site/hub
+# Single-gateway examples.
+GWX_VALUES="examples/helm/praxis-gateway"
+try_template "$GW_DIR" "example praxis-gateway byo" --namespace grid -f "$GWX_VALUES/byo.yaml"
+try_template "$GW_DIR" "example praxis-gateway render-consumer" --namespace grid -f "$GWX_VALUES/render-consumer.yaml"
+try_template "$GW_DIR" "example praxis-gateway render-provider" --namespace grid -f "$GWX_VALUES/render-provider.yaml" \
+  "${HS_GW_PINNED[@]}"
+try_template "$GW_DIR" "example praxis-gateway operator" --namespace grid -f "$GWX_VALUES/operator.yaml"
+try_reject_msg "$GW_DIR" "example praxis-gateway render-provider with the digest placeholder" "digest" --namespace grid \
+  -f "$GWX_VALUES/render-provider.yaml"
 try_reject_msg "$GW_DIR" "example hub-site site gateway with the digest placeholder" "digest" --namespace grid \
   -f "$HS_VALUES/site-praxis-gateway.yaml"
 try_reject_msg "charts/grid-site" "example hub-site site grid-site with the digest placeholder" "digest" \
@@ -619,52 +685,53 @@ fi
 echo ""
 echo "=== Schema rejection (gateway) ==="
 try_template "$GW_DIR" "standalone default (no values)" --namespace praxis
-try_reject_msg "$GW_DIR" "blank config.inline" "config.inline is empty" --set-string 'config.inline= ' --namespace praxis
-try_reject_msg "$GW_DIR" "config.inline not a mapping" "config.inline is not a valid YAML mapping" \
-  --set-string config.inline=not-a-mapping --namespace praxis
+try_reject_msg "$GW_DIR" "blank praxisConfig.byo.inline" "praxisConfig.byo.inline is empty" --set-string 'praxisConfig.byo.inline= ' --namespace praxis
+try_reject_msg "$GW_DIR" "praxisConfig.byo.inline not a mapping" "praxisConfig.byo.inline is not a valid YAML mapping" \
+  --set-string praxisConfig.byo.inline=not-a-mapping --namespace praxis
 try_reject "$GW_DIR" "invalid digest (gw)" "${GW_REQ[@]}" --set image.digest=invalid
 try_reject "$GW_DIR" "invalid service type (gw)" "${GW_REQ[@]}" --set service.type=ExternalName
 try_reject "$GW_DIR" "unknown key (gw)" "${GW_REQ[@]}" --set typoField=true
 try_template "$GW_DIR" "subchart keys (gw)" "${GW_REQ[@]}" --set enabled=true --set global.foo=bar
 try_reject "$GW_DIR" "runAsNonRoot override" "${GW_REQ[@]}" --set podSecurityContext.runAsNonRoot=false
-try_reject "$GW_DIR" "overlay enabled no name" "${GW_REQ[@]}" --set overlay.enabled=true
-try_reject "$GW_DIR" "tls enabled no secret" "${GW_REQ[@]}" --set tls.enabled=true --set tls.existingSecret=""
+try_reject "$GW_DIR" "removed overlay.enabled key" "${GW_REQ[@]}" --set overlay.enabled=true
+try_reject "$GW_DIR" "removed tls.enabled key" "${GW_REQ[@]}" --set tls.enabled=true
 try_reject_msg "$GW_DIR" "telemetry sampling rate above one" \
-  "gatewayConfig[./]telemetry[./]samplingRate.*(less than or equal to 1|maximum: got 1\\.01)" \
-  --set gatewayConfig.telemetry.enabled=true --set-json gatewayConfig.telemetry.samplingRate=1.01
+  "praxisConfig[./]render[./]telemetry[./]samplingRate.*(less than or equal to 1|maximum: got 1\\.01)" \
+  --set praxisConfig.render.telemetry.enabled=true --set-json praxisConfig.render.telemetry.samplingRate=1.01
 try_reject_msg "$GW_DIR" "telemetry sampling rate below zero" \
-  "gatewayConfig[./]telemetry[./]samplingRate.*(greater than or equal to 0|minimum: got -0\\.01)" \
-  --set gatewayConfig.telemetry.enabled=true --set-json gatewayConfig.telemetry.samplingRate=-0.01
+  "praxisConfig[./]render[./]telemetry[./]samplingRate.*(greater than or equal to 0|minimum: got -0\\.01)" \
+  --set praxisConfig.render.telemetry.enabled=true --set-json praxisConfig.render.telemetry.samplingRate=-0.01
 try_reject_msg "$GW_DIR" "telemetry endpoint userinfo credentials" \
-  "gatewayConfig[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
-  "${GW_REQ[@]}" --set-string 'gatewayConfig.telemetry.otlpEndpoint=https://user:password@collector:4317'
+  "praxisConfig[./]render[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
+  "${GW_REQ[@]}" --set-string 'praxisConfig.render.telemetry.otlpEndpoint=https://user:password@collector:4317'
 try_reject_msg "$GW_DIR" "telemetry endpoint query credentials" \
-  "gatewayConfig[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
-  "${GW_REQ[@]}" --set-string 'gatewayConfig.telemetry.otlpEndpoint=https://collector:4317?api_key=sentinel'
+  "praxisConfig[./]render[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
+  "${GW_REQ[@]}" --set-string 'praxisConfig.render.telemetry.otlpEndpoint=https://collector:4317?api_key=sentinel'
 try_reject_msg "$GW_DIR" "telemetry endpoint fragment credentials" \
-  "gatewayConfig[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
-  "${GW_REQ[@]}" --set-string 'gatewayConfig.telemetry.otlpEndpoint=https://collector:4317/otlp#token=sentinel'
+  "praxisConfig[./]render[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
+  "${GW_REQ[@]}" --set-string 'praxisConfig.render.telemetry.otlpEndpoint=https://collector:4317/otlp#token=sentinel'
+try_reject "$GW_DIR" "removed root gridServing key" "${GW_REQ[@]}" --set gridServing.enabled=true
 
 # Secure gateway config (render)
-GW_RENDER=(--set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.model=q --set gatewayConfig.auth.mode=none
-  --set "gatewayConfig.backends[0].cluster=a" --set "gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000"
-  --set "gatewayConfig.backends[0].transport.mode=plaintext")
+GW_RENDER=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.model=q --set praxisConfig.render.auth.mode=none
+  --set "praxisConfig.render.backends[0].cluster=a" --set "praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000"
+  --set "praxisConfig.render.backends[0].transport.mode=plaintext")
 echo ""
 echo "=== Secure gateway config (gateway) ==="
 SECURE_ARGS=(
-  --set gatewayConfig.render=true --set gatewayConfig.localSite=hub
-  --set gatewayConfig.model=qwen3
-  --set gatewayConfig.auth.mode=api-key --set image.tag=verify-api-key
-  --set gatewayConfig.auth.validateUrl=https://maas-api.svc:8443/internal/v1/api-keys/validate
-  --set gatewayConfig.upstreamCA.secretName=upstream-ca
-  --set tls.enabled=true --set tls.existingSecret=grid-identity
-  --set gatewayConfig.listenerTls.enabled=true --set gatewayConfig.listenerTls.existingSecret=listener-cert
-  --set "gatewayConfig.backends[0].cluster=site-a"
-  --set "gatewayConfig.backends[0].endpoints[0]=172.30.202.42:8000"
-  --set "gatewayConfig.backends[0].transport.sni=site-a.grid.internal" --set "gatewayConfig.backends[0].site=site-a"
-  --set "gatewayConfig.backends[1].cluster=site-b"
-  --set "gatewayConfig.backends[1].endpoints[0]=172.30.181.254:8000"
-  --set "gatewayConfig.backends[1].transport.mode=plaintext"
+  --set praxisConfig.source=render --set grid.siteName=hub
+  --set praxisConfig.render.model=qwen3
+  --set praxisConfig.render.auth.mode=api-key --set image.tag=verify-api-key
+  --set praxisConfig.render.auth.validateUrl=https://maas-api.svc:8443/internal/v1/api-keys/validate
+  --set upstreamCA.secretName=upstream-ca
+  --set gridIdentity.tlsSecretName=grid-identity --set gridIdentity.caSecretName=grid-ca
+  --set listenerTls.secretName=listener-cert
+  --set "praxisConfig.render.backends[0].cluster=site-a"
+  --set "praxisConfig.render.backends[0].endpoints[0]=172.30.202.42:8000"
+  --set "praxisConfig.render.backends[0].transport.sni=site-a.grid.internal" --set "praxisConfig.render.backends[0].site=site-a"
+  --set "praxisConfig.render.backends[1].cluster=site-b"
+  --set "praxisConfig.render.backends[1].endpoints[0]=172.30.181.254:8000"
+  --set "praxisConfig.render.backends[1].transport.mode=plaintext"
 )
 SECURE_RENDER=$(helm template verify-secure "$GW_DIR" "${SECURE_ARGS[@]}" --namespace grid-system 2>&1)
 
@@ -706,7 +773,7 @@ else
   fail "secure config: auth.mode none should strip Authorization by default"
 fi
 CA_RENDER=$(helm template verify-ca "$GW_DIR" "${SECURE_ARGS[@]}" --namespace grid-system \
-  --set gatewayConfig.auth.validateCA.configMap=service-ca --set gatewayConfig.auth.validateCA.key=service-ca.crt)
+  --set praxisConfig.render.auth.validateCA.configMapName=service-ca --set praxisConfig.render.auth.validateCA.key=service-ca.crt)
 if echo "$CA_RENDER" | grep -A1 'name: SSL_CERT_FILE' | matches '/etc/praxis/validate-ca/service-ca.crt' \
     && echo "$CA_RENDER" | matches 'mountPath: "/etc/praxis/validate-ca"'; then
   pass "secure config: validateCA mounts the bundle and sets SSL_CERT_FILE"
@@ -723,14 +790,14 @@ else
   fail "networkPolicy: should limit listener ingress to the listed peers"
 fi
 try_template "$GW_DIR" "none + LoadBalancer with allowUnauthenticatedExposure (gw)" "${GW_RENDER[@]}" \
-  --set service.type=LoadBalancer --set gatewayConfig.auth.allowUnauthenticatedExposure=true --namespace grid-system
+  --set service.type=LoadBalancer --set praxisConfig.render.auth.allowUnauthenticatedExposure=true --namespace grid-system
 if echo "$SECURE_RENDER" | matches 'sni: "site-a.grid.internal"' && echo "$SECURE_RENDER" | matches 'verify: true'; then
   pass "secure config: mutual_tls backend renders sni + verify:true"
 else
   fail "secure config: mutual_tls backend missing sni/verify"
 fi
-# site-b is plaintext and last: the first tls: after its stanza must not exist.
-if awk '/- name: "site-b"/{f=1} f&&/[^-] tls:/{print; exit}' <<<"$SECURE_RENDER" | matches 'tls:'; then
+# site-b is plaintext: no tls: inside any of its stanzas, which end at the next list item.
+if awk '/- name: "site-b"/{f=1; next} f&&/- /{f=0} f&&/[^-] tls:/{print; exit}' <<<"$SECURE_RENDER" | matches 'tls:'; then
   fail "secure config: plaintext backend must not render a tls block"
 else
   pass "secure config: plaintext backend renders no tls block"
@@ -753,16 +820,16 @@ else
 fi
 
 try_reject_msg "$GW_DIR" "http validateUrl (gw)" "https://" "${GW_RENDER[@]}" \
-  --set image.tag=verify-api-key --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=http://maas/validate --namespace grid-system
+  --set image.tag=verify-api-key --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=http://maas/validate --namespace grid-system
 try_reject_msg "$GW_DIR" "api-key without validateUrl (gw)" "validateUrl is required" "${GW_RENDER[@]}" \
-  --set gatewayConfig.auth.mode=api-key --namespace grid-system
+  --set praxisConfig.render.auth.mode=api-key --namespace grid-system
 try_reject_msg "$GW_DIR" "render without auth.mode (gw)" "auth.mode is required" \
-  --set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.model=q --set "gatewayConfig.backends[0].cluster=a" \
-  --set "gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000" --namespace grid-system
+  --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.model=q --set "praxisConfig.render.backends[0].cluster=a" \
+  --set "praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000" --namespace grid-system
 try_reject_msg "$GW_DIR" "none + LoadBalancer (gw)" "exposes unauthenticated inference" "${GW_RENDER[@]}" --set service.type=LoadBalancer --namespace grid-system
 try_reject_msg "$GW_DIR" "none + NodePort (gw)" "exposes unauthenticated inference" "${GW_RENDER[@]}" --set service.type=NodePort --namespace grid-system
-try_reject_msg "$GW_DIR" "validateCA configMap and secret (gw)" "set configMap or secret, not both" "${SECURE_ARGS[@]}" \
-  --set gatewayConfig.auth.validateCA.configMap=a --set gatewayConfig.auth.validateCA.secret=b --namespace grid-system
+try_reject_msg "$GW_DIR" "validateCA configMap and secret (gw)" "set configMapName or secretName, not both" "${SECURE_ARGS[@]}" \
+  --set praxisConfig.render.auth.validateCA.configMapName=a --set praxisConfig.render.auth.validateCA.secretName=b --namespace grid-system
 try_reject_msg "$GW_DIR" "networkPolicy enabled without from (gw)" "needs at least one peer" "${GW_REQ[@]}" \
   --set networkPolicy.enabled=true --namespace grid-system
 try_reject_msg "$GW_DIR" "networkPolicy from an empty namespaceSelector (gw)" "admits every pod in every namespace" "${GW_REQ[@]}" \
@@ -771,79 +838,97 @@ try_reject_msg "$GW_DIR" "networkPolicy from an empty namespaceSelector (gw)" "a
 try_reject_msg "$GW_DIR" "networkPolicy from ipBlock ::/0 (gw)" "admits every address" "${GW_REQ[@]}" \
   --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{"ipBlock":{"cidr":"::/0"}}]' \
   --namespace grid-system
-BK1=(--set "gatewayConfig.backends[0].cluster=a" --set "gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000"
-  --set "gatewayConfig.backends[0].transport.mode=plaintext")
-R0=(--set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.model=q --set gatewayConfig.auth.mode=none --namespace grid-system)
+# praxisConfig.source is required: byo, operator, or render.
+try_template "$GW_DIR" "praxisConfig.source byo with a ConfigMap (gw)" --set praxisConfig.byo.configMapName=my-praxis --namespace grid-system
+try_template "$GW_DIR" "praxisConfig.source operator (gw)" --set praxisConfig.source=operator --namespace grid-system
+if helm template v-op "$GW_DIR" --set praxisConfig.source=operator --namespace grid-system 2>&1 | grep -q 'name: "praxis-consumer-config"'; then
+  pass "praxisConfig.source operator mounts praxis-consumer-config by default (gw)"
+else
+  fail "praxisConfig.source operator must mount praxis-consumer-config by default (gw)"
+fi
+try_reject_msg "$GW_DIR" "unknown praxisConfig.source (gw)" "source" --set praxisConfig.source=cluster --namespace grid-system
+try_reject_msg "$GW_DIR" "listenerTls with source operator (gw)" "not supported with praxisConfig.source operator" \
+  --set praxisConfig.source=operator --set listenerTls.secretName=s --namespace grid-system
+try_reject_msg "$GW_DIR" "source operator with a LoadBalancer (gw)" "exposes unauthenticated inference" \
+  --set praxisConfig.source=operator --set service.type=LoadBalancer --namespace grid-system
+try_template "$GW_DIR" "source operator with a LoadBalancer and allowUnauthenticatedExposure (gw)" \
+  --set praxisConfig.source=operator --set service.type=LoadBalancer --set praxisConfig.operator.allowUnauthenticatedExposure=true --namespace grid-system
+try_reject_msg "$GW_DIR" "source operator with a Route (gw)" "route is not supported with praxisConfig.source operator" \
+  --set praxisConfig.source=operator --set route.enabled=true --set route.host=gw.example.com --namespace grid-system
+try_reject_msg "$GW_DIR" "render settings with source byo (gw)" "praxisConfig.source is byo, which ignores it" \
+  --set praxisConfig.render.model=x --namespace grid-system
+try_reject_msg "$GW_DIR" "old config key (gw)" "[Aa]dditional propert(y|ies).*config.*not allowed" --set config.existingConfigMap=x --namespace grid-system
+try_reject_msg "$GW_DIR" "old gatewayConfig key (gw)" "[Aa]dditional propert(y|ies).*gatewayConfig.*not allowed" --set gatewayConfig.render=true --namespace grid-system
+BK1=(--set "praxisConfig.render.backends[0].cluster=a" --set "praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000"
+  --set "praxisConfig.render.backends[0].transport.mode=plaintext")
+R0=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.model=q --set praxisConfig.render.auth.mode=none --namespace grid-system)
 try_reject_msg "$GW_DIR" "backend without cluster (gw)" "backends[./]0.*cluster" "${R0[@]}" \
-  --set "gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000"
+  --set "praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000"
 try_reject_msg "$GW_DIR" "backend without endpoints (gw)" "backends[./]0.*endpoints" "${R0[@]}" \
-  --set "gatewayConfig.backends[0].cluster=a"
+  --set "praxisConfig.render.backends[0].cluster=a"
 try_reject_msg "$GW_DIR" "duplicate backend cluster (gw)" "listed twice" "${R0[@]}" "${BK1[@]}" \
-  --set "gatewayConfig.backends[1].cluster=a" --set "gatewayConfig.backends[1].endpoints[0]=1.2.3.5:8000" \
-  --set "gatewayConfig.backends[1].transport.mode=plaintext"
-try_reject_msg "$GW_DIR" "blank localSite (gw)" "localSite" "${R0[@]}" "${BK1[@]}" --set gatewayConfig.localSite=""
-try_reject_msg "$GW_DIR" "blank model (gw)" "gatewayConfig.model is required" "${R0[@]}" "${BK1[@]}" --set-string "gatewayConfig.model= "
+  --set "praxisConfig.render.backends[1].cluster=a" --set "praxisConfig.render.backends[1].endpoints[0]=1.2.3.5:8000" \
+  --set "praxisConfig.render.backends[1].transport.mode=plaintext"
+try_reject_msg "$GW_DIR" "blank grid.siteName (gw)" "grid.siteName" "${R0[@]}" "${BK1[@]}" --set grid.siteName=""
+try_reject_msg "$GW_DIR" "blank model (gw)" "praxisConfig.render.model is required" "${R0[@]}" "${BK1[@]}" --set-string "praxisConfig.render.model= "
 try_reject_msg "$GW_DIR" "unknown healthCheck key (gw)" "healthCheck" "${R0[@]}" "${BK1[@]}" \
-  --set "gatewayConfig.backends[0].healthCheck.bogus=1"
-try_reject_msg "$GW_DIR" "api-key on the legacy 0.4.0 image (gw)" "unsupported on the default image" "${R0[@]}" "${BK1[@]}" \
-  --set image.tag=0.4.0 --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://maas/validate
+  --set "praxisConfig.render.backends[0].healthCheck.bogus=1"
+try_reject_msg "$GW_DIR" "api-key on the legacy 0.4.0 image (gw)" "unsupported on the legacy image" "${R0[@]}" "${BK1[@]}" \
+  --set image.tag=0.4.0 --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=https://maas/validate
 try_template "$GW_DIR" "api-key on the 0.7.0 image (gw)" "${R0[@]}" "${BK1[@]}" \
-  --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://maas/validate
+  --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=https://maas/validate
 try_reject_msg "$GW_DIR" "validateUrl without a host (gw)" "validateUrl" "${R0[@]}" "${BK1[@]}" \
-  --set image.tag=verify-api-key --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https:///v
-try_reject_msg "$GW_DIR" "blank backend endpoint (gw)" "endpoints[./]0" "${R0[@]}" --set "gatewayConfig.backends[0].cluster=a" \
-  --set-string "gatewayConfig.backends[0].endpoints[0]= " --set "gatewayConfig.backends[0].transport.mode=plaintext"
+  --set image.tag=verify-api-key --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=https:///v
+try_reject_msg "$GW_DIR" "blank backend endpoint (gw)" "endpoints[./]0" "${R0[@]}" --set "praxisConfig.render.backends[0].cluster=a" \
+  --set-string "praxisConfig.render.backends[0].endpoints[0]= " --set "praxisConfig.render.backends[0].transport.mode=plaintext"
 try_reject_msg "$GW_DIR" "networkPolicy from an empty peer (gw)" "empty peer" "${GW_REQ[@]}" \
   --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{}]' --namespace grid-system
 try_template "$GW_DIR" "networkPolicy from all addresses with except (gw)" "${GW_REQ[@]}" --set networkPolicy.enabled=true \
   --set-json 'networkPolicy.from=[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.0.0.0/8"]}}]' --namespace grid-system
 try_reject_msg "$GW_DIR" "api-key validateUrl IP literal (gw)" "not an IP address" "${R0[@]}" "${BK1[@]}" \
-  --set image.tag=verify-api-key --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://10.0.0.1:8443/v
+  --set image.tag=verify-api-key --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=https://10.0.0.1:8443/v
 try_reject_msg "$GW_DIR" "networkPolicy from ipBlock 0.0.0.0/0 (gw)" "admits every address" "${GW_REQ[@]}" \
   --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{"ipBlock":{"cidr":"0.0.0.0/0"}}]' --namespace grid-system
 try_reject_msg "$GW_DIR" "networkPolicy from a bare namespaceSelector (gw)" "admits every pod in every namespace" "${GW_REQ[@]}" \
   --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{"namespaceSelector":{}}]' --namespace grid-system
-if helm template v-hc "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set "gatewayConfig.backends[0].healthCheck.type=tcp" \
+if helm template v-hc "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set "praxisConfig.render.backends[0].healthCheck.type=tcp" \
     --show-only templates/gateway-config.yaml | awk '/health_check:/{f=1} f&&/path:/{print; exit}' | matches path; then
   fail "tcp health_check should carry no path"
 else
   pass "tcp health_check carries no path"
 fi
-if [ "$(helm template v-ca "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set gatewayConfig.auth.validateCA.configMap=x | grep -c 'SSL_CERT_FILE')" = 0 ]; then
-  pass "validateCA is ignored outside api-key"
-else
-  fail "validateCA should apply only with api-key"
-fi
+try_reject_msg "$GW_DIR" "validateCA without api-key (gw)" "validateUrl and validateCA require auth.mode api-key" \
+  "${R0[@]}" "${BK1[@]}" --set praxisConfig.render.auth.validateCA.configMapName=x
 if helm template v-probe "$GW_DIR" "${GW_REQ[@]}" --set health.readiness.httpGet.path=/ --set health.readiness.httpGet.port=http \
     --show-only templates/deployment.yaml --namespace grid-system | sed -n '/readinessProbe/,/livenessProbe/p' | matches tcpSocket; then
   fail "an httpGet readiness probe should drop the default tcpSocket"
 else
   pass "an httpGet readiness probe drops the default tcpSocket"
 fi
-try_reject_msg "$GW_DIR" "render without model (gw)" "gatewayConfig.model is required" \
-  --set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.auth.mode=none --set gatewayConfig.backends[0].cluster=a \
-  --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 --namespace grid-system
-try_reject_msg "$GW_DIR" "render without backends (gw)" "gatewayConfig.backends needs at least one backend" \
-  --set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q --namespace grid-system
+try_reject_msg "$GW_DIR" "render without model (gw)" "praxisConfig.render.model is required" \
+  --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --set praxisConfig.render.backends[0].cluster=a \
+  --set praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000 --namespace grid-system
+try_reject_msg "$GW_DIR" "render without backends (gw)" "praxisConfig.render.backends needs at least one backend" \
+  --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q --namespace grid-system
 try_reject_msg "$GW_DIR" "mutual_tls without sni (gw)" "sets no transport.sni" \
-  --set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
-  --set tls.enabled=true --set tls.existingSecret=id \
-  --set gatewayConfig.backends[0].cluster=a --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 --namespace grid-system
-try_reject_msg "$GW_DIR" "mutual_tls without grid identity (gw)" "tls.enabled is false" \
-  --set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
-  --set gatewayConfig.backends[0].cluster=a --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 \
-  --set gatewayConfig.backends[0].transport.mode=mutual_tls --set gatewayConfig.backends[0].transport.sni=a.grid --namespace grid-system
+  --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q \
+  --set gridIdentity.tlsSecretName=id --set gridIdentity.caSecretName=grid-ca \
+  --set praxisConfig.render.backends[0].cluster=a --set praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000 --namespace grid-system
+try_reject_msg "$GW_DIR" "mutual_tls without grid identity (gw)" "gridIdentity.tlsSecretName is empty" \
+  --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q \
+  --set praxisConfig.render.backends[0].cluster=a --set praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000 \
+  --set praxisConfig.render.backends[0].transport.mode=mutual_tls --set praxisConfig.render.backends[0].transport.sni=a.grid --namespace grid-system
 try_reject_msg "$GW_DIR" "plaintext with sni (gw)" "sni belongs to a TLS transport" \
-  --set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
-  --set gatewayConfig.backends[0].cluster=a --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 \
-  --set gatewayConfig.backends[0].transport.mode=plaintext --set gatewayConfig.backends[0].transport.sni=x --namespace grid-system
+  --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q \
+  --set praxisConfig.render.backends[0].cluster=a --set praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000 \
+  --set praxisConfig.render.backends[0].transport.mode=plaintext --set praxisConfig.render.backends[0].transport.sni=x --namespace grid-system
 # tls transport: server-verified backend with no client cert (a KServe workload).
-TLS1=(--set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q
-  --set "gatewayConfig.backends[0].cluster=kserve" --set "gatewayConfig.backends[0].transport.mode=tls" --namespace grid-system)
-TLS_RENDER=$(helm template v-tls "$GW_DIR" "${TLS1[@]}" --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" \
-  --set "gatewayConfig.backends[0].transport.sni=qwen3-kserve-workload-svc.llm.svc" \
-  --set "gatewayConfig.backends[0].transport.ca.configMap=openshift-service-ca.crt" \
-  --set "gatewayConfig.backends[0].transport.ca.key=service-ca.crt" 2>&1)
+TLS1=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q
+  --set "praxisConfig.render.backends[0].cluster=kserve" --set "praxisConfig.render.backends[0].transport.mode=tls" --namespace grid-system)
+TLS_RENDER=$(helm template v-tls "$GW_DIR" "${TLS1[@]}" --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000" \
+  --set "praxisConfig.render.backends[0].transport.sni=qwen3-kserve-workload-svc.llm.svc" \
+  --set "praxisConfig.render.backends[0].transport.ca.configMapName=openshift-service-ca.crt" \
+  --set "praxisConfig.render.backends[0].transport.ca.key=service-ca.crt" 2>&1)
 if echo "$TLS_RENDER" | matches 'ca_path: "/etc/praxis/backend-ca/0/service-ca.crt"' \
     && echo "$TLS_RENDER" | matches 'sni: "qwen3-kserve-workload-svc.llm.svc"' \
     && ! awk '/- name: "kserve"/{f=1} f&&/client_cert/{print; exit}' <<<"$TLS_RENDER" | matches client_cert \
@@ -858,44 +943,44 @@ else
   fail "tls backend: health_check should default to tcp"
 fi
 try_reject_msg "$GW_DIR" "tls backend: IP endpoint without sni (gw)" "without transport.sni" "${TLS1[@]}" \
-  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000"
+  --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000"
 try_reject_msg "$GW_DIR" "tls backend: ca with configMap and secret (gw)" "transport[./]ca.*oneOf" "${TLS1[@]}" \
-  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" \
-  --set "gatewayConfig.backends[0].transport.ca.configMap=a" --set "gatewayConfig.backends[0].transport.ca.secret=b"
+  --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000" --set "praxisConfig.render.backends[0].transport.sni=h" \
+  --set "praxisConfig.render.backends[0].transport.ca.configMapName=a" --set "praxisConfig.render.backends[0].transport.ca.secretName=b"
 try_reject_msg "$GW_DIR" "tls backend: empty ca (gw)" "transport[./]ca.*oneOf" "${TLS1[@]}" \
-  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" \
-  --set-json 'gatewayConfig.backends[0].transport.ca={}'
+  --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000" --set "praxisConfig.render.backends[0].transport.sni=h" \
+  --set-json 'praxisConfig.render.backends[0].transport.ca={}'
 try_reject_msg "$GW_DIR" "transport.ca outside tls (gw)" "transport/mode': value must be 'tls'|transport: Must validate \"then\"" "${TLS1[@]}" \
-  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.mode=plaintext" \
-  --set "gatewayConfig.backends[0].transport.ca.configMap=a"
+  --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000" --set "praxisConfig.render.backends[0].transport.mode=plaintext" \
+  --set "praxisConfig.render.backends[0].transport.ca.configMapName=a"
 
 # trustPrivate: the FQDN endpoint and SNI drop the root dot.
 TRUST_RENDER=$(helm template v-trust "$GW_DIR" "${TLS1[@]}" \
-  --set "gatewayConfig.backends[0].endpoints[0]=m.ns.svc.cluster.local.:8000" --set "gatewayConfig.backends[0].trustPrivate=true" 2>&1 || true)
+  --set "praxisConfig.render.backends[0].endpoints[0]=m.ns.svc.cluster.local.:8000" --set "praxisConfig.render.backends[0].trustPrivate=true" 2>&1 || true)
 if grep -q '"m.ns.svc.cluster.local"$' <<<"$TRUST_RENDER" && grep -q 'sni: "m.ns.svc.cluster.local"' <<<"$TRUST_RENDER"; then
   pass "trustPrivate: lists the FQDN without its root dot and derives an undotted sni"
 else
   fail "trustPrivate: want the undotted trust entry and sni, got: $(grep -E 'sni:|trusted|svc' <<<"$TRUST_RENDER" | head -3 | tr '\n' ' ')"
 fi
 try_reject_msg "$GW_DIR" "trustPrivate with only IP endpoints (gw)" "no hostname endpoint" "${TLS1[@]}" \
-  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" --set "gatewayConfig.backends[0].trustPrivate=true"
+  --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000" --set "praxisConfig.render.backends[0].transport.sni=h" --set "praxisConfig.render.backends[0].trustPrivate=true"
 try_reject_msg "$GW_DIR" "trustPrivate over plaintext without allowPlaintextTrust (gw)" "allowPlaintextTrust" \
-  --set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q --namespace grid-system \
-  --set "gatewayConfig.backends[0].cluster=p" --set "gatewayConfig.backends[0].transport.mode=plaintext" \
-  --set "gatewayConfig.backends[0].endpoints[0]=m.ns.svc.cluster.local.:8000" --set "gatewayConfig.backends[0].trustPrivate=true"
+  --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q --namespace grid-system \
+  --set "praxisConfig.render.backends[0].cluster=p" --set "praxisConfig.render.backends[0].transport.mode=plaintext" \
+  --set "praxisConfig.render.backends[0].endpoints[0]=m.ns.svc.cluster.local.:8000" --set "praxisConfig.render.backends[0].trustPrivate=true"
 
 # provider role: serves the grid identity, requires a client cert, routes to one local backend.
 DIGEST=$(printf 'a%.0s' $(seq 64))
-PROVIDER=(--set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.role=provider --namespace grid-system
+PROVIDER=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.role=provider --namespace grid-system
   --set image.flavor=grid-gateway
-  --set tls.enabled=true --set tls.existingSecret=grid-site-identity --set tls.caSecret=grid-ca
-  --set "gatewayConfig.backends[0].cluster=local" --set "gatewayConfig.backends[0].transport.mode=plaintext"
-  --set "gatewayConfig.backends[0].endpoints[0]=m.ns.svc.cluster.local.:8000" --set "gatewayConfig.backends[0].trustPrivate=true"
-  --set "gatewayConfig.backends[0].allowPlaintextTrust=true" --set-json "gatewayConfig.peerTrust.certDigests=[\"$DIGEST\"]")
-SPIFFE=(--set gatewayConfig.peerTrust.mode=spiffe --set gatewayConfig.peerTrust.certDigests=null)
+  --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca
+  --set "praxisConfig.render.backends[0].cluster=local" --set "praxisConfig.render.backends[0].transport.mode=plaintext"
+  --set "praxisConfig.render.backends[0].endpoints[0]=m.ns.svc.cluster.local.:8000" --set "praxisConfig.render.backends[0].trustPrivate=true"
+  --set "praxisConfig.render.backends[0].allowPlaintextTrust=true" --set-json "praxisConfig.render.peerTrust.certDigests=[\"$DIGEST\"]")
+SPIFFE=(--set praxisConfig.render.peerTrust.mode=spiffe --set praxisConfig.render.peerTrust.certDigests=null)
 PROV_RENDER=$(helm template v-prov "$GW_DIR" "${PROVIDER[@]}" 2>&1 || true)
 if grep -q 'client_cert_mode: require$' <<<"$PROV_RENDER" && grep -q "cert_digest: \"$DIGEST\"" <<<"$PROV_RENDER" \
-  && grep -q 'name: "grid-ca"' <<<"$PROV_RENDER" && ! grep -q 'intelligent_route' <<<"$PROV_RENDER"; then
+  && grep -q 'name: "grid-site-identity"' <<<"$PROV_RENDER" && ! grep -q 'intelligent_route' <<<"$PROV_RENDER"; then
   pass "provider pin: Grid-CA client auth plus the certificate digest allowlist"
 else
   fail "provider pin: unexpected render: $(grep -E 'client_cert_mode|cert_digest|Error' <<<"$PROV_RENDER" | head -3 | tr '\n' ' ')"
@@ -906,7 +991,7 @@ else
   fail "provider: routes are not limited to allowedPaths"
 fi
 SPIFFE_RENDER=$(helm template v-prov "$GW_DIR" "${PROVIDER[@]}" "${SPIFFE[@]}" \
-  --set "gatewayConfig.peerTrust.spiffeIds[0]=spiffe://grid.internal/site/hub" 2>&1 || true)
+  --set "praxisConfig.render.peerTrust.spiffeIds[0]=spiffe://grid.internal/site/hub" 2>&1 || true)
 if grep -q 'client_cert_mode: require_named$' <<<"$SPIFFE_RENDER" && grep -q -- '- "spiffe://grid.internal/site/hub"' <<<"$SPIFFE_RENDER" \
   && grep -q 'peer_identity_trust' <<<"$SPIFFE_RENDER" && grep -q -- '- organization: "hub"' <<<"$SPIFFE_RENDER" \
   && ! grep -q 'cert_digest' <<<"$SPIFFE_RENDER"; then
@@ -914,46 +999,44 @@ if grep -q 'client_cert_mode: require_named$' <<<"$SPIFFE_RENDER" && grep -q -- 
 else
   fail "provider spiffe: unexpected render: $(grep -E 'client_cert_mode|spiffe|organization|Error' <<<"$SPIFFE_RENDER" | head -4 | tr '\n' ' ')"
 fi
-if helm template v-prov "$GW_DIR" "${PROVIDER[@]}" "${SPIFFE[@]}" --set gatewayConfig.peerTrust.allowAnyGridSite=true 2>&1 \
+if helm template v-prov "$GW_DIR" "${PROVIDER[@]}" "${SPIFFE[@]}" --set praxisConfig.render.peerTrust.allowAnyGridSite=true 2>&1 \
   | matches 'client_cert_mode: require_named$'; then
   pass "provider spiffe: allowAnyGridSite accepts any Grid-CA site explicitly"
 else
   fail "provider spiffe: allowAnyGridSite did not render require_named"
 fi
-try_reject_msg "$GW_DIR" "rendered config without localSite (gw)" "localSite" "${PROVIDER[@]}" \
-  --set gatewayConfig.localSite=""
+try_reject_msg "$GW_DIR" "rendered config without grid.siteName (gw)" "grid.siteName" "${PROVIDER[@]}" \
+  --set grid.siteName=""
 try_reject_msg "$GW_DIR" "provider spiffe without an allowlist (gw)" "peerTrust" "${PROVIDER[@]}" "${SPIFFE[@]}"
-try_reject_msg "$GW_DIR" "provider pin without digests (gw)" "peerTrust" "${PROVIDER[@]}" --set gatewayConfig.peerTrust.certDigests=null
+try_reject_msg "$GW_DIR" "provider pin without digests (gw)" "peerTrust" "${PROVIDER[@]}" --set praxisConfig.render.peerTrust.certDigests=null
 # The template guards hold without the schema. The flag needs Helm 3.16+.
 if helm template --help | matches -- --skip-schema-validation; then
   try_reject_msg "$GW_DIR" "provider spiffe without an allowlist, schema skipped (gw)" "allowAnyGridSite true" \
     --skip-schema-validation "${PROVIDER[@]}" "${SPIFFE[@]}"
   try_reject_msg "$GW_DIR" "provider pin without digests, schema skipped (gw)" "pin mode needs certDigests" \
-    --skip-schema-validation "${PROVIDER[@]}" --set gatewayConfig.peerTrust.certDigests=null
+    --skip-schema-validation "${PROVIDER[@]}" --set praxisConfig.render.peerTrust.certDigests=null
 else
   echo "  SKIP: template guards without the schema (needs Helm 3.16+)"
 fi
 try_reject_msg "$GW_DIR" "provider on the ai image flavor (gw)" "image.flavor grid-gateway" "${PROVIDER[@]}" --set image.flavor=ai
 try_reject_msg "$GW_DIR" "provider pin with a malformed digest (gw)" "certDigests" "${PROVIDER[@]}" \
-  --set-json 'gatewayConfig.peerTrust.certDigests=["ABC"]'
+  --set-json 'praxisConfig.render.peerTrust.certDigests=["ABC"]'
 try_reject_msg "$GW_DIR" "connect timeout above the total (gw)" "must not exceed totalConnectTimeoutMs" "${PROVIDER[@]}" \
-  --set "gatewayConfig.backends[0].connectTimeoutMs=6000" --set "gatewayConfig.backends[0].totalConnectTimeoutMs=5000"
-if render v-prov "$GW_DIR" "${PROVIDER[@]}" --set tls.caSecret="" && grep -q 'name: "grid-ca"' <<<"$RENDERED"; then
-  pass "provider without tls.caSecret projects grid-ca (gw)"
-else
-  fail "provider without tls.caSecret did not default to grid-ca (gw)"
-fi
+  --set "praxisConfig.render.backends[0].connectTimeoutMs=6000" --set "praxisConfig.render.backends[0].totalConnectTimeoutMs=5000"
 try_reject_msg "$GW_DIR" "provider with two backends (gw)" "exactly one local backend" "${PROVIDER[@]}" \
-  --set "gatewayConfig.backends[1].cluster=two" --set "gatewayConfig.backends[1].transport.mode=plaintext" --set "gatewayConfig.backends[1].endpoints[0]=10.0.0.2:80"
-try_reject_msg "$GW_DIR" "peerTrust.rateLimit missing burst (gw)" "burst" "${PROVIDER[@]}" --set gatewayConfig.peerTrust.rateLimit.rate=5
+  --set "praxisConfig.render.backends[1].cluster=two" --set "praxisConfig.render.backends[1].transport.mode=plaintext" --set "praxisConfig.render.backends[1].endpoints[0]=10.0.0.2:80"
+try_reject_msg "$GW_DIR" "peerTrust.rateLimit missing burst (gw)" "burst" "${PROVIDER[@]}" --set praxisConfig.render.peerTrust.rateLimit.rate=5
 
 # gridServing: operator serving config mounted as a directory, routed by grid_site_route.
-SERVING=(--set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.auth.mode=none --namespace grid-system
+SERVING=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --namespace grid-system
   --set image.repository=quay.io/example/grid-gateway --set image.tag=t --set image.flavor=grid-gateway
-  --set tls.enabled=true --set tls.existingSecret=grid-site-identity --set tls.caSecret=grid-ca
-  --set gridServing.enabled=true --set gridServing.configMap=grid-serving-grid-gw
-  --set "gatewayConfig.backends[0].cluster=pool-b" --set "gatewayConfig.backends[0].endpoints[0]=203.0.113.7:8443"
-  --set "gatewayConfig.backends[0].transport.sni=site-b.grid.internal")
+  --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca
+  --set praxisConfig.render.gridServing.enabled=true --set praxisConfig.render.gridServing.configMapName=grid-serving-grid-gw
+  --set "praxisConfig.render.backends[0].cluster=pool-b" --set "praxisConfig.render.backends[0].endpoints[0]=203.0.113.7:8443"
+  --set "praxisConfig.render.backends[0].transport.mode=mutual_tls"
+  --set "praxisConfig.render.backends[0].transport.sni=site-b.grid.internal")
+try_reject "$GW_DIR" "removed gridServing.configMap key" "${SERVING[@]}" \
+  --set praxisConfig.render.gridServing.configMap=grid-serving-grid-gw
 SERV_RENDER=$(helm template v-serv "$GW_DIR" "${SERVING[@]}" 2>&1 || true)
 if grep -q 'filter: grid_site_route' <<<"$SERV_RENDER" && ! grep -q 'intelligent_route' <<<"$SERV_RENDER" \
   && grep -q 'value: "/etc/praxis/grid-serving/serving-config.json"' <<<"$SERV_RENDER" \
@@ -962,30 +1045,36 @@ if grep -q 'filter: grid_site_route' <<<"$SERV_RENDER" && ! grep -q 'intelligent
 else
   fail "gridServing: unexpected render: $(grep -E 'route|GRID_SERVING|grid-serving|Error' <<<"$SERV_RENDER" | head -3 | tr '\n' ' ')"
 fi
-try_reject_msg "$GW_DIR" "gridServing without network or configMap (gw)" "gridServing.network" "${SERVING[@]}" --set gridServing.configMap=""
-if helm template v-serv "$GW_DIR" "${SERVING[@]}" --set gridServing.configMap="" --set gridServing.network=grid \
-  --set fullnameOverride=gw 2>&1 | matches 'name: "grid-serving-grid-gw"'; then
-  pass "gridServing: derives the operator's ConfigMap name from network and gatewayRef"
+try_reject_msg "$GW_DIR" "gridServing without networkName or ConfigMap (gw)" "praxisConfig.render.gridServing" "${SERVING[@]}" --set praxisConfig.render.gridServing.configMapName=""
+for setting in capacity ttl_secs; do
+  for value in 0 -1 1.5; do
+    try_reject_msg "$GW_DIR" "prefixAffinity $setting=$value (gw)" "$setting" \
+      "${SERVING[@]}" --set "praxisConfig.render.gridServing.siteRoute.prefixAffinity.$setting=$value"
+  done
+done
+if helm template v-serv "$GW_DIR" "${SERVING[@]}" --set praxisConfig.render.gridServing.configMapName="" \
+  --set praxisConfig.render.gridServing.networkName=grid --set praxisConfig.render.gridServing.gatewayRefName=gw \
+  2>&1 | matches 'name: "grid-serving-grid-gw"'; then
+  pass "gridServing: derives the operator ConfigMap name from networkName and gatewayRefName"
 else
   fail "gridServing: did not derive grid-serving-grid-gw"
 fi
-try_reject_msg "$GW_DIR" "gridServing without the Grid CA (gw)" "tls.caSecret" "${SERVING[@]}" --set tls.caSecret=""
-try_reject_msg "$GW_DIR" "gridServing on the provider role (gw)" "consumer role only" "${SERVING[@]}" --set gatewayConfig.role=provider \
-  --set-json "gatewayConfig.peerTrust.certDigests=[\"$DIGEST\"]"
-try_reject_msg "$GW_DIR" "gridServing on the ai image flavor (gw)" "image.flavor grid-gateway" "${SERVING[@]}" \
+try_reject_msg "$GW_DIR" "gridServing without the Grid identity (gw)" "praxisConfig.render.gridServing polls peers with the grid identity" "${SERVING[@]}" \
+  --set gridIdentity.tlsSecretName="" --set gridIdentity.caSecretName="" \
+  --set praxisConfig.render.backends[0].transport.mode=tls
+try_reject_msg "$GW_DIR" "gridServing on the provider role (gw)" "consumer role only" "${SERVING[@]}" --set praxisConfig.render.role=provider \
+  --set-json "praxisConfig.render.peerTrust.certDigests=[\"$DIGEST\"]"
+try_reject_msg "$GW_DIR" "gridServing on the ai image flavor (gw)" "praxisConfig.render.gridServing needs image.flavor grid-gateway" "${SERVING[@]}" \
   --set image.repository=quay.io/example/ai --set image.flavor=ai
 # --reuse-values from a release predating these keys leaves them absent.
-try_template "$GW_DIR" "absent gridServing and peerTrust maps (gw)" "${GW_REQ[@]}" --set gridServing=null \
-  --set gatewayConfig.peerTrust=null
-try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
-  --set gatewayConfig.listenerTls.enabled=true --namespace grid-system
-
+try_template "$GW_DIR" "absent gridServing and peerTrust maps (gw)" "${GW_REQ[@]}" --set praxisConfig.render.gridServing=null \
+  --set praxisConfig.render.peerTrust=null
 # listenerTls names the port https (render or BYO). A rendered config probes the
 # loopback admin listener; a BYO config's probes follow the port name.
 for mode in render byo; do
-  if [ "$mode" = render ]; then args=("${GW_RENDER[@]}"); want=3; else args=(--set config.existingConfigMap=byo); want=5; fi
-  out=$(helm template v-port "$GW_DIR" "${args[@]}" --set gatewayConfig.listenerTls.enabled=true \
-    --set gatewayConfig.listenerTls.existingSecret=l --namespace grid-system)
+  if [ "$mode" = render ]; then args=("${GW_RENDER[@]}"); want=3; else args=(--set praxisConfig.byo.configMapName=byo); want=5; fi
+  out=$(helm template v-port "$GW_DIR" "${args[@]}" --set listenerTls.secretName=l \
+    --namespace grid-system)
   if [ "$(echo "$out" | grep -cE 'name: https|port: https|targetPort: https')" = "$want" ]; then
     pass "listenerTls ($mode): port, probes, and Service target https"
   else
@@ -1014,9 +1103,9 @@ probe_port_matches() {
   fi
 }
 probe_port_matches "provider gateway" --set port.containerPort=8443 --set port.name=https-mtls \
-  --set tls.enabled=true --set tls.existingSecret=provider-tls
+  --set gridIdentity.tlsSecretName=provider-tls --set gridIdentity.caSecretName=grid-ca
 probe_port_matches "gtm emulator" --set port.containerPort=8443 --set port.name=https \
-  --set tls.enabled=true --set tls.existingSecret=gtm-tls
+  --set gridIdentity.tlsSecretName=gtm-tls --set gridIdentity.caSecretName=grid-ca
 for f in "$EXAMPLE_DIR"/{combined-site,dedicated-edge}/values/*-provider-gateway.yaml; do
   probe_port_matches "$(basename "$f" .yaml)" -f "$f"
 done
@@ -1213,7 +1302,19 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
   echo "  Kind Runtime Tests"
   echo "======================================================================"
   KIND_CLUSTER="helm-verify-$$"
-  kind create cluster --name "$KIND_CLUSTER" --wait 60s 2>&1
+  # Guarded: an unguarded create let the whole runtime section be skipped while the run
+  # still exited 0, so a broken provider read as a pass.
+  if kind create cluster --name "$KIND_CLUSTER" --wait 60s 2>&1; then
+    pass "kind: cluster created"
+  else
+    fail "kind: cluster create failed, runtime tests did not run"
+    echo "  (rootless podman needs systemd Delegate=yes; see kind.sigs.k8s.io/docs/user/rootless)"
+    echo ""
+    echo "=== Summary ==="
+    echo "  Passed: $PASS"
+    echo "  Failed: $FAIL"
+    exit 1
+  fi
 
   # Load operator image if available
   IMAGE_REF="${OPERATOR_IMAGE}:${OPERATOR_TAG}"
@@ -1347,6 +1448,238 @@ spec:
   gridNetworkRef: helm-test-network
 CR_EOF
 
+  # Grid enrollment lifecycle. Nothing else installs this chart, and it holds the Grid CA
+  # signing key, so install, helm test, upgrade and uninstall it here.
+  echo ""
+  echo "=== Grid Enrollment Kind lifecycle ==="
+
+  ENROLL_NS="grid-enroll"
+  ENROLL_HUB_NS="grid-system"
+  ENROLL_INVITE_NS="${ENROLL_NS}-invites"
+  # Only the hub operator's namespace is pre-created; the chart owns the invite one, and
+  # pre-creating it here would hide a regression in that.
+  kubectl --context "$KCTX" create namespace "$ENROLL_HUB_NS" >/dev/null 2>&1 || true
+
+  ENROLL_ARGS=(
+    --namespace "$ENROLL_NS" --create-namespace
+    --kube-context "$KCTX"
+    --set "hubSite.name=hub"
+    --set "hubSite.namespace=$ENROLL_HUB_NS"
+    --wait --timeout 5m
+  )
+  if [ -n "${ENROLL_IMAGE_REF:-}" ]; then
+    ENROLL_ARGS+=(--set "image.repository=${ENROLL_IMAGE_REF%%:*}" --set "image.tag=${ENROLL_IMAGE_REF##*:}")
+  fi
+
+  if helm install grid-enrollment charts/grid-enrollment "${ENROLL_ARGS[@]}" 2>&1; then
+    pass "kind: enrollment install"
+  else
+    fail "kind: enrollment install"
+  fi
+
+  if kubectl --context "$KCTX" get namespace "$ENROLL_INVITE_NS" >/dev/null 2>&1; then
+    pass "kind: the chart created the invite namespace"
+  else
+    fail "kind: the chart did not create the invite namespace"
+  fi
+
+  # The confinement policies have to exist, or the grants they cover are unconfined.
+  for pol in "grid-enrollment-${ENROLL_NS}-bootstrap-secrets" "grid-enrollment-${ENROLL_NS}-invite-secrets"; do
+    if kubectl --context "$KCTX" get validatingadmissionpolicy "$pol" >/dev/null 2>&1; then
+      pass "kind: enrollment policy $pol"
+    else
+      fail "kind: enrollment policy $pol missing"
+    fi
+  done
+
+  # The Role grants one namespace and the Deployment is told another unless they share a
+  # helper. That mismatch breaks every SiteInvite, so assert the two agree on the cluster.
+  ENROLL_ROLE_NS=$(kubectl --context "$KCTX" get role -A \
+    -o jsonpath='{range .items[?(@.metadata.name=="grid-enrollment-site-invite-secrets")]}{.metadata.namespace}{end}' 2>/dev/null || echo "")
+  ENROLL_ENV_NS=$(kubectl --context "$KCTX" -n "$ENROLL_NS" get deploy grid-enrollment \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENROLLMENT_INVITE_SECRET_NAMESPACE")].value}' 2>/dev/null || echo "")
+  if [ -n "$ENROLL_ROLE_NS" ] && [ "$ENROLL_ROLE_NS" = "$ENROLL_ENV_NS" ]; then
+    pass "kind: invite namespace agrees ($ENROLL_ROLE_NS)"
+  else
+    fail "kind: invite namespace mismatch (role=$ENROLL_ROLE_NS env=$ENROLL_ENV_NS)"
+  fi
+  if [ "$ENROLL_ROLE_NS" = "$ENROLL_NS" ]; then
+    fail "kind: invite Secrets share the namespace holding the CA key"
+  else
+    pass "kind: invite Secrets are out of the CA namespace"
+  fi
+
+  if helm test grid-enrollment --namespace "$ENROLL_NS" --kube-context "$KCTX" 2>&1; then
+    pass "kind: enrollment helm test"
+  else
+    fail "kind: enrollment helm test"
+  fi
+
+  # The bootstrap is the only account allowed those names, and only as Opaque or TLS.
+  BOOT_SA="system:serviceaccount:${ENROLL_NS}:grid-enrollment-ca-bootstrap"
+  deny_probe "policy denies an unlisted Secret name" 30 \
+    kubectl --context "$KCTX" create secret generic denied-by-policy \
+    --from-literal=a=b -n "$ENROLL_HUB_NS" --as="$BOOT_SA" --dry-run=server
+  cat >"$WORK/probe-sa-token.yaml" <<SA_TOKEN_EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grid-site-identity
+  annotations:
+    kubernetes.io/service-account.name: grid-operator
+type: kubernetes.io/service-account-token
+SA_TOKEN_EOF
+  deny_probe "policy denies minting a ServiceAccount token" 30 \
+    kubectl --context "$KCTX" create -n "$ENROLL_HUB_NS" \
+    --as="$BOOT_SA" --dry-run=server -f "$WORK/probe-sa-token.yaml"
+
+  # Misplacement, not absence: the bootstrap writes wherever hubSite.namespace points, so
+  # the helm test passes either way. Only the cluster knows where the operator actually
+  # runs, so derive it rather than trusting the value.
+  OP_NS=$(kubectl --context "$KCTX" get deploy -A -l app.kubernetes.io/name=grid-operator \
+    -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || echo "")
+  if [ -n "$OP_NS" ] && kubectl --context "$KCTX" -n "$OP_NS" get secret grid-site-identity >/dev/null 2>&1; then
+    pass "kind: hub identity is in the operator's namespace ($OP_NS)"
+  else
+    fail "kind: hub identity is not in the operator's namespace (operator=$OP_NS)"
+  fi
+
+  # The helm test has to be able to fail, or it proves nothing. Only meaningful from a
+  # green baseline: a test already red for its own reasons would "fail" here for free.
+  if helm test grid-enrollment --namespace "$ENROLL_NS" --kube-context "$KCTX" >/dev/null 2>&1; then
+    kubectl --context "$KCTX" -n "$ENROLL_HUB_NS" delete secret grid-site-identity >/dev/null 2>&1
+    if helm test grid-enrollment --namespace "$ENROLL_NS" --kube-context "$KCTX" >/dev/null 2>&1; then
+      fail "kind: helm test passed with the hub identity deleted, so it is vacuous"
+    else
+      pass "kind: helm test fails when the hub identity is absent"
+    fi
+  else
+    fail "kind: helm test is not green, so its failure case proves nothing"
+  fi
+  if helm upgrade grid-enrollment charts/grid-enrollment --reuse-values \
+    --namespace "$ENROLL_NS" --kube-context "$KCTX" --wait --timeout 5m >/dev/null 2>&1 \
+    && helm test grid-enrollment --namespace "$ENROLL_NS" --kube-context "$KCTX" >/dev/null 2>&1; then
+    pass "kind: upgrade re-issues the identity and helm test recovers"
+  else
+    fail "kind: identity not re-issued, or helm test still failing"
+  fi
+
+  # The DELETE arm reads oldObject, which the create probes never exercise.
+  SVC_SA="system:serviceaccount:${ENROLL_NS}:grid-enrollment"
+  if kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" create secret generic not-an-invite \
+    --from-literal=a=b >/dev/null 2>&1; then
+    deny_probe "policy denies deleting a non-invite Secret" 15 \
+      kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret not-an-invite \
+      --as="$SVC_SA" --dry-run=server
+    kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret not-an-invite >/dev/null 2>&1 || true
+  else
+    fail "kind: could not create the not-an-invite probe Secret, so the DELETE arm is untested"
+  fi
+
+  # An invite name in the wrong namespace is still outside the grant.
+  policy_deny_probe "policy denies an invite Secret outside the invite namespace" 15 \
+    "$ENROLL_NS" "$SVC_SA" \
+    kubectl --context "$KCTX" -n "$ENROLL_NS" create secret generic grid-invite-elsewhere \
+    --from-literal=a=b --as="$SVC_SA" --dry-run=server
+
+  # generateName is populated before validating admission, so the allowlist still applies.
+  cat >"$WORK/probe-generatename.yaml" <<GEN_EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  generateName: policy-probe-
+type: Opaque
+GEN_EOF
+  deny_probe "policy denies a generateName Secret" 15 \
+    kubectl --context "$KCTX" create -n "$ENROLL_HUB_NS" \
+    --as="$BOOT_SA" --dry-run=server -f "$WORK/probe-generatename.yaml"
+
+  # A namespace the chart never renders into is outside both arms.
+  policy_deny_probe "policy denies the bootstrap a third namespace" 15 \
+    enroll-third "$BOOT_SA" \
+    kubectl --context "$KCTX" -n enroll-third create secret generic anything \
+    --from-literal=a=b --as="$BOOT_SA" --dry-run=server
+
+  # Another account must be unaffected, or the policies are over-reaching.
+  if kubectl --context "$KCTX" -n "$ENROLL_HUB_NS" create secret generic unrelated-ok \
+    --from-literal=a=b --dry-run=server 2>&1 | grep -q "created"; then
+    pass "kind: policies leave other principals alone"
+  else
+    fail "kind: policies affected an unrelated principal"
+  fi
+
+  # The chart owns the invite namespace, so an install into a fresh namespace has to
+  # succeed and the namespace has to be there afterwards. The old form of this check
+  # asserted the opposite and counted any unrelated install failure as a pass.
+  FRESH_ARGS=(--namespace enroll-fresh --create-namespace --kube-context "$KCTX" --wait --timeout 5m)
+  if [ -n "${ENROLL_IMAGE_REF:-}" ]; then
+    FRESH_ARGS+=(--set "image.repository=${ENROLL_IMAGE_REF%%:*}" --set "image.tag=${ENROLL_IMAGE_REF##*:}")
+  fi
+  if helm install enroll-fresh charts/grid-enrollment "${FRESH_ARGS[@]}" >/dev/null 2>&1; then
+    pass "kind: install creates its own invite namespace"
+    if kubectl --context "$KCTX" get namespace enroll-fresh-invites >/dev/null 2>&1; then
+      pass "kind: enroll-fresh-invites exists after install"
+    else
+      fail "kind: enroll-fresh-invites missing after install"
+    fi
+    # The namespace is kept, not hooked, so an uninstall and a reinstall must both leave
+    # an unredeemed token in place. As a hook, before-hook-creation deleted the namespace
+    # on the reinstall and took the token with it.
+    if kubectl --context "$KCTX" -n enroll-fresh-invites create secret generic grid-invite-reinstall \
+      --from-literal=token=outstanding >/dev/null 2>&1; then
+      helm uninstall enroll-fresh --namespace enroll-fresh --kube-context "$KCTX" >/dev/null 2>&1 || true
+      if kubectl --context "$KCTX" -n enroll-fresh-invites get secret grid-invite-reinstall >/dev/null 2>&1; then
+        pass "kind: an outstanding invite survives an uninstall"
+      else
+        fail "kind: the uninstall destroyed an outstanding invite"
+      fi
+      if helm install enroll-fresh charts/grid-enrollment "${FRESH_ARGS[@]}" >/dev/null 2>&1; then
+        if kubectl --context "$KCTX" -n enroll-fresh-invites get secret grid-invite-reinstall >/dev/null 2>&1; then
+          pass "kind: an outstanding invite survives a reinstall"
+        else
+          fail "kind: the reinstall destroyed an outstanding invite"
+        fi
+      else
+        fail "kind: reinstall over a kept invite namespace failed"
+      fi
+    else
+      fail "kind: could not create the reinstall probe invite, so survival is untested"
+    fi
+  else
+    fail "kind: install into a fresh namespace failed"
+  fi
+  helm uninstall enroll-fresh --namespace enroll-fresh --kube-context "$KCTX" >/dev/null 2>&1 || true
+  kubectl --context "$KCTX" delete namespace enroll-fresh enroll-fresh-invites --wait=false >/dev/null 2>&1 || true
+
+  # An upgrade must not take the invite tokens with it either. The namespace is a kept
+  # regular resource, so no phase deletes it to recreate it.
+  if kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" create secret generic grid-invite-survivor \
+    --from-literal=token=outstanding >/dev/null 2>&1; then
+    if helm upgrade grid-enrollment charts/grid-enrollment --reuse-values \
+      --namespace "$ENROLL_NS" --kube-context "$KCTX" --wait --timeout 5m >/dev/null 2>&1 \
+      && kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" get secret grid-invite-survivor >/dev/null 2>&1; then
+      pass "kind: an outstanding invite survives an upgrade"
+    else
+      fail "kind: the upgrade destroyed an outstanding invite"
+    fi
+  else
+    fail "kind: could not create the grid-invite-survivor Secret, so survival is untested"
+  fi
+  kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret grid-invite-survivor >/dev/null 2>&1 || true
+
+  if helm upgrade grid-enrollment charts/grid-enrollment --reuse-values \
+    --namespace "$ENROLL_NS" --kube-context "$KCTX" --wait --timeout 5m 2>&1; then
+    pass "kind: enrollment upgrade with --reuse-values"
+  else
+    fail "kind: enrollment upgrade with --reuse-values"
+  fi
+
+  if helm uninstall grid-enrollment --namespace "$ENROLL_NS" --kube-context "$KCTX" 2>&1; then
+    pass "kind: enrollment uninstall"
+  else
+    fail "kind: enrollment uninstall"
+  fi
+
   if helm uninstall grid-operator --namespace grid-system --kube-context "$KCTX" 2>&1; then
     pass "kind: operator uninstall"
   else
@@ -1381,7 +1714,7 @@ CR_EOF
   if MISSING_OUT=$(helm install test-gateway-missing "$GW_DIR" \
     --namespace grid-system \
     --kube-context "$KCTX" \
-    --set config.existingConfigMap=missing-gateway-config \
+    --set praxisConfig.byo.configMapName=missing-gateway-config \
     --set nameOverride=test-gateway-missing 2>&1); then
     fail "kind: BYO mode accepts a missing ConfigMap"
     helm uninstall test-gateway-missing --namespace grid-system --kube-context "$KCTX" >/dev/null 2>&1 || true
@@ -1401,10 +1734,11 @@ CR_EOF
   if helm install test-gateway "$GW_DIR" \
     --namespace grid-system \
     --kube-context "$KCTX" \
-    --set config.existingConfigMap=test-gateway-config \
+    --set praxisConfig.byo.configMapName=test-gateway-config \
     --set nameOverride=test-gateway \
     --set mountReconciliation.enabled=true \
     --set mountReconciliation.network=helm-test-network \
+    --set mountReconciliation.operator.namespace=grid-system \
     --set image.repository="$GW_IMAGE" \
     --set image.tag="$GW_TAG" \
     --set image.pullPolicy=IfNotPresent \
@@ -1441,7 +1775,7 @@ CR_EOF
   if helm upgrade test-gateway "$GW_DIR" \
     --namespace grid-system \
     --kube-context "$KCTX" \
-    --set config.existingConfigMap=test-gateway-config \
+    --set praxisConfig.byo.configMapName=test-gateway-config \
     --set nameOverride=test-gateway \
     --set image.repository="$GW_IMAGE" \
     --set image.tag="$GW_TAG" \
@@ -1772,6 +2106,70 @@ else
 fi
 
 echo ""
+echo "=== Bootstrap allowlist covers every Secret the Job is told to write ==="
+# The policy allowlist and the Job's --*-secret args are built separately from the same
+# values. If they drift, the bootstrap is denied its own writes and the install fails,
+# and no render test would notice, because each side is self-consistent.
+for case in "default" "hub" "local-authz" "external-db"; do
+  ENROLL_SETS=(--set host=enroll.example.com)
+  case "$case" in
+    hub)         ENROLL_SETS+=(--set hubSite.name=hub --set hubSite.namespace=grid-system) ;;
+    local-authz) ENROLL_SETS+=(--set enrollment.authz=local) ;;
+    external-db) ENROLL_SETS+=(--set db.type=external --set db.external.connectionUrlSecretRef=byo-db) ;;
+  esac
+  ENROLL_OUT="$WORK/enroll-allowlist-$case.yaml"
+  if ! helm template allow "$ENROLL_DIR" --namespace grid-enroll "${ENROLL_SETS[@]}" >"$ENROLL_OUT" 2>/dev/null; then
+    fail "allowlist: render failed ($case)"
+    continue
+  fi
+  MISSING=$(python3 - "$ENROLL_OUT" <<'PY_EOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+args, allowed = [], ""
+for d in docs:
+    if d.get("kind") == "Job":
+        a = d["spec"]["template"]["spec"]["containers"][0].get("args", [])
+        args = [a[i + 1] for i, v in enumerate(a[:-1]) if v.endswith("-secret")]
+    if d.get("kind") == "ValidatingAdmissionPolicy" and any(
+        c.get("name") == "grid-enrollment-bootstrap" for c in d["spec"].get("matchConditions", [])
+    ):
+        allowed = d["spec"]["validations"][0]["expression"]
+if not args:
+    print("NO-JOB")
+else:
+    print(" ".join(n for n in args if '"%s"' % n not in allowed) or "OK")
+PY_EOF
+)
+  if [ "$MISSING" = "OK" ]; then
+    pass "allowlist covers the Job's Secret args ($case)"
+  elif [ "$MISSING" = "NO-JOB" ]; then
+    pass "allowlist: no bootstrap Job renders ($case)"
+  else
+    fail "allowlist missing Secret names the Job writes ($case): $MISSING"
+  fi
+done
+
+echo ""
+echo "=== Confinement policies do not collide ==="
+# The signer policies and the two Secret policies all render by default and are cluster
+# scoped, so a shared name would have one silently replace another.
+POL_OUT="$WORK/enroll-policies.yaml"
+helm template pol "$ENROLL_DIR" --namespace grid-enroll --set host=enroll.example.com \
+  --set hubSite.name=hub --set hubSite.namespace=grid-system >"$POL_OUT" 2>/dev/null
+POL_NAMES=$(python3 -c "
+import yaml
+want={'csr-record','csr-record-confine','bootstrap-secrets','invite-secrets'}
+n=[d['metadata']['name'] for d in yaml.safe_load_all(open('$POL_OUT')) if d and d.get('kind')=='ValidatingAdmissionPolicy']
+got={x.rsplit('grid-enroll-',1)[-1] for x in n}
+print('OK' if len(n)==len(set(n)) and got==want else 'names=%s' % sorted(got))
+")
+if [ "$POL_NAMES" = "OK" ]; then
+  pass "the signer and Secret policies render under four distinct names"
+else
+  fail "ValidatingAdmissionPolicy set changed or names collide: $POL_NAMES"
+fi
+
+echo ""
 echo "=== Template rendering (enrollment) ==="
 # route.enabled=auto renders a Route only where route.openshift.io/v1 is served.
 OCP=(--api-versions route.openshift.io/v1)
@@ -1870,7 +2268,7 @@ for chart in charts/*/; do
       code = $0
       sub(/^[^:]+:[0-9]+:/, "", code)
       if ($0 ~ /^charts\/praxis-gateway\/+templates\/_helpers\.tpl:[0-9]+:/ &&
-          (code == "{{- if not (lookup \"v1\" \"ConfigMap\" .Release.Namespace .Values.config.existingConfigMap) }}" ||
+          (code == "{{- if not (lookup \"v1\" \"ConfigMap\" .Release.Namespace .Values.praxisConfig.byo.configMapName) }}" ||
            code == "{{- if lookup \"v1\" \"Namespace\" \"\" \"kube-system\" }}")) {
         next
       }
@@ -1900,7 +2298,7 @@ same_render "grid-operator defaults" "$CHART_DIR"
 same_render "grid-site defaults" charts/grid-site --set gridNetwork.name=grid --set gridSite.name=site-a
 same_render "grid-enrollment defaults" charts/grid-enrollment
 same_render "grid-enrollment local authz" charts/grid-enrollment --set enrollment.authz=local
-same_render "praxis-gateway defaults" "$GW_DIR" --set config.existingConfigMap=cfg
+same_render "praxis-gateway defaults" "$GW_DIR" --set praxisConfig.byo.configMapName=cfg
 same_render "grid-mock-providers defaults" charts/grid-mock-providers
 for f in "$HS_VALUES"/*.yaml; do
   role=$(basename "$f" .yaml)
@@ -1913,7 +2311,8 @@ for f in "$HS_VALUES"/*.yaml; do
       chart=charts/grid-site
       extra=("${HS_PINNED[@]}")
       ;;
-    *-praxis-gateway)
+    hub-praxis-gateway) chart=$GW_DIR ;;
+    site-praxis-gateway)
       chart=$GW_DIR
       extra=("${HS_GW_PINNED[@]}")
       ;;

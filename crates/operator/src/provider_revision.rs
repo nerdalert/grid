@@ -392,6 +392,7 @@ mod tests {
                 last_node_generation: 10,
             },
             revision_renewer: None,
+            departed: crate::swim_runtime::Departed::Evict,
         })
         .await?)
     }

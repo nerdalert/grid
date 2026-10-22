@@ -43,17 +43,26 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
-# Values both sides install with; the operator and gateway never start.
+# Each chart version gets values it understands; the operator and gateway never start.
 OPERATOR_ARGS=(--set image.repository=registry.k8s.io/pause --set image.tag=3.9)
+# grid.id without enrollment renders a GridNetwork and GridSite, set once the CRDs exist.
+GRID_ARGS=(--set grid.id=upgrade --set grid.network=upgrade-op --set site.name=upgrade-op-site)
 SITE_ARGS=(--set gridNetwork.name=upgrade --set gridSite.name=upgrade-site)
-GATEWAY_ARGS=(--set config.existingConfigMap=upgrade-gateway --set image.tag=v0.1.0-ci)
+GATEWAY_BASE_ARGS=(--set config.existingConfigMap=upgrade-gateway --set image.tag=v0.1.0-ci)
+GATEWAY_ARGS=(--set praxisConfig.byo.configMapName=upgrade-gateway --set image.tag=v0.1.0-ci)
 RELEASES=(grid-operator grid-site praxis-gateway grid-mock-providers)
 
-release_args() { # <release>: prints the extra args, one per line
-  case "$1" in
-    grid-operator) printf '%s\n' "${OPERATOR_ARGS[@]}" ;;
+release_args() { # <base|branch> <release>: prints the values for that chart version
+  case "$2" in
+    grid-operator) printf '%s\n' "${OPERATOR_ARGS[@]}" ${GRID:+"${GRID_ARGS[@]}"} ;;
     grid-site) printf '%s\n' "${SITE_ARGS[@]}" ;;
-    praxis-gateway) printf '%s\n' "${GATEWAY_ARGS[@]}" ;;
+    praxis-gateway)
+      if [ "$1" = base ]; then
+        printf '%s\n' "${GATEWAY_BASE_ARGS[@]}"
+      else
+        printf '%s\n' "${GATEWAY_ARGS[@]}"
+      fi
+      ;;
   esac
 }
 
@@ -63,6 +72,11 @@ uids() { # <kind> [-n ns | -A]: "name uid" lines, sorted
 
 echo "== base ${BASE_REF}, install with $(${INSTALL_HELM} version --short), upgrade with $(${UPGRADE_HELM} version --short) =="
 git -C "${ROOT}" worktree add --detach "${BASE}" "${BASE_REF}" >/dev/null
+
+# A later base branch may already contain the source-mode value rename. Use the base chart's values schema instead of assuming it still accepts the legacy key.
+if grep -q '^praxisConfig:' "${BASE}/charts/praxis-gateway/values.yaml"; then
+  GATEWAY_BASE_ARGS=("${GATEWAY_ARGS[@]}")
+fi
 
 crd_group() { # <chart dir>: the grid API group its GridNetwork CRD serves
   awk '/^  group: /{print $2; exit}' "$1"/templates/crds/gridnetwork.yaml "$1"/crds/gridnetwork.yaml 2>/dev/null
@@ -85,11 +99,15 @@ ${K} -n "${NS}" create configmap upgrade-gateway --from-literal=config.yaml='{}'
 
 echo "== install from base =="
 for r in "${RELEASES[@]}"; do
-  mapfile -t extra < <(release_args "${r}")
+  mapfile -t extra < <(release_args base "${r}")
   ${INSTALL_HELM} --kube-context "${CTX}" install "${r}" "${BASE}/charts/${r}" -n "${NS}" "${extra[@]}" >/dev/null \
     || fail "base install of ${r}"
   pass "base install: ${r}"
 done
+GRID=1
+${INSTALL_HELM} --kube-context "${CTX}" upgrade grid-operator "${BASE}/charts/grid-operator" -n "${NS}" \
+  "${OPERATOR_ARGS[@]}" "${GRID_ARGS[@]}" >/dev/null || fail "base upgrade of grid-operator with grid.id"
+pass "base upgrade: grid-operator with grid.id"
 # Out-of-band CRs (cluster-scoped), created against the base CRDs.
 ${K} apply -f "${BASE}/deploy/examples/single-cluster-api-provider/gridnetwork.yaml" \
   -f "${BASE}/deploy/examples/single-cluster-api-provider/gridsite.yaml" \
@@ -121,11 +139,12 @@ fi
 
 echo "== upgrade to branch ${UPGRADE_FLAGS[*]} =="
 for r in "${RELEASES[@]}"; do
-  mapfile -t extra < <(release_args "${r}")
+  mapfile -t extra < <(release_args branch "${r}")
   ${UPGRADE_HELM} --kube-context "${CTX}" upgrade "${r}" "${ROOT}/charts/${r}" -n "${NS}" \
     "${UPGRADE_FLAGS[@]}" "${extra[@]}" >/dev/null || fail "upgrade of ${r}"
   status="$(${UPGRADE_HELM} --kube-context "${CTX}" status "${r}" -n "${NS}" -o json | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["info"]["status"],d["version"])')"
-  [ "${status}" = "deployed 2" ] || fail "${r} is '${status}' after upgrade, want 'deployed 2'"
+  want="deployed 2"; [ "${r}" = grid-operator ] && want="deployed 3"
+  [ "${status}" = "${want}" ] || fail "${r} is '${status}' after upgrade, want '${want}'"
   pass "upgrade: ${r} (${status})"
 done
 
@@ -147,6 +166,17 @@ $(diff <(echo "${CRS_BEFORE}") <(echo "${CRS_AFTER}"))"
 else
   echo "SKIP: CR carry-over, since the API group moved from ${BASE_GROUP} to ${GROUP} (no in-place upgrade)"
 fi
+
+echo "== grid.id records stay with the release =="
+for record in "GridNetwork upgrade-op" "GridSite upgrade-op-site"; do
+  awk -v want="${record}" '/^---/{k=""} /^kind: /{k=$2} k && /^  name: /{gsub(/"/, "", $2); if (k" "$2==want) f=1; k=""} END{exit !f}' \
+    <<<"$(${UPGRADE_HELM} --kube-context "${CTX}" get manifest grid-operator -n "${NS}")" \
+    || fail "the grid-operator release no longer renders ${record}"
+done
+create="$(${K} -n "${NS}" get deploy grid-operator \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="GRID_CREATE_LOCAL_RECORDS")].value}')"
+[ "${create}" = "false" ] || fail "operator record creation is '${create}' while the release renders the records"
+pass "the release still renders its GridNetwork and GridSite, and the operator's creation is off"
 
 echo "== CRD ownership =="
 manifest="$(${UPGRADE_HELM} --kube-context "${CTX}" get manifest grid-operator -n "${NS}")" && [ -n "${manifest}" ] \

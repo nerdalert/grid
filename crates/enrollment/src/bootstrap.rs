@@ -64,6 +64,15 @@ struct BootstrapArgs {
     /// Leave the CA and every certificate alone: a provided CA serves instead.
     #[arg(long)]
     skip_ca: bool,
+    /// Wait for the admission policy that confines this account's unscopable Secret
+    /// create before writing anything. Off by default: only the renderer knows whether it
+    /// rendered that policy, so the chart sets this when it did.
+    ///
+    /// Carried as an environment variable rather than only a flag, because the chart has
+    /// to set it on whatever image it is pinned to. An image that predates this ignores an
+    /// env var it does not read, where an argument it does not know is fatal.
+    #[arg(long, env = "ENROLLMENT_WAIT_FOR_CONFINEMENT")]
+    wait_for_confinement: bool,
     /// Secret for the builtin Postgres credentials, created once with a generated password.
     #[arg(long)]
     db_credentials_secret: Option<String>,
@@ -121,16 +130,12 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
     use k8s_openapi::api::core::v1::Secret;
     use kube::api::Api;
 
-    let namespace = args
-        .namespace
-        .clone()
-        .or_else(|| std::env::var("POD_NAMESPACE").ok())
-        .unwrap_or_else(|| "default".to_owned());
-
+    let namespace = resolve_namespace(args);
     check_site_args(args)?;
     let client = kube::Client::try_default().await?;
     let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
 
+    Box::pin(await_secret_confinement(&secrets, args)).await?;
     ensure_credentials(&secrets, args).await?;
     Box::pin(ensure_swim_key(&client, &secrets, args)).await?;
     if args.skip_ca {
@@ -153,6 +158,15 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
 
 /// Length of a SWIM key, the operator's `SwimKey`.
 const SWIM_KEY_LEN: usize = 32;
+
+/// Probe name for the confinement check. No allowlist in the chart carries it, so a
+/// cluster that admits it is not enforcing the policy.
+const CONFINEMENT_PROBE_NAME: &str = "grid-enrollment-confinement-probe";
+/// Probes before giving up, which with the interval below allows a minute for the API
+/// server to compile the policy.
+const CONFINEMENT_PROBE_ATTEMPTS: u32 = 30;
+/// Gap between probes.
+const CONFINEMENT_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Create the SWIM key once, then copy that same key beside the site identity.
 async fn ensure_swim_key(
@@ -220,6 +234,90 @@ async fn create_key_secret(
         Err(kube::Error::Api(response)) if response.code == 409 => Ok(Some(Box::pin(held_key(secrets, name)).await?)),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The namespace to work in: the flag, then `POD_NAMESPACE`, then `default`.
+fn resolve_namespace(args: &BootstrapArgs) -> String {
+    args.namespace
+        .clone()
+        .or_else(|| std::env::var("POD_NAMESPACE").ok())
+        .unwrap_or_else(|| "default".to_owned())
+}
+
+/// A Secret no allowlist in this chart carries, so admitting it means nothing is enforcing.
+fn confinement_probe() -> Box<k8s_openapi::api::core::v1::Secret> {
+    use k8s_openapi::{api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+
+    Box::new(Secret {
+        metadata: ObjectMeta {
+            name: Some(CONFINEMENT_PROBE_NAME.to_owned()),
+            ..ObjectMeta::default()
+        },
+        type_: Some("Opaque".to_owned()),
+        ..Secret::default()
+    })
+}
+
+/// Whether admission refused the probe, which is what proves the policy is live.
+///
+/// Only a 403 counts. A success means nothing is enforcing yet, and any other error means
+/// the probe itself could not be judged, so both read as not-yet and the caller retries
+/// rather than treating an inconclusive answer as proof.
+async fn probe_is_denied(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    params: &kube::api::PostParams,
+    probe: &k8s_openapi::api::core::v1::Secret,
+) -> bool {
+    match secrets.create(params, probe).await {
+        Err(kube::Error::Api(response)) if response.code == 403 => true,
+        Ok(_) => false,
+        Err(error) => {
+            tracing::debug!(%error, "confinement probe inconclusive");
+            false
+        },
+    }
+}
+
+/// Refuses to write until the admission policy confining this account is enforcing.
+///
+/// Two of the Secrets below need POST, because only POST returns 409 as an atomic
+/// create-once guard, so this account holds `create` on Secrets unscoped by name and the
+/// policy is what narrows it. Helm waits for the policy object to be created, not for the
+/// API server to compile and enforce it, so without this the first writes can land in
+/// that gap with the grant unconfined. Replacing the policy on upgrade reopens it.
+///
+/// Probes with a name the policy cannot admit and requires the refusal. A 403 means the
+/// policy is live. A success means it is not yet, so this retries.
+async fn await_secret_confinement(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    args: &BootstrapArgs,
+) -> Result<(), BoxError> {
+    use kube::api::PostParams;
+
+    if !args.wait_for_confinement {
+        return Ok(());
+    }
+
+    let probe = confinement_probe();
+    let params = PostParams {
+        dry_run: true,
+        ..PostParams::default()
+    };
+
+    for attempt in 1..=CONFINEMENT_PROBE_ATTEMPTS {
+        if probe_is_denied(secrets, &params, &probe).await {
+            tracing::info!(attempt, "Secret confinement is enforcing");
+            return Ok(());
+        }
+        tracing::debug!(attempt, "confinement not enforcing yet");
+        tokio::time::sleep(CONFINEMENT_PROBE_INTERVAL).await;
+    }
+    Err(
+        "the admission policy confining this account's Secret writes is not enforcing; \
+         it may be missing, or the API server has not compiled it. Re-run, or pass \
+         ca.bootstrap.policy.enabled=false if the policy is deliberately absent"
+            .into(),
+    )
 }
 
 /// The `key` an existing Secret holds, zeroizing whatever else it carries.

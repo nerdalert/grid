@@ -21,7 +21,7 @@ that ConfigMap and delivers a file that the Praxis AI gateway can reload
 without restarting.
 
 For the project-owned `grid-gateway`, cross-site routing uses a separate
-serving ConfigMap. With `gridServing.enabled`, the chart mounts this file and
+serving ConfigMap. With `praxisConfig.render.gridServing.enabled`, the chart mounts this file and
 sets `GRID_SERVING_CONFIG`. The gateway combines that configuration with
 peer signals to build its routing snapshot. See the [cross-site setup]
 for the required image, TLS, and operator settings.
@@ -124,6 +124,11 @@ tenant-facing catalog. See the
 configuration examples. The [site-selection guide](docs/site-selection.md)
 explains measured site availability and shedding at consumer gateways.
 
+Go API types for the public CRDs (`grid.praxis.fast/v1alpha1`) live in
+[`go/`](go/) as the module `github.com/praxis-proxy/grid/go`. They are
+generated from the deployed CRD schemas; see [`go/README.md`](go/README.md)
+for install and usage.
+
 ## Compatibility and trust
 
 The API version is `grid.praxis.fast/v1alpha1`. Resources from the former
@@ -163,7 +168,7 @@ make build          # build the root workspace
 make fmt            # format root and Gateway workspaces
 make lint           # Clippy, formatting, dependencies, Gateway no-ring check
 make test           # run root workspace tests
-make all            # build, format, lint, docs, tests, audit
+make all            # build, format, lint, docs, tests, audit (+ Go types check when go is in PATH)
 ```
 
 Install the pinned upstream Forge with `./scripts/forge.sh install` before

@@ -362,7 +362,8 @@ variable (64-character hex) provides an alternative key injection path without
 requiring a Kubernetes Secret.  Because environment variables are visible to
 same-host process inspectors, this is not the production Secret delivery path.
 
-Routing eligibility remains gated separately by `GridSite.status.phase == Active`
+Routing eligibility remains gated separately by `GridSite.status.phase == Active`,
+or `Unreachable` under poll signal transport,
 regardless of SWIM encryption configuration. Active status indicates control-plane
 eligibility only: sufficient trust information exists to include the site in routing
 overlays. Data-plane security readiness (mTLS handshake completion, client certificate
@@ -381,6 +382,12 @@ candidates are evicted from the rendered overlay.
 
 Local and healthy remote candidates are never evicted.  CRDT storage records
 are not deleted by this mechanism.
+
+Under poll signal transport the operator removes no candidate for liveness. A failed
+probe, a Dead or Suspect SWIM member, this TTL and the SWIM dead-member TTL leave a
+remote site's candidates in place, and the gateway routes around a silent site. A
+candidate leaves when trust fails, its endpoint changed and awaits a probe, its
+providers are withdrawn, or its GridSite is deleted.
 
 With site auto discovery on, the same TTL bounds auto-discovered GridSites. When
 gossip stops vouching for a stub's site (any SWIM state but `Dead`), the operator
@@ -633,8 +640,9 @@ verified the remote site's identity through TLS, which is sufficient to include
 the site's providers in routing overlays for consideration.
 
 Provider records from a peer whose `GridSite` is in `Discovered`, `Connecting`, `Pending`,
-`Unreachable`, or `Left` are excluded from the routing overlay. Records from a peer with
-no matching `GridSite` are also excluded (fail-closed).
+or `Left` are excluded from the routing overlay, and so are those from an `Unreachable`
+peer except under poll signal transport, where the gateway judges reachability from
+signals. Records from a peer with no matching `GridSite` are also excluded (fail-closed).
 
 GridSite Active is a control-plane eligibility signal. It means AGN has enough
 site/trust information to consider the site for overlay generation. It does not
@@ -1080,9 +1088,31 @@ loop owns this field separately from the provider's routing phase and clears
 it when discovery is disabled. The field reports the latest poll error; the
 held model set still follows its TTL independently.
 
+`status.servedModels` is the discovered set itself: the deduplicated model
+names the loop last observed for this provider (the field is a set; order
+carries no meaning). A successful poll writes the set and its expiry boundary,
+including when the names are unchanged. An empty set is present and means the
+backend serves no models.
+
+`status.servedModelsExpiresAt` is the RFC 3339 UTC deadline for that exact set,
+computed from the last successful poll and the discovery TTL. Readers must
+require this timestamp to be in the future before using `servedModels`. The
+discovery loop may not clear the status until its next round after the TTL, so
+the presence of `servedModels` alone does not prove freshness. Failed polls do
+not extend the deadline. When the set is unknown, expired and cleared, or
+discovery is disabled, both fields are absent; readers must fail closed.
+Writing either field advances `metadata.resourceVersion`, so the CRDT revision
+of the gossiped provider record advances with discovery status changes.
+
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS
 when a bearer token is configured. With `auth.credentialsManagedExternally`, requests carry no
 credentials, so plain HTTP remains available.
+
+Discovery refuses loopback, `localhost`, link-local, unspecified, and cloud
+metadata addresses, including the AWS, GCP, and EKS Pod Identity IPv6
+endpoints. Other unique-local IPv6 addresses remain allowed. A literal blocked
+IP or a `localhost` URL is reported as `config`; a hostname that resolves to a
+blocked address is reported as `unreachable`.
 
 Discovery runs in its own loop, like the signals scraper, not in reconcile.
 Discovered sets are held in memory per provider:
@@ -1090,8 +1120,9 @@ Discovered sets are held in memory per provider:
 - A successful poll replaces the set and renews its deadline; an empty list is
   a valid result.
 - A failed poll keeps the set; its deadline is not renewed.
-- A set not renewed within the TTL expires. Absence is the staleness signal,
-  so a stale set fails closed and no clocks are compared.
+- A set not renewed within the TTL expires in the monotonic in-memory store.
+  Readers use `servedModelsExpiresAt` to reject stale status even if the next
+  discovery round has not cleared it yet.
 - A provider that is deleted or drops `modelDiscovery` loses its set on the
   next round.
 - The response is rejected as a whole, never partially applied, when it:

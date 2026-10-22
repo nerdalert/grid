@@ -4,10 +4,11 @@
 
 AI Grid Network (AGN) uses [Semantic Versioning][semver]. The workspace version
 is defined in `workspace.package.version` in the root `Cargo.toml`. Workspace
-crates inherit that version. The separate `crates/gateway/Cargo.toml` workspace
-has its own package version; root version changes do not update it. Read each
-manifest for its current package version. Package versions alone do not establish image
-compatibility: qualify the tagged source and intended consumer below.
+crates inherit that version. Keep the separate `crates/gateway/Cargo.toml`
+workspace version and its explicit gateway package version aligned with the
+root workspace; root version changes do not update them. Package versions alone
+do not establish image compatibility: qualify the tagged source and intended
+consumer below.
 
 The five charts published by this release (`grid-operator`, `grid-site`,
 `praxis-gateway`, `grid-mock-providers`, and `grid-enrollment`) have versions
@@ -61,6 +62,8 @@ silently substitute a custom-built Praxis AI image.
 Before opening a release preparation pull request:
 
 - [ ] Update the workspace version in `Cargo.toml` and regenerate `Cargo.lock`.
+- [ ] Update both `workspace.package.version` and `package.version` in
+      `crates/gateway/Cargo.toml` and regenerate `crates/gateway/Cargo.lock`.
 - [ ] Update the five release-chart versions listed above.
 - [ ] Update their AGN workload `appVersion` values to the AGN tag.
 - [ ] Verify the `praxis-gateway` `appVersion` and default image match the
@@ -69,6 +72,9 @@ Before opening a release preparation pull request:
       `praxis-gateway` `overlay.sidecar.image.tag`. An empty tag there resolves
       to the chart `appVersion`, which is the Praxis AI version, so these are
       pinned by hand and the release workflow does not check them.
+- [ ] Run `make generate-deploy` and commit the result. The manifests under
+      `deploy/operator` and `deploy/overlays` render from `charts/grid-operator`,
+      so they carry the operator image tag and the kind version label.
 - [ ] Confirm the release workflow builds
       `ghcr.io/praxis-proxy/grid-gateway:v<version>` from the same tagged AGN
       source, publishes the version tag, and records the resulting immutable
@@ -79,7 +85,7 @@ Before opening a release preparation pull request:
 - [ ] Run `make test` and `make doc` for the root workspace.
 - [ ] Run `cargo test --locked --manifest-path crates/gateway/Cargo.toml --workspace`
       for the separate Gateway workspace.
-- [ ] Run `make codegen-check` and `make crds-check`.
+- [ ] Run `make codegen-check`, `make crds-check`, and `make deploy-check`.
 - [ ] Run `git diff --check` and validate the release workflow with
       `actionlint`.
 - [ ] Lint and render the five release charts with their required values.
