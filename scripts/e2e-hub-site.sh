@@ -1206,6 +1206,9 @@ ha_operator_restart() {
   started=$(date -u +%s)
   k "$HUB_CTX" rollout status deployment/grid-operator --timeout="${TIMEOUT}s" >/dev/null 2>&1 && rolled=1
   measure "operator restart" ttr_rollout_seconds "$(($(date -u +%s) - started))"
+  # Deployment rollout completion does not wait for terminating old Pods to disappear.
+  # Keep the drain watcher running through that final termination window.
+  promptly "operator restart: the restarted pod is gone" pod_absent "$pod" || true
   stop_drain_watch
   keep drain operator-restart
   measure "operator restart" drain_order_samples "$(drain_order_samples)"
