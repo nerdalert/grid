@@ -47,15 +47,32 @@ async fn reconcile(api: &FakeApi, path: &str) {
 /// pass that finds it held skips its writes.
 static PASS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// One signals pass in Poll mode, the only writer of provider conditions, awaited.
+/// Run signals passes in Poll mode until the asynchronous readiness writer publishes `Ready`.
+///
+/// A pass can skip its status write while the process-wide write slot is occupied, so one pass
+/// is not enough to guarantee that this API receives the condition. Retry within the same bound
+/// used by the other readiness waits in this test suite.
 async fn signals_pass(api: &FakeApi, path: &str) {
     let _pass = PASS.lock().await;
     let client = api.client("default");
     let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
-    grid_network::refresh_signals(&ctx, &client, NETWORK)
+    let publish = async {
+        loop {
+            grid_network::refresh_signals(&ctx, &client, NETWORK)
+                .await
+                .expect("signals pass succeeds");
+            if fixtures::observe(api, path).condition("Ready").is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(30), publish)
         .await
-        .expect("signals pass succeeds");
-    fixtures::until_condition(api, path, "Ready").await;
+        .is_err()
+    {
+        panic!("{path} never held a Ready condition within 30 s");
+    }
 }
 
 /// The field manager each provider condition type belongs to.
