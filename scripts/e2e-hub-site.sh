@@ -1059,7 +1059,26 @@ assert_drain_order() {
 }
 
 # pod_absent <pod>: the pod object is gone, which is the end of its drain.
-pod_absent() { ! k "$HUB_CTX" get pod "$1" >/dev/null 2>&1; }
+pod_absent() {
+  local pod
+  pod=$(k "$HUB_CTX" get pod "$1" --ignore-not-found -o name) || return 1
+  [[ -z $pod ]]
+}
+
+# selftest_pod_absent: NotFound is absence, while an API error is not.
+selftest_pod_absent() (
+  HUB_CTX=selftest
+  k() {
+    [[ $2 == get && $3 == pod && $5 == --ignore-not-found && $6 == -o && $7 == name ]] || return 2
+    case $4 in
+      missing) return 0 ;;
+      present) printf 'pod/present\n' ;;
+      api-error) return 1 ;;
+      *) return 2 ;;
+    esac
+  }
+  pod_absent missing && ! pod_absent present && ! pod_absent api-error
+)
 
 # gateway_pod: the oldest gateway pod, so a scenario hits one that was already serving.
 gateway_pod() {
@@ -1644,6 +1663,11 @@ cmd_selftest() {
   refutes "a ready endpoint that outlived its container" assert_drain_order "selftest late endpoint"
   : >"$WORK/drain.log"
   refutes "a drain nobody watched" assert_drain_order "selftest unobserved drain"
+  if selftest_pod_absent; then
+    pass "kubectl lookup errors do not mean a pod is absent"
+  else
+    fail "pod-absence predicate did not distinguish NotFound from an API error"
+  fi
 
   printf '%s\n' "100 503 0" "101 000 0" "102 200 3" >"$WORK/catalog.log"
   assert_catalog "selftest catalog" 100
