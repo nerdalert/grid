@@ -870,7 +870,10 @@ measure() {
 ha_operator_args() {
   OA=()
   ha || return 0
-  OA=(--set "replicaCount=$HA_OPERATOR_REPLICAS")
+  # Keep EndpointSlice withdrawal observable to the 200ms drain watcher before the
+  # operator process exits. This uses the chart's documented graceful-shutdown delay;
+  # the drain assertion remains strict and still rejects a late ready endpoint.
+  OA=(--set "replicaCount=$HA_OPERATOR_REPLICAS" --set shutdownDelaySeconds=3)
   # Both operator Services carry one endpoint under a Local traffic policy, and MetalLB
   # withdraws the announcement as notOwner when that endpoint changes node. Pinning the
   # operator keeps the lab's load balancer out of a test about the grid.
