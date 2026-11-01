@@ -10,12 +10,13 @@ cargo xtask env run-grid-llmd-pool-metrics-demo \
   --quick --teardown
 ```
 
-Quick mode proves the local EPP scrape, score changes, overlay propagation,
-and routing recovery. Full mode also deploys the source-built Grid Gateway and
-proves that each site's EPP signals cross the operator mTLS poll relay, reach
-the Gateway through its local operator, and change live site selection without
-a Gateway restart. It also checks that a stale local signal is excluded while
-SWIM remains connected and that a peer with the wrong pinned identity cannot
+Quick mode proves the local EPP metric-to-overlay path and an attributed
+pressure-driven A-to-B route shift followed by recovery to A. Full mode retains
+those checks, then deploys the source-built Grid Gateway and proves that each
+site's EPP signals cross the operator mTLS poll relay, reach the Gateway
+through its local operator, and change live site selection without a Gateway
+restart. It also checks that a stale local signal is excluded while SWIM
+remains connected and that a peer with the wrong pinned identity cannot
 replace an accepted signal.
 
 Build the Grid operator and Gateway from this checkout before a full local run:
@@ -36,9 +37,10 @@ cargo xtask env run-grid-llmd-pool-metrics-demo \
 
 Full mode requires source-built Grid images because it exercises the operator's
 signal relay and uses the `gridServing` chart mode with the `grid_site_route`
-filter. The run resolves a unique Kind cluster prefix and a Forge state
-directory under `EVIDENCE_DIR`; do not share Forge state between simultaneous
-runs.
+filter. Quick mode exercises the existing consumer Gateway and does not
+require the Grid Gateway image. The run resolves a unique Kind cluster prefix
+and a Forge state directory under `EVIDENCE_DIR`; do not share Forge state
+between simultaneous runs.
 
 Full mode also runs a separate learned-ceiling lifecycle proof after the
 cross-site signal, stale-signal, wrong-pin, and partition proofs have restored

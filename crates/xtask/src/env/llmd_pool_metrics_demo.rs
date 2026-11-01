@@ -968,29 +968,25 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
 fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String, ProofResult> {
     let mut results = BTreeMap::new();
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
+    let mut routing_started = None;
 
-    // Proof 1: Provenance (image digests and config verification)
-    results.insert("provenance".to_owned(), proof_provenance(mtls));
-
-    // Proof 2: Baseline (early state scorecard with production scores)
-    results.insert("baseline".to_owned(), proof_baseline(context));
-
-    if mode == DemoMode::Full {
-        let table_start = Instant::now();
-
-        // Proof 3: Pressure via consumer gateway (live table with attribution)
-        results.insert(
-            "pressure_and_flip".to_owned(),
-            proof_pressure_and_flip(context, table_start),
-        );
-
-        // Proof 4: Recovery (measured queue drain with live table)
-        results.insert("recovery".to_owned(), proof_recovery(context, table_start));
-
-        // Proof 5: EPP metrics cross the operator poll relay and drive the
-        // embedded Grid Gateway's live site route without a gateway restart.
-        results.insert("cross_site_signal_poll".to_owned(), cross_site::proof(context));
-        results.insert("learned_ceiling_lifecycle".to_owned(), learned_ceiling::proof(context));
+    for scenario in proof_plan(mode) {
+        let (name, result) = match scenario {
+            ProofScenario::Provenance => ("provenance", proof_provenance(mtls)),
+            ProofScenario::Baseline => ("baseline", proof_baseline(context)),
+            ProofScenario::PressureAndFlip => {
+                let started = Instant::now();
+                routing_started = Some(started);
+                ("pressure_and_flip", proof_pressure_and_flip(context, started))
+            },
+            ProofScenario::Recovery => {
+                let started = routing_started.unwrap_or_else(Instant::now);
+                ("recovery", proof_recovery(context, started))
+            },
+            ProofScenario::CrossSiteSignalPoll => ("cross_site_signal_poll", cross_site::proof(context)),
+            ProofScenario::LearnedCeilingLifecycle => ("learned_ceiling_lifecycle", learned_ceiling::proof(context)),
+        };
+        results.insert(name.to_owned(), result);
     }
 
     // TLS proof stages, only in mTLS mode
@@ -1000,6 +996,49 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
     }
 
     results
+}
+
+/// Deployed proof stages selected by the quick and full qualification modes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProofScenario {
+    /// Verify image references and live EPP metric availability.
+    Provenance,
+    /// Confirm the idle Pool A preference and attributed request.
+    Baseline,
+    /// Apply persistent local pressure and verify attributed failover to Pool B.
+    PressureAndFlip,
+    /// Remove pressure and verify attributed recovery to Pool A.
+    Recovery,
+    /// Verify peer signal relay, stale-signal handling, identity, and partition behavior.
+    CrossSiteSignalPoll,
+    /// Verify learned-capacity persistence, withdrawal, and relearning behavior.
+    LearnedCeilingLifecycle,
+}
+
+/// Proofs shared by quick and full modes.
+const QUICK_PROOF_PLAN: &[ProofScenario] = &[
+    ProofScenario::Provenance,
+    ProofScenario::Baseline,
+    ProofScenario::PressureAndFlip,
+    ProofScenario::Recovery,
+];
+
+/// Full mode preserves quick proofs and appends distributed and capacity lifecycle checks.
+const FULL_PROOF_PLAN: &[ProofScenario] = &[
+    ProofScenario::Provenance,
+    ProofScenario::Baseline,
+    ProofScenario::PressureAndFlip,
+    ProofScenario::Recovery,
+    ProofScenario::CrossSiteSignalPoll,
+    ProofScenario::LearnedCeilingLifecycle,
+];
+
+/// Select the proof stages for the requested qualification mode.
+fn proof_plan(mode: DemoMode) -> &'static [ProofScenario] {
+    match mode {
+        DemoMode::Quick => QUICK_PROOF_PLAN,
+        DemoMode::Full => FULL_PROOF_PLAN,
+    }
 }
 
 /// Proof 1: Image digests and VCR configuration verification.
@@ -4855,6 +4894,32 @@ mod tests {
     use serde::Deserialize as _;
 
     use super::*;
+
+    #[test]
+    fn quick_mode_runs_pressure_and_recovery_without_full_only_proofs() {
+        assert_eq!(
+            proof_plan(DemoMode::Quick),
+            &[
+                ProofScenario::Provenance,
+                ProofScenario::Baseline,
+                ProofScenario::PressureAndFlip,
+                ProofScenario::Recovery,
+            ],
+            "quick mode must exercise live local signal routing and recovery"
+        );
+        assert_eq!(
+            proof_plan(DemoMode::Full),
+            &[
+                ProofScenario::Provenance,
+                ProofScenario::Baseline,
+                ProofScenario::PressureAndFlip,
+                ProofScenario::Recovery,
+                ProofScenario::CrossSiteSignalPoll,
+                ProofScenario::LearnedCeilingLifecycle,
+            ],
+            "full mode must retain quick coverage and add the distributed proofs"
+        );
+    }
 
     #[test]
     fn curl_probe_waits_for_a_terminal_pod_before_reading_logs() -> Result<(), Box<dyn std::error::Error>> {
