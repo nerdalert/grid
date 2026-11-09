@@ -1663,6 +1663,7 @@ pub(crate) mod tests {
             admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,
+            adapter_contract: None,
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: model.to_owned(),
@@ -1732,6 +1733,280 @@ pub(crate) mod tests {
     }
 
     const OPEN: AdmissionState = AdmissionState::NewAndExisting;
+
+    /// A Dynamo pool candidate for the request-path adapter tests.
+    fn dynamo_candidate(
+        site: &str,
+        provider: &str,
+        provider_uid: &str,
+        provider_generation: u64,
+        comparable: bool,
+    ) -> CandidateConfig {
+        CandidateConfig {
+            expires_at_ms: None,
+            admission: AdmissionState::default(),
+            cluster: provider.to_owned(),
+            credential: None,
+            adapter_contract: Some(grid_signals::provider_observation::ProviderAdapterContract {
+                provider_id: provider.to_owned(),
+                adapter_kind: "dynamo/frontend".to_owned(),
+                adapter_version: 1,
+                provider_uid: provider_uid.to_owned(),
+                provider_generation,
+                primary_model: "llama".to_owned(),
+                model_scope: "dedicatedSingleModel".to_owned(),
+                concurrency_profile: comparable.then(|| "same-profile".to_owned()),
+                concurrency_capacity: comparable.then_some(10),
+            }),
+            fresh: true,
+            kind: CapabilityKind::InferenceModel,
+            name: "llama".to_owned(),
+            publishes_load: true,
+            site: site.to_owned(),
+            stable_id: None,
+            weight: None,
+        }
+    }
+
+    /// An llm-d or other legacy pool candidate with no opt-in adapter.
+    fn legacy_candidate(site: &str, provider: &str) -> CandidateConfig {
+        CandidateConfig {
+            expires_at_ms: None,
+            admission: AdmissionState::default(),
+            cluster: provider.to_owned(),
+            credential: None,
+            adapter_contract: None,
+            fresh: true,
+            kind: CapabilityKind::InferenceModel,
+            name: "llama".to_owned(),
+            publishes_load: true,
+            site: site.to_owned(),
+            stable_id: None,
+            weight: None,
+        }
+    }
+
+    /// Publish one complete, identity-fenced Dynamo Frontend v1 batch.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the request-path fixture varies each source identity and sample field"
+    )]
+    fn publish_dynamo(
+        store: &grid_signals::LoadStore,
+        site: &str,
+        provider: &str,
+        provider_uid: &str,
+        provider_generation: u64,
+        sequence: u64,
+        ready: u8,
+        active: u64,
+        at_ms: i64,
+    ) {
+        use grid_signals::provider_observation::{
+            DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+        };
+
+        let sample = |metric: &str, value: u64| {
+            format!(
+                r#"{metric}{{grid_site="{site}",grid_provider="{provider}",grid_adapter_kind="dynamo/frontend",grid_adapter_version="1",grid_provider_uid="{provider_uid}",grid_provider_generation="{provider_generation}",grid_model="llama",grid_model_scope="dedicatedSingleModel"}} {value} {at_ms}"#
+            )
+        };
+        let samples = [
+            sample(DYNAMO_FRONTEND_V1_MODEL_READY_METRIC, u64::from(ready)),
+            sample(DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, active),
+        ];
+        let metadata = format!(
+            r#"grid_provider_config_generation{{grid_site="{site}",grid_provider="{provider}",provider_uid="{provider_uid}",publisher_epoch="1",batch_sequence="{sequence}",batch_samples="2"}} {provider_generation} {at_ms}"#
+        );
+        let batch = std::iter::once(metadata).chain(samples).collect::<Vec<_>>().join("\n");
+        let _ = store.ingest_at(&batch, at_ms, at_ms, site);
+    }
+
+    /// Build the exact snapshot a gateway refresh would publish, then route requests through
+    /// `HttpFilter::on_request` so assertions observe the selected upstream cluster.
+    fn request_filter(
+        store: &grid_signals::LoadStore,
+        candidates: Vec<CandidateConfig>,
+        now_ms: i64,
+    ) -> GridSiteRouteFilter {
+        let candidates = validate_candidates(candidates).expect("valid serving candidates");
+        let availability = AvailabilitySettings::default();
+        let mut learned = Learned::default();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: store,
+                now_ms,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &availability,
+                learned: &mut learned,
+            },
+        );
+        filter(
+            snapshot,
+            AffinitySettings {
+                enabled: false,
+                exploration: 0.0,
+                ..AffinitySettings::default()
+            },
+        )
+    }
+
+    /// Exercise the final `GridSiteRouteFilter` choice for one inference request.
+    async fn request_cluster(filter: &GridSiteRouteFilter) -> String {
+        let request = llama_request("/v1/chat/completions");
+        let mut ctx = context(&request);
+        let action = filter.on_request(&mut ctx).await.expect("route request");
+        assert!(matches!(action, FilterAction::Continue), "request was refused");
+        ctx.cluster.expect("request selected a serving pool").to_string()
+    }
+
+    async fn request_clusters(filter: &GridSiteRouteFilter, count: usize) -> Vec<String> {
+        let mut selected = Vec::with_capacity(count);
+        for _ in 0..count {
+            selected.push(request_cluster(filter).await);
+        }
+        selected
+    }
+
+    #[tokio::test]
+    async fn mixed_adapters_and_missing_capacity_use_safe_request_fallbacks() {
+        let now = grid_signals::now_ms();
+        let mixed = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        publish_dynamo(&mixed, "east", "pool-east", "uid-pool-east", 1, 1, 1, 0, now);
+        let llmd_queue = format!(
+            r#"{}{{grid_site="west",grid_provider="pool-west"}} 90 {now}"#,
+            crate::signals::llm_d::QUEUE_METRIC
+        );
+        let _ = mixed.ingest_at(&llmd_queue, now, now, "west");
+        let mixed_candidates = vec![
+            dynamo_candidate("east", "pool-east", "uid-pool-east", 1, true),
+            legacy_candidate("west", "pool-west"),
+        ];
+        let mixed_filter = request_filter(&mixed, mixed_candidates.clone(), now);
+        let mixed_picks = request_clusters(&mixed_filter, 128).await;
+        let east = mixed_picks.iter().filter(|pool| *pool == "pool-east").count();
+        let west = mixed_picks.iter().filter(|pool| *pool == "pool-west").count();
+        assert!(
+            east > 0 && west > 0,
+            "mixed metrics must not steer requests: east={east}, west={west}"
+        );
+        let mixed_without_metrics = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        let mixed_fallback = request_filter(&mixed_without_metrics, mixed_candidates, now);
+        assert_eq!(
+            mixed_picks,
+            request_clusters(&mixed_fallback, 128).await,
+            "each mixed-adapter request must match the same candidates without telemetry"
+        );
+
+        let incomplete = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        publish_dynamo(&incomplete, "north", "pool-north", "uid-pool-north", 1, 1, 1, 0, now);
+        publish_dynamo(&incomplete, "south", "pool-south", "uid-pool-south", 1, 1, 1, 9, now);
+        let incomplete_candidates = vec![
+            dynamo_candidate("north", "pool-north", "uid-pool-north", 1, false),
+            dynamo_candidate("south", "pool-south", "uid-pool-south", 1, false),
+        ];
+        let incomplete_filter = request_filter(&incomplete, incomplete_candidates.clone(), now);
+        let incomplete_picks = request_clusters(&incomplete_filter, 128).await;
+        let north = incomplete_picks.iter().filter(|pool| *pool == "pool-north").count();
+        let south = incomplete_picks.iter().filter(|pool| *pool == "pool-south").count();
+        assert!(
+            north > 0 && south > 0,
+            "active request counts without an independent capacity must not be treated as comparable: north={north}, south={south}"
+        );
+        let incomplete_without_metrics =
+            grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        let incomplete_fallback = request_filter(&incomplete_without_metrics, incomplete_candidates, now);
+        assert_eq!(
+            incomplete_picks,
+            request_clusters(&incomplete_fallback, 128).await,
+            "each capacity-incomplete request must match the same candidates without telemetry"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_dynamo_samples_cannot_appear_idle_and_recover_on_fresh_samples() {
+        let now = grid_signals::now_ms();
+        let stale_at = now.saturating_sub(40_000);
+        let store = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        publish_dynamo(&store, "east", "pool-east", "uid-pool-east", 1, 1, 1, 0, stale_at);
+        publish_dynamo(&store, "west", "pool-west", "uid-pool-west", 1, 1, 1, 8, now);
+        let candidates = vec![
+            dynamo_candidate("east", "pool-east", "uid-pool-east", 1, true),
+            dynamo_candidate("west", "pool-west", "uid-pool-west", 1, true),
+        ];
+        let stale_filter = request_filter(&store, candidates.clone(), now);
+        assert_eq!(
+            request_clusters(&stale_filter, 16).await,
+            ["pool-west"; 16],
+            "stale readiness and active-request samples cannot rank the pool as idle"
+        );
+
+        publish_dynamo(&store, "east", "pool-east", "uid-pool-east", 1, 2, 1, 0, now);
+        publish_dynamo(&store, "west", "pool-west", "uid-pool-west", 1, 2, 1, 8, now);
+        let recovered = request_filter(&store, candidates, now);
+        let recovered_picks = request_clusters(&recovered, 128).await;
+        assert!(
+            recovered_picks.iter().any(|pool| pool == "pool-east"),
+            "a pool re-enters request selection when its fresh source samples return"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_provider_identity_is_not_selected_as_idle_and_recovers_on_current_data() {
+        let now = grid_signals::now_ms();
+        let store = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        publish_dynamo(&store, "east", "pool-east", "old-pool-east-uid", 1, 1, 1, 0, now);
+        publish_dynamo(&store, "west", "pool-west", "uid-pool-west", 1, 1, 1, 8, now);
+        let candidates = vec![
+            dynamo_candidate("east", "pool-east", "uid-pool-east", 1, true),
+            dynamo_candidate("west", "pool-west", "uid-pool-west", 1, true),
+        ];
+        let stale = request_filter(&store, candidates.clone(), now);
+        assert_eq!(
+            request_clusters(&stale, 16).await,
+            ["pool-west"; 16],
+            "the stale UID cannot be read as zero active requests"
+        );
+
+        publish_dynamo(&store, "east", "pool-east", "uid-pool-east", 1, 2, 1, 0, now);
+        publish_dynamo(&store, "west", "pool-west", "uid-pool-west", 1, 2, 1, 8, now);
+        let recovered = request_filter(&store, candidates, now);
+        let recovered_picks = request_clusters(&recovered, 128).await;
+        assert!(
+            recovered_picks.iter().any(|pool| pool == "pool-east"),
+            "the pool rejoins request selection after its exact source identity is current"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_model_not_ready_excludes_a_pool_until_request_path_recovery() {
+        let now = grid_signals::now_ms();
+        let store = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        publish_dynamo(&store, "east", "pool-east", "uid-pool-east", 1, 1, 0, 0, now);
+        publish_dynamo(&store, "west", "pool-west", "uid-pool-west", 1, 1, 1, 4, now);
+        let candidates = vec![
+            dynamo_candidate("east", "pool-east", "uid-pool-east", 1, true),
+            dynamo_candidate("west", "pool-west", "uid-pool-west", 1, true),
+        ];
+        let unready = request_filter(&store, candidates.clone(), now);
+        assert_eq!(
+            request_clusters(&unready, 16).await,
+            ["pool-west"; 16],
+            "model_ready=0 excludes the otherwise lower-pressure pool from actual requests"
+        );
+
+        publish_dynamo(&store, "east", "pool-east", "uid-pool-east", 1, 2, 1, 0, now);
+        publish_dynamo(&store, "west", "pool-west", "uid-pool-west", 1, 2, 1, 4, now);
+        let recovered = request_filter(&store, candidates, now);
+        let recovered_picks = request_clusters(&recovered, 128).await;
+        assert!(
+            recovered_picks.iter().any(|pool| pool == "pool-east"),
+            "model readiness recovery changes actual request selection"
+        );
+    }
 
     #[test]
     fn a_conversation_stays_on_the_site_holding_its_prompt() {
@@ -1876,6 +2151,7 @@ pub(crate) mod tests {
                     stable_id: None,
                     cluster: cluster.to_owned(),
                     credential: None,
+                    adapter_contract: None,
                     admission: AdmissionState::default(),
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,

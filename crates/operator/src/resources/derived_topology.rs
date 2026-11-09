@@ -485,7 +485,6 @@ fn undialable(entry: &Resolved, declarations: &Declarations<'_>) -> Option<Refus
     }
 }
 
-
 /// Transport for a provider hop. No CA: the consumer's grid identity carries trust.
 fn hop_transport(tls: &EgressTls) -> EndpointTransport {
     match tls.mode {

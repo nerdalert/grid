@@ -399,6 +399,42 @@ func TestInferenceProviderFullRoundTrip(t *testing.T) {
 	}
 }
 
+// TestInferenceProviderDynamoAdapterRoundTrip covers the opt-in, versioned
+// adapter shape independently of the legacy llm-d fixture above.
+func TestInferenceProviderDynamoAdapterRoundTrip(t *testing.T) {
+	ip := v1alpha1.InferenceProvider{
+		Spec: v1alpha1.InferenceProviderSpec{
+			GridNetworkRef: "production",
+			MetricsConfig: &v1alpha1.MetricsConfig{
+				Adapter: &v1alpha1.InferenceProviderMetricsConfigAdapter{
+					Kind:         v1alpha1.InferenceProviderMetricsConfigAdapterKindDynamoFrontendV1,
+					Scope:        v1alpha1.InferenceProviderMetricsConfigAdapterScopeDedicatedSingleModel,
+					PrimaryModel: "Qwen/Qwen3-0.6B",
+					ModelAliases: []string{"qwen3"},
+					Concurrency: &v1alpha1.InferenceProviderMetricsConfigAdapterConcurrency{
+						Profile:  "openai-chat-v1",
+						Capacity: 4,
+					},
+				},
+			},
+		},
+	}
+
+	b, err := json.Marshal(&ip)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got v1alpha1.InferenceProvider
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&got); err != nil {
+		t.Fatalf("strict unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(ip, got) {
+		t.Fatalf("round-trip differs:\n  got  %+v\n  want %+v", got, ip)
+	}
+}
+
 // TestGridNetworkRoundTrip loads the basic GridNetwork testdata fixture and
 // verifies that the key fields survive a strict unmarshal/marshal cycle.
 func TestGridNetworkRoundTrip(t *testing.T) {
@@ -594,6 +630,16 @@ func TestDeepCopyIsolation(t *testing.T) {
 	secretName := "original-secret"
 	modelName := "original-model"
 	sig := "vllm_queue_depth"
+	adapter := &v1alpha1.InferenceProviderMetricsConfigAdapter{
+		Kind:         v1alpha1.InferenceProviderMetricsConfigAdapterKindDynamoFrontendV1,
+		Scope:        v1alpha1.InferenceProviderMetricsConfigAdapterScopeDedicatedSingleModel,
+		PrimaryModel: "Qwen/Qwen3-0.6B",
+		ModelAliases: []string{"qwen3"},
+		Concurrency: &v1alpha1.InferenceProviderMetricsConfigAdapterConcurrency{
+			Profile:  "openai-chat-v1",
+			Capacity: 4,
+		},
+	}
 	ip := v1alpha1.InferenceProvider{
 		Spec: v1alpha1.InferenceProviderSpec{
 			GridNetworkRef: "net",
@@ -603,6 +649,7 @@ func TestDeepCopyIsolation(t *testing.T) {
 			Models: []v1alpha1.ModelInfo{{Name: modelName}},
 			MetricsConfig: &v1alpha1.MetricsConfig{
 				SignalNames: &v1alpha1.MetricSignalNames{QueueDepth: &sig},
+				Adapter:     adapter,
 			},
 		},
 	}
@@ -619,6 +666,14 @@ func TestDeepCopyIsolation(t *testing.T) {
 	*ip.Spec.MetricsConfig.SignalNames.QueueDepth = "mutated"
 	if *cp.Spec.MetricsConfig.SignalNames.QueueDepth == "mutated" {
 		t.Error("MetricsConfig.SignalNames.QueueDepth: copy sees mutation in original")
+	}
+	ip.Spec.MetricsConfig.Adapter.PrimaryModel = "mutated"
+	ip.Spec.MetricsConfig.Adapter.ModelAliases[0] = "mutated"
+	ip.Spec.MetricsConfig.Adapter.Concurrency.Profile = "mutated"
+	ip.Spec.MetricsConfig.Adapter.Concurrency.Capacity = 8
+	if got := cp.Spec.MetricsConfig.Adapter; got.PrimaryModel != "Qwen/Qwen3-0.6B" ||
+		got.ModelAliases[0] != "qwen3" || got.Concurrency.Profile != "openai-chat-v1" || got.Concurrency.Capacity != 4 {
+		t.Errorf("MetricsConfig.Adapter copy shares nested state: %+v", got)
 	}
 }
 

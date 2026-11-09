@@ -119,12 +119,17 @@ impl RouteSnapshot {
     ) -> Self {
         // Score each candidate once, then sort the pairs: load_of allocates a
         // store key and scans a window, too costly to repeat inside sort_by.
+        let telemetry = telemetry_policies(&candidates);
         let mut reset_pairs = BTreeSet::new();
         let mut ranked: Vec<_> = candidates
             .into_iter()
             .map(|candidate| {
                 let local = *candidate.site == *local_site;
-                Self::resolve(candidate, local, inputs, &mut reset_pairs)
+                let policy = telemetry
+                    .get(candidate.name.as_ref())
+                    .copied()
+                    .unwrap_or(CandidateTelemetry::Legacy);
+                Self::resolve(candidate, local, policy, inputs, &mut reset_pairs)
             })
             .collect();
         weigh_alike(&mut ranked);
@@ -139,10 +144,18 @@ impl RouteSnapshot {
     fn resolve<S: SiteSignals>(
         mut candidate: RouteCandidate,
         local: bool,
+        telemetry: CandidateTelemetry,
         inputs: &mut Inputs<'_, S>,
         reset_pairs: &mut BTreeSet<SitePair>,
     ) -> ResolvedCandidate {
-        let readings = observed(&mut candidate, local, inputs);
+        if telemetry == CandidateTelemetry::NoMetrics {
+            inputs
+                .learned
+                .load
+                .remove(&(Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
+            candidate.publishes_load = false;
+        }
+        let readings = observed(&mut candidate, local, telemetry, inputs);
         let score_unavailable = ScoreUnavailable::for_candidate(&candidate, &readings, inputs);
         let reading = &readings.horizon;
         let recent = &readings.recent;
@@ -161,21 +174,46 @@ impl RouteSnapshot {
         } else {
             recent.queued.map(|_| false)
         };
-        let measured = Self::measured(&candidate, &readings, inputs, reset_pairs);
-        if let Some(measured) = &measured {
-            candidate.capacity = measured.ceiling;
-            candidate.rho = Some(measured.rho);
-            candidate.full = measured.full;
-            candidate.relieved = measured.relieved;
+        let measured = if telemetry == CandidateTelemetry::Legacy {
+            Self::measured(&candidate, &readings, inputs, reset_pairs)
         } else {
-            // Direct pressure remains useful without a count or a learned ceiling.
-            candidate.rho = reading.comparator();
+            None
+        };
+        match telemetry {
+            CandidateTelemetry::Legacy => {
+                if let Some(measured) = &measured {
+                    candidate.capacity = measured.ceiling;
+                    candidate.rho = Some(measured.rho);
+                    candidate.full = measured.full;
+                    candidate.relieved = measured.relieved;
+                } else {
+                    // Direct pressure remains useful without a count or a learned ceiling.
+                    candidate.rho = reading.comparator();
+                }
+            },
+            CandidateTelemetry::DynamoComparable => {
+                candidate.capacity = reading
+                    .request_pressure
+                    .and(candidate.adapter_contract.as_ref())
+                    .and_then(|contract| contract.concurrency_capacity)
+                    .map(f64::from);
+                candidate.rho = reading.request_pressure;
+            },
+            CandidateTelemetry::NoMetrics => {
+                candidate.capacity = None;
+                candidate.rho = None;
+                candidate.full = None;
+                candidate.relieved = None;
+            },
         }
         // Ordered by queue depth; a site publishing none sorts after every site that does.
-        let load = if candidate.admission_state == AdmissionState::NewAndExisting {
-            reading.queued.unwrap_or(f64::INFINITY)
-        } else {
-            UNHEALTHY
+        let load = match (telemetry, candidate.admission_state) {
+            (_, AdmissionState::ExistingOnly | AdmissionState::Excluded) => UNHEALTHY,
+            (CandidateTelemetry::NoMetrics, AdmissionState::NewAndExisting) => 0.0,
+            (CandidateTelemetry::DynamoComparable, AdmissionState::NewAndExisting) => {
+                candidate.rho.unwrap_or(f64::INFINITY)
+            },
+            (CandidateTelemetry::Legacy, AdmissionState::NewAndExisting) => reading.queued.unwrap_or(f64::INFINITY),
         };
         ResolvedCandidate {
             candidate,
@@ -191,7 +229,49 @@ impl RouteSnapshot {
     /// anchored at the site's newest fresh sample, so a site polled less often than either is
     /// still judged on what it last said. Fullness is judged from the second, so one spike a
     /// horizon ago does not hold a site full.
-    fn readings<S: SiteSignals>(candidate: &RouteCandidate, inputs: &Inputs<'_, S>) -> Readings {
+    fn readings<S: SiteSignals>(
+        candidate: &RouteCandidate,
+        telemetry: CandidateTelemetry,
+        inputs: &Inputs<'_, S>,
+    ) -> Readings {
+        if telemetry == CandidateTelemetry::NoMetrics {
+            let mut horizon = SiteReading::default();
+            if let Some(contract) = candidate.adapter_contract.as_ref() {
+                let before =
+                    inputs
+                        .signals
+                        .learning_state(&candidate.site, &candidate.cluster, inputs.now_ms, inputs.window_ms);
+                horizon = inputs.signals.read_dynamo_frontend(
+                    &candidate.site,
+                    &candidate.cluster,
+                    contract,
+                    Over {
+                        now_ms: inputs.now_ms,
+                        window_ms: inputs.window_ms,
+                        horizon_ms: inputs.horizon_ms,
+                        queue_full: inputs.availability.queue_full,
+                    },
+                );
+                if before
+                    != inputs.signals.learning_state(
+                        &candidate.site,
+                        &candidate.cluster,
+                        inputs.now_ms,
+                        inputs.window_ms,
+                    )
+                {
+                    return Readings::default();
+                }
+            }
+            horizon.request_pressure = None;
+            horizon.in_flight = None;
+            return Readings {
+                coherent: true,
+                horizon,
+                recent: SiteReading::default(),
+                epoch: None,
+            };
+        }
         let state = || {
             inputs
                 .signals
@@ -204,14 +284,36 @@ impl RouteSnapshot {
             horizon_ms,
             queue_full: inputs.availability.queue_full,
         };
-        let reading = inputs
-            .signals
-            .read(&candidate.site, &candidate.cluster, over(inputs.horizon_ms));
-        let recent = inputs.signals.read(
-            &candidate.site,
-            &candidate.cluster,
-            over(inputs.availability.room_after_ms),
-        );
+        let (reading, recent) = if telemetry == CandidateTelemetry::DynamoComparable {
+            let Some(contract) = candidate.adapter_contract.as_ref() else {
+                return Readings::default();
+            };
+            (
+                inputs.signals.read_dynamo_frontend(
+                    &candidate.site,
+                    &candidate.cluster,
+                    contract,
+                    over(inputs.horizon_ms),
+                ),
+                inputs.signals.read_dynamo_frontend(
+                    &candidate.site,
+                    &candidate.cluster,
+                    contract,
+                    over(inputs.availability.room_after_ms),
+                ),
+            )
+        } else {
+            (
+                inputs
+                    .signals
+                    .read(&candidate.site, &candidate.cluster, over(inputs.horizon_ms)),
+                inputs.signals.read(
+                    &candidate.site,
+                    &candidate.cluster,
+                    over(inputs.availability.room_after_ms),
+                ),
+            )
+        };
         if before != state() {
             return Readings::default();
         }
@@ -529,6 +631,67 @@ pub(crate) fn decisions_for(candidates: &[RouteCandidate]) -> Vec<SiteDecisions>
         .collect()
 }
 
+/// Telemetry mode selected for every candidate of one model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateTelemetry {
+    /// Preserve the existing llm-d provider series behavior.
+    Legacy,
+    /// Compare active-request pressure across a complete Dynamo set with one profile and capacity.
+    DynamoComparable,
+    /// Adapter telemetry is mixed, incomplete, unsupported, or ambiguous.
+    NoMetrics,
+}
+
+/// Select one telemetry policy per model before reading any site's signals.
+fn telemetry_policies(candidates: &[RouteCandidate]) -> BTreeMap<String, CandidateTelemetry> {
+    let mut by_model = BTreeMap::<String, Vec<&RouteCandidate>>::new();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.kind == CapabilityKind::InferenceModel)
+    {
+        by_model.entry(candidate.name.to_string()).or_default().push(candidate);
+    }
+    by_model
+        .into_iter()
+        .map(|(model, model_candidates)| {
+            let has_adapter = model_candidates
+                .iter()
+                .any(|candidate| candidate.adapter_contract.is_some());
+            if !has_adapter {
+                return (model, CandidateTelemetry::Legacy);
+            }
+            let profile = model_candidates
+                .first()
+                .and_then(|candidate| candidate.adapter_contract.as_ref())
+                .and_then(|contract| contract.concurrency_profile.as_deref());
+            let capacity = model_candidates
+                .first()
+                .and_then(|candidate| candidate.adapter_contract.as_ref())
+                .and_then(|contract| contract.concurrency_capacity);
+            let mut sources = BTreeSet::new();
+            let comparable = model_candidates.len() >= 2
+                && profile.is_some()
+                && capacity.is_some()
+                && model_candidates.iter().all(|candidate| {
+                    candidate.adapter_contract.as_ref().is_some_and(|contract| {
+                        contract.is_comparable_dynamo_frontend(&candidate.name)
+                            && contract.concurrency_profile.as_deref() == profile
+                            && contract.concurrency_capacity == capacity
+                            && sources.insert((candidate.site.to_string(), contract.provider_id.clone()))
+                    })
+                });
+            (
+                model,
+                if comparable {
+                    CandidateTelemetry::DynamoComparable
+                } else {
+                    CandidateTelemetry::NoMetrics
+                },
+            )
+        })
+        .collect()
+}
+
 /// A candidate's site and cluster, the labels of its score gauge.
 type SitePair = (Arc<str>, Arc<str>);
 /// A `(site, cluster, model)` triple: one inference model a site's cluster serves.
@@ -573,6 +736,7 @@ impl ScoreUnavailable {
     ) -> Option<Self> {
         if candidate.admission_state != AdmissionState::NewAndExisting
             || !candidate.publishes_load
+            || candidate.adapter_contract.is_some()
             || !readings.coherent
             || readings.horizon.queued.is_some()
             || readings.horizon.unready
@@ -1220,8 +1384,13 @@ fn sheds_on(candidate: &RouteCandidate, score: f64) -> bool {
 }
 
 /// `candidate`'s readings, with its silence marked.
-fn observed<S: SiteSignals>(candidate: &mut RouteCandidate, local: bool, inputs: &mut Inputs<'_, S>) -> Readings {
-    let readings = RouteSnapshot::readings(candidate, inputs);
+fn observed<S: SiteSignals>(
+    candidate: &mut RouteCandidate,
+    local: bool,
+    telemetry: CandidateTelemetry,
+    inputs: &mut Inputs<'_, S>,
+) -> Readings {
+    let readings = RouteSnapshot::readings(candidate, telemetry, inputs);
     observe_silence(candidate, local, &readings, inputs);
     readings
 }
@@ -1402,6 +1571,7 @@ mod tests {
             admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,
+            adapter_contract: None,
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: name.to_owned(),
@@ -1410,6 +1580,638 @@ mod tests {
             stable_id: None,
             weight: None,
         }
+    }
+
+    fn dynamo_cand(
+        name: &str,
+        site: &str,
+        provider: &str,
+        concurrency_profile: Option<&str>,
+        concurrency_capacity: Option<u32>,
+    ) -> CandidateConfig {
+        dynamo_cand_at_generation(name, site, provider, concurrency_profile, concurrency_capacity, 1)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test helper exposes the independently varied source revision"
+    )]
+    fn dynamo_cand_at_generation(
+        name: &str,
+        site: &str,
+        routing_cluster: &str,
+        concurrency_profile: Option<&str>,
+        concurrency_capacity: Option<u32>,
+        provider_generation: u64,
+    ) -> CandidateConfig {
+        let mut candidate = cand(name, site, routing_cluster);
+        candidate.adapter_contract = Some(grid_signals::provider_observation::ProviderAdapterContract {
+            provider_id: format!("provider-{routing_cluster}"),
+            adapter_kind: "dynamo/frontend".to_owned(),
+            adapter_version: 1,
+            provider_uid: format!("uid-{routing_cluster}-provider"),
+            provider_generation,
+            primary_model: name.to_owned(),
+            model_scope: "dedicatedSingleModel".to_owned(),
+            concurrency_profile: concurrency_profile.map(str::to_owned),
+            concurrency_capacity,
+        });
+        candidate
+    }
+
+    fn dynamo_sample(site: &str, routing_cluster: &str, metric: &str, value: f64, at_ms: i64) -> String {
+        dynamo_sample_at_generation(site, routing_cluster, 1, metric, value, at_ms)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test exposition labels expose the independently varied source revision"
+    )]
+    fn dynamo_sample_at_generation(
+        site: &str,
+        routing_cluster: &str,
+        generation: u64,
+        metric: &str,
+        value: f64,
+        at_ms: i64,
+    ) -> String {
+        dynamo_sample_at_identity(
+            site,
+            routing_cluster,
+            &format!("uid-{routing_cluster}-provider"),
+            generation,
+            metric,
+            value,
+            at_ms,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test exposition exposes source UID, generation, series, value, and timestamp independently"
+    )]
+    fn dynamo_sample_at_identity(
+        site: &str,
+        routing_cluster: &str,
+        provider_uid: &str,
+        generation: u64,
+        metric: &str,
+        value: f64,
+        at_ms: i64,
+    ) -> String {
+        format!(
+            r#"{metric}{{grid_site="{site}",grid_provider="{routing_cluster}",grid_adapter_kind="dynamo/frontend",grid_adapter_version="1",grid_provider_uid="{provider_uid}",grid_provider_generation="{generation}",grid_model="m",grid_model_scope="dedicatedSingleModel"}} {value} {at_ms}"#
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test publication exposes provider revision, clock, and payload independently"
+    )]
+    fn ingest_dynamo_revision_batch(
+        store: &LoadStore,
+        site: &str,
+        routing_cluster: &str,
+        generation: u64,
+        sequence: u64,
+        at_ms: i64,
+        samples: &[String],
+    ) {
+        ingest_dynamo_revision_batch_with_uid(
+            store,
+            site,
+            routing_cluster,
+            &format!("uid-{routing_cluster}-provider"),
+            generation,
+            sequence,
+            at_ms,
+            samples,
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test publication exposes provider identity, revision, clock and payload independently"
+    )]
+    fn ingest_dynamo_revision_batch_with_uid(
+        store: &LoadStore,
+        site: &str,
+        routing_cluster: &str,
+        provider_uid: &str,
+        generation: u64,
+        sequence: u64,
+        at_ms: i64,
+        samples: &[String],
+    ) {
+        let metadata = format!(
+            r#"grid_provider_config_generation{{grid_site="{site}",grid_provider="{routing_cluster}",provider_uid="{provider_uid}",publisher_epoch="1",batch_sequence="{sequence}",batch_samples="{}"}} {generation} {at_ms}"#,
+            samples.len()
+        );
+        let batch = std::iter::once(metadata)
+            .chain(samples.iter().cloned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        store.ingest_at(&batch, at_ms, at_ms, site);
+    }
+
+    fn ingest_dynamo_pool(store: &LoadStore, site: &str, routing_cluster: &str, active: u32, at_ms: i64) {
+        ingest_dynamo_pool_at_generation(store, site, routing_cluster, 1, 1, active, at_ms);
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test fixture exposes readiness, load, and source revision independently"
+    )]
+    fn ingest_dynamo_pool_at_generation(
+        store: &LoadStore,
+        site: &str,
+        routing_cluster: &str,
+        generation: u64,
+        ready: u32,
+        active: u32,
+        at_ms: i64,
+    ) {
+        use grid_signals::provider_observation::{
+            DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+        };
+
+        let samples = [
+            dynamo_sample_at_generation(
+                site,
+                routing_cluster,
+                generation,
+                DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+                f64::from(ready),
+                at_ms,
+            ),
+            dynamo_sample_at_generation(
+                site,
+                routing_cluster,
+                generation,
+                DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+                f64::from(active),
+                at_ms,
+            ),
+        ];
+        let sequence = u64::try_from(at_ms).expect("test publication timestamps are positive");
+        ingest_dynamo_revision_batch(store, site, routing_cluster, generation, sequence, at_ms, &samples);
+    }
+
+    #[test]
+    fn comparable_dynamo_candidates_rank_by_their_declared_request_pressure() {
+        let store = LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        ingest_dynamo_pool(&store, "east", "pool-east", 8, 1_000);
+        ingest_dynamo_pool(&store, "west", "pool-west", 2, 1_000);
+        let candidates = validate_candidates(vec![
+            dynamo_cand("m", "east", "pool-east", Some("same-profile"), Some(10)),
+            dynamo_cand("m", "west", "pool-west", Some("same-profile"), Some(10)),
+        ])
+        .unwrap();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 1_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut Learned::default(),
+            },
+        );
+
+        assert_eq!(
+            snapshot
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.as_ref())
+                .collect::<Vec<_>>(),
+            ["pool-west", "pool-east"],
+            "the lower active-request ratio ranks first"
+        );
+        assert_eq!(site_in(&snapshot, "east").rho, Some(0.8));
+        assert_eq!(site_in(&snapshot, "west").rho, Some(0.2));
+        assert_eq!(site_in(&snapshot, "east").capacity, Some(10.0));
+        let selected = select_pools(&snapshot, "m", 256);
+        let less_loaded = selected.iter().filter(|pool| pool.as_str() == "pool-west").count();
+        let busier = selected.iter().filter(|pool| pool.as_str() == "pool-east").count();
+        assert!(
+            less_loaded > busier,
+            "pressure affects final request selection: less-loaded pool got {less_loaded}, busier got {busier}"
+        );
+    }
+
+    #[test]
+    fn mixed_or_capacity_incomplete_dynamo_sets_fall_back_without_pressure_scores() {
+        let store = LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        ingest_dynamo_pool(&store, "east", "pool-east", 0, 1_000);
+        store.ingest_at(&line("west", "pool-west", 90.0, 1_000), 1_000, 1_000, "west");
+        let mixed = validate_candidates(vec![
+            dynamo_cand("m", "east", "pool-east", Some("same-profile"), Some(10)),
+            cand("m", "west", "pool-west"),
+        ])
+        .unwrap();
+        let mixed_snapshot = RouteSnapshot::from_store(
+            mixed,
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 1_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut Learned::default(),
+            },
+        );
+        assert_eq!(
+            mixed_snapshot
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.as_ref())
+                .collect::<Vec<_>>(),
+            ["pool-east", "pool-west"],
+            "mixed llm-d/Dynamo candidates preserve fallback order"
+        );
+        assert!(
+            mixed_snapshot
+                .candidates
+                .iter()
+                .all(|candidate| candidate.rho.is_none())
+        );
+        let mixed_picks = select_pools(&mixed_snapshot, "m", 64);
+        assert!(mixed_picks.iter().any(|pool| pool == "pool-east"));
+        assert!(mixed_picks.iter().any(|pool| pool == "pool-west"));
+
+        ingest_dynamo_pool(&store, "north", "pool-north", 0, 2_000);
+        ingest_dynamo_pool(&store, "south", "pool-south", 7, 2_000);
+        let incomplete = validate_candidates(vec![
+            dynamo_cand("m", "north", "pool-north", None, None),
+            dynamo_cand("m", "south", "pool-south", None, None),
+        ])
+        .unwrap();
+        let incomplete_snapshot = RouteSnapshot::from_store(
+            incomplete,
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 2_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut Learned::default(),
+            },
+        );
+        assert_eq!(
+            incomplete_snapshot
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.as_ref())
+                .collect::<Vec<_>>(),
+            ["pool-north", "pool-south"],
+            "missing capacity does not turn active requests into a comparable idle score"
+        );
+        assert!(
+            incomplete_snapshot.candidates.iter().all(|candidate| {
+                candidate.rho.is_none() && candidate.capacity.is_none() && !candidate.publishes_load
+            })
+        );
+        let incomplete_picks = select_pools(&incomplete_snapshot, "m", 64);
+        assert!(incomplete_picks.iter().any(|pool| pool == "pool-north"));
+        assert!(incomplete_picks.iter().any(|pool| pool == "pool-south"));
+
+        ingest_dynamo_pool(&store, "north", "pool-north", 0, 3_000);
+        ingest_dynamo_pool(&store, "south", "pool-south", 7, 3_000);
+        let mismatched = validate_candidates(vec![
+            dynamo_cand("m", "north", "pool-north", Some("same-profile"), Some(10)),
+            dynamo_cand("m", "south", "pool-south", Some("same-profile"), Some(20)),
+        ])
+        .unwrap();
+        let mismatched_snapshot = RouteSnapshot::from_store(
+            mismatched,
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 3_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut Learned::default(),
+            },
+        );
+        assert_eq!(
+            mismatched_snapshot
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.as_ref())
+                .collect::<Vec<_>>(),
+            ["pool-north", "pool-south"],
+            "a differing denominator is not treated as a comparable pressure profile"
+        );
+        assert!(
+            mismatched_snapshot.candidates.iter().all(|candidate| {
+                candidate.rho.is_none() && candidate.capacity.is_none() && !candidate.publishes_load
+            })
+        );
+        let mismatched_picks = select_pools(&mismatched_snapshot, "m", 64);
+        assert!(mismatched_picks.iter().any(|pool| pool == "pool-north"));
+        assert!(mismatched_picks.iter().any(|pool| pool == "pool-south"));
+    }
+
+    #[test]
+    fn comparable_adapter_policy_is_resolved_independently_per_model() {
+        let candidates = validate_candidates(vec![
+            dynamo_cand("m", "east", "pool-east", Some("profile-a"), Some(10)),
+            dynamo_cand("m", "west", "pool-west", Some("profile-a"), Some(10)),
+            dynamo_cand("n", "north", "pool-north", Some("profile-b"), Some(20)),
+            dynamo_cand("n", "south", "pool-south", Some("profile-b"), Some(20)),
+        ])
+        .unwrap();
+        let policies = telemetry_policies(&candidates);
+
+        assert_eq!(policies.get("m"), Some(&CandidateTelemetry::DynamoComparable));
+        assert_eq!(policies.get("n"), Some(&CandidateTelemetry::DynamoComparable));
+    }
+
+    #[test]
+    fn a_stale_provider_generation_is_not_selected_and_recovers_on_current_signals() {
+        let store = LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        ingest_dynamo_pool(&store, "east", "pool-east", 0, 1_000);
+        ingest_dynamo_pool(&store, "west", "pool-west", 4, 1_000);
+        let candidates = validate_candidates(vec![
+            dynamo_cand_at_generation("m", "east", "pool-east", Some("same-profile"), Some(10), 2),
+            dynamo_cand("m", "west", "pool-west", Some("same-profile"), Some(10)),
+        ])
+        .unwrap();
+        let mut learned = Learned::default();
+        let stale = RouteSnapshot::from_store(
+            candidates.clone(),
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 1_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut learned,
+            },
+        );
+        assert_eq!(site_in(&stale, "east").rho, None);
+        assert!(
+            select_pools(&stale, "m", 32).iter().all(|pool| pool == "pool-west"),
+            "old provider generation cannot win as idle"
+        );
+
+        ingest_dynamo_pool_at_generation(&store, "east", "pool-east", 2, 1, 0, 2_000);
+        ingest_dynamo_pool(&store, "west", "pool-west", 4, 2_000);
+        let recovered = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 2_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut learned,
+            },
+        );
+        assert_eq!(site_in(&recovered, "east").rho, Some(0.0));
+        let recovered_picks = select_pools(&recovered, "m", 128);
+        assert!(recovered_picks.iter().any(|pool| pool == "pool-east"));
+    }
+
+    #[test]
+    fn a_stale_provider_uid_is_not_selected_and_recovers_on_current_signals() {
+        use grid_signals::provider_observation::{
+            DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+        };
+
+        let store = LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        let retired_uid = [
+            dynamo_sample_at_identity(
+                "east",
+                "pool-east",
+                "retired-uid",
+                2,
+                DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+                1.0,
+                1_000,
+            ),
+            dynamo_sample_at_identity(
+                "east",
+                "pool-east",
+                "retired-uid",
+                2,
+                DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+                0.0,
+                1_000,
+            ),
+        ];
+        ingest_dynamo_revision_batch_with_uid(&store, "east", "pool-east", "retired-uid", 2, 1, 1_000, &retired_uid);
+        ingest_dynamo_pool(&store, "west", "pool-west", 4, 1_000);
+        let candidates = validate_candidates(vec![
+            dynamo_cand_at_generation("m", "east", "pool-east", Some("same-profile"), Some(10), 2),
+            dynamo_cand("m", "west", "pool-west", Some("same-profile"), Some(10)),
+        ])
+        .unwrap();
+        let mut learned = Learned::default();
+        let stale = RouteSnapshot::from_store(
+            candidates.clone(),
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 1_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut learned,
+            },
+        );
+        assert_eq!(site_in(&stale, "east").rho, None);
+        assert!(
+            select_pools(&stale, "m", 32).iter().all(|pool| pool == "pool-west"),
+            "a retired provider UID cannot win as idle"
+        );
+
+        ingest_dynamo_pool_at_generation(&store, "east", "pool-east", 2, 1, 0, 2_000);
+        ingest_dynamo_pool(&store, "west", "pool-west", 4, 2_000);
+        let recovered = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 2_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut learned,
+            },
+        );
+        assert_eq!(site_in(&recovered, "east").rho, Some(0.0));
+        let recovered_picks = select_pools(&recovered, "m", 128);
+        let east = recovered_picks.iter().filter(|pool| *pool == "pool-east").count();
+        assert!(
+            east > 0,
+            "the pool returns to request selection with its current provider UID: east={east}"
+        );
+    }
+
+    #[test]
+    fn a_new_batch_without_readiness_does_not_reuse_an_old_ready_idle_sample() {
+        use grid_signals::provider_observation::{
+            DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+        };
+
+        let store = LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        let ready_and_idle = [
+            dynamo_sample("east", "pool-east", DYNAMO_FRONTEND_V1_MODEL_READY_METRIC, 1.0, 1_000),
+            dynamo_sample(
+                "east",
+                "pool-east",
+                DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+                5.0,
+                1_000,
+            ),
+        ];
+        ingest_dynamo_revision_batch(&store, "east", "pool-east", 1, 1, 1_000, &ready_and_idle);
+        let ready_and_busy = [
+            dynamo_sample("west", "pool-west", DYNAMO_FRONTEND_V1_MODEL_READY_METRIC, 1.0, 1_000),
+            dynamo_sample(
+                "west",
+                "pool-west",
+                DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+                4.0,
+                1_000,
+            ),
+        ];
+        ingest_dynamo_revision_batch(&store, "west", "pool-west", 1, 1, 1_000, &ready_and_busy);
+
+        let active_without_readiness = [dynamo_sample(
+            "east",
+            "pool-east",
+            DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+            0.0,
+            1_000,
+        )];
+        ingest_dynamo_revision_batch(&store, "east", "pool-east", 1, 2, 1_000, &active_without_readiness);
+        let current_west = [
+            dynamo_sample("west", "pool-west", DYNAMO_FRONTEND_V1_MODEL_READY_METRIC, 1.0, 2_000),
+            dynamo_sample(
+                "west",
+                "pool-west",
+                DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+                4.0,
+                2_000,
+            ),
+        ];
+        ingest_dynamo_revision_batch(&store, "west", "pool-west", 1, 2, 2_000, &current_west);
+
+        let candidates = validate_candidates(vec![
+            dynamo_cand("m", "east", "pool-east", Some("same-profile"), Some(10)),
+            dynamo_cand("m", "west", "pool-west", Some("same-profile"), Some(10)),
+        ])
+        .unwrap();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 2_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut Learned::default(),
+            },
+        );
+
+        let key = LoadStore::key("east", "pool-east");
+        let current_serial = store.learning_state(&key, 2_000, 30_000).serial;
+        assert_eq!(
+            store
+                .latest(&key, DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC)
+                .map(|sample| (sample.value, sample.publication_serial)),
+            Some((0.0, Some(current_serial))),
+            "a newer publication at the same timestamp replaces the prior sample"
+        );
+        assert_ne!(
+            store
+                .latest(&key, DYNAMO_FRONTEND_V1_MODEL_READY_METRIC)
+                .and_then(|sample| sample.publication_serial),
+            Some(current_serial),
+            "readiness remains tied to its prior publication"
+        );
+        assert_eq!(site_in(&snapshot, "east").rho, None);
+        assert!(
+            select_pools(&snapshot, "m", 32).iter().all(|pool| pool == "pool-west"),
+            "an absent readiness sample in the current complete batch cannot reuse an old ready=1 idle sample"
+        );
+    }
+
+    #[test]
+    fn model_not_ready_excludes_a_pool_until_a_fresh_ready_sample_recovers_it() {
+        let store = LoadStore::new(Duration::from_secs(60)).with_revision_guard(60_000);
+        ingest_dynamo_pool_at_generation(&store, "east", "pool-east", 1, 0, 0, 1_000);
+        ingest_dynamo_pool_at_generation(&store, "west", "pool-west", 1, 1, 4, 1_000);
+        let candidates = validate_candidates(vec![
+            dynamo_cand("m", "east", "pool-east", Some("same-profile"), Some(10)),
+            dynamo_cand("m", "west", "pool-west", Some("same-profile"), Some(10)),
+        ])
+        .unwrap();
+        let mut learned = Learned::default();
+        let unready = RouteSnapshot::from_store(
+            candidates.clone(),
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 1_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut learned,
+            },
+        );
+        assert_eq!(site_in(&unready, "east").admission_state, AdmissionState::Excluded);
+        assert!(
+            select_pools(&unready, "m", 32).iter().all(|pool| pool == "pool-west"),
+            "model_ready=0 excludes the lower-pressure pool"
+        );
+
+        ingest_dynamo_pool_at_generation(&store, "east", "pool-east", 1, 1, 0, 2_000);
+        let recovered = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 2_000,
+                window_ms: 30_000,
+                horizon_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut learned,
+            },
+        );
+        let recovered_picks = select_pools(&recovered, "m", 128);
+        let east = recovered_picks.iter().filter(|pool| *pool == "pool-east").count();
+        assert!(
+            east > 0,
+            "ready pool rejoins request selection after recovery: east={east}"
+        );
+    }
+
+    fn pick_pool(snapshot: &RouteSnapshot, model: &str, turn: usize) -> String {
+        crate::route::select_spread(
+            snapshot,
+            CapabilityKind::InferenceModel,
+            model,
+            turn,
+            |_| true,
+            &crate::route::KeepAll,
+        )
+        .map(|selection| selection.candidate.cluster.to_string())
+        .expect("a serving candidate is selected")
+    }
+
+    fn select_pools(snapshot: &RouteSnapshot, model: &str, turns: usize) -> Vec<String> {
+        (0..turns).map(|turn| pick_pool(snapshot, model, turn)).collect()
     }
 
     #[test]

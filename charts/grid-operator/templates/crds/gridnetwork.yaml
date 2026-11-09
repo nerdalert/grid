@@ -1039,6 +1039,15 @@ spec:
                             rule: '!(has(self.enabled) && has(self.generate))'
                           - message: set only `credentialMountBase` or `credentialMountPath`, not both
                             rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
+                      providerAdapterContractVersion:
+                        description: |-
+                          Provider telemetry contract version supported by the running Gateway.
+
+                          Set this only after the Gateway understands versioned provider adapter
+                          metadata and exact source-revision checks. The operator omits adapter
+                          metadata unless this is exactly `v1`.
+                        nullable: true
+                        type: string
                       providerHopEndpoints:
                         description: |-
                           Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
@@ -1979,6 +1988,15 @@ spec:
                             rule: '!(has(self.enabled) && has(self.generate))'
                           - message: set only `credentialMountBase` or `credentialMountPath`, not both
                             rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
+                      providerAdapterContractVersion:
+                        description: |-
+                          Provider telemetry contract version supported by the running Gateway.
+
+                          Set this only after the Gateway understands versioned provider adapter
+                          metadata and exact source-revision checks. The operator omits adapter
+                          metadata unless this is exactly `v1`.
+                        nullable: true
+                        type: string
                       providerHopEndpoints:
                         description: |-
                           Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
@@ -2195,6 +2213,7 @@ spec:
                         - noMetrics
                         - queueDepth
                         - kvCachePressure
+                        - dynamoRequestPressure
                       type: string
                   required:
                     - strategy

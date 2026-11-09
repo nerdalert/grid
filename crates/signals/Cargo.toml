@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 dashmap = { workspace = true }
+serde = { workspace = true }
 
 [lints]
 workspace = true

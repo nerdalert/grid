@@ -14,6 +14,8 @@ use crate::crd::inference_provider::Condition;
 
 /// Gateway model-discovery contract version required for dynamic model routes.
 pub const MODEL_DISCOVERY_CONTRACT_VERSION: &str = "v1";
+/// Gateway provider-adapter contract version required for canonical telemetry candidates.
+pub const PROVIDER_ADAPTER_CONTRACT_VERSION: &str = "v1";
 
 // ---------------------------------------------------------------------------
 // Routing policy
@@ -82,6 +84,14 @@ pub enum ScoringStrategy {
     /// utilization produces a higher score. It is a capacity-pressure signal,
     /// not evidence that the current request's prefix is cached.
     KvCachePressure,
+
+    /// Compare fresh Dynamo Frontend request pressure across equivalent Dynamo pools.
+    ///
+    /// The operator applies this only when every eligible inference provider has
+    /// a fresh one-model observation, the same primary model and concurrency
+    /// profile, and an independently declared capacity. Mixed llm-d/Dynamo or
+    /// incomplete observations use ordinary noMetrics ordering.
+    DynamoRequestPressure,
 }
 
 impl ScoringStrategy {
@@ -89,7 +99,8 @@ impl ScoringStrategy {
     #[must_use]
     pub fn weights(self) -> scoring::ScoringWeights {
         match self {
-            Self::NoMetrics => scoring::ScoringWeights {
+            // Adapter scores are supplied separately; failed or mixed comparisons use noMetrics.
+            Self::NoMetrics | Self::DynamoRequestPressure => scoring::ScoringWeights {
                 locality: 0.0,
                 queue_depth: 0.0,
                 kv_cache: 0.0,
@@ -873,6 +884,14 @@ pub struct GatewayRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_discovery_contract_version: Option<String>,
 
+    /// Provider telemetry contract version supported by the running Gateway.
+    ///
+    /// Set this only after the Gateway understands versioned provider adapter
+    /// metadata and exact source-revision checks. The operator omits adapter
+    /// metadata unless this is exactly `v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_adapter_contract_version: Option<String>,
+
     /// Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
     /// serving config. With the default `praxisConfig.siteRouter`
     /// `intelligentRoute` this allowlist is independent of `praxisConfig`, so a
@@ -908,6 +927,12 @@ impl GatewayRef {
     #[must_use]
     pub fn supports_model_discovery_contract(&self) -> bool {
         self.model_discovery_contract_version.as_deref() == Some(MODEL_DISCOVERY_CONTRACT_VERSION)
+    }
+
+    /// Whether the Gateway declares provider-adapter contract `v1` support.
+    #[must_use]
+    pub fn supports_provider_adapter_contract(&self) -> bool {
+        self.provider_adapter_contract_version.as_deref() == Some(PROVIDER_ADAPTER_CONTRACT_VERSION)
     }
 }
 
@@ -2650,6 +2675,7 @@ mod tests {
             namespace: "ns".to_owned(),
             site_name: None,
             model_discovery_contract_version: None,
+            provider_adapter_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,
         };
@@ -3227,7 +3253,11 @@ mod tests {
             values.contains(&"kvCachePressure"),
             "CRD enum must include kvCachePressure: {values:?}"
         );
-        assert_eq!(values.len(), 3, "only the three supported strategies belong in the CRD");
+        assert!(
+            values.contains(&"dynamoRequestPressure"),
+            "CRD enum must include dynamoRequestPressure: {values:?}"
+        );
+        assert_eq!(values.len(), 4, "only supported strategies belong in the CRD");
     }
 
     #[test]

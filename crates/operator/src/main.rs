@@ -5258,6 +5258,7 @@ mod tests {
             phase: crdt::ProviderPhase::Available,
             match_labels: labels,
             revision: 1,
+            adapter_contract: None,
         };
         let local = operator::site_providers::LocalProviders::default();
         local.replace(
@@ -6073,6 +6074,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "east".to_owned(),
+            adapter_contract: None,
         });
         assert!(!delivered(&east_and_west, &state), "east has sent no load yet");
         let row = operator::signals::Observation {

@@ -16,7 +16,6 @@ use crate::{
     resources::tls_backend,
 };
 
-
 /// Response size cap.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 

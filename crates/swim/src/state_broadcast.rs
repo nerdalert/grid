@@ -52,6 +52,10 @@ const PROVIDER_STATE_EXTENSION_MAGIC: [u8; 8] = *b"AGNPSEXT";
 const PROVIDER_STATE_EXTENSION_VERSION_V1: u8 = 1;
 /// Provider-state extension version carrying explicit provider metadata records.
 const PROVIDER_STATE_EXTENSION_VERSION_V2: u8 = 2;
+/// Provider-state extension version carrying revision-bound serving adapter metadata.
+const PROVIDER_STATE_EXTENSION_VERSION_V3: u8 = 3;
+/// Compact provider-adapter metadata indexed into the preceding V2 provider map.
+const PROVIDER_STATE_EXTENSION_VERSION_V4: u8 = 4;
 
 /// Domain-separation prefix mixed into every state-broadcast signature.
 ///
@@ -417,22 +421,87 @@ struct ProviderStateExtensionV1 {
     provider_tools: BTreeMap<String, Vec<String>>,
 }
 
-/// Metadata associated with one explicitly identified provider.
+/// Metadata associated with one explicitly identified provider in V2.
 #[derive(Deserialize, Serialize)]
-struct ProviderMetadata {
+struct ProviderMetadataV2 {
     /// MCP tools served by the provider.
     tools: Vec<String>,
     /// Kubernetes UID binding dynamic model inventories to this instance.
     uid: Option<String>,
 }
 
-/// Provider-state extension carrying explicit provider metadata records.
+/// Provider-state extension carrying explicit provider metadata records in V2.
 #[derive(Default, Deserialize, Serialize)]
 struct ProviderStateExtensionV2 {
     /// Whether an empty provider set is an authoritative withdrawal.
     authoritative_provider_state: bool,
     /// Provider metadata keyed by `network/site/provider` identity.
-    providers: BTreeMap<String, ProviderMetadata>,
+    providers: BTreeMap<String, ProviderMetadataV2>,
+}
+
+/// Metadata associated with one explicitly identified provider in V3.
+#[derive(Deserialize, Serialize)]
+struct ProviderMetadataV3 {
+    /// MCP tools served by the provider.
+    tools: Vec<String>,
+    /// Kubernetes UID binding dynamic model inventories to this instance.
+    uid: Option<String>,
+    /// Versioned serving adapter bound to the same provider UID and model.
+    adapter_contract: Option<grid_signals::provider_observation::ProviderAdapterContract>,
+}
+
+/// Unified provider-state metadata assembled from the legacy base frame and optional V3 tail.
+#[derive(Default)]
+struct ProviderStateExtensionV3 {
+    /// Whether an empty provider set is an authoritative withdrawal.
+    authoritative_provider_state: bool,
+    /// Provider metadata keyed by `network/site/provider` identity.
+    providers: BTreeMap<String, ProviderMetadataV3>,
+}
+
+/// V3 supplemental frame carrying full adapter contracts for compatibility with existing peers.
+#[derive(Default, Deserialize, Serialize)]
+struct ProviderAdapterExtensionV3 {
+    /// Adapter contracts keyed by `network/site/provider` identity.
+    providers: BTreeMap<String, grid_signals::provider_observation::ProviderAdapterContract>,
+}
+
+/// Compact V4 adapter contract, referring to the sorted V2 provider map by index.
+#[derive(Deserialize, Serialize)]
+struct ProviderAdapterMetadataV4 {
+    /// Index in the preceding V2 provider map.
+    provider_index: u32,
+    /// Adapter family name.
+    adapter_kind: String,
+    /// Adapter contract version.
+    adapter_version: u16,
+    /// Provider UID when the preceding V2 metadata does not already carry it.
+    provider_uid: Option<String>,
+    /// Kubernetes generation of the provider resource.
+    provider_generation: u64,
+    /// Primary model represented by the adapter.
+    primary_model: String,
+    /// Scope asserted by the adapter.
+    model_scope: String,
+    /// Shared request-accounting profile for comparable providers.
+    concurrency_profile: Option<String>,
+    /// Independently declared effective concurrent-request capacity.
+    concurrency_capacity: Option<u32>,
+}
+
+/// Compact V4 supplemental frame carrying adapter metadata without repeated provider keys.
+#[derive(Default, Deserialize, Serialize)]
+struct ProviderAdapterExtensionV4 {
+    /// Adapter records indexed into the preceding V2 provider map.
+    providers: Vec<ProviderAdapterMetadataV4>,
+}
+
+/// Decoded supplemental provider-adapter payload.
+enum DecodedProviderAdapterExtension {
+    /// Full V3 contract records emitted by earlier adapter-aware builds.
+    V3(ProviderAdapterExtensionV3),
+    /// Compact V4 contract records indexed into the base provider map.
+    V4(ProviderAdapterExtensionV4),
 }
 
 /// Extension format used by peers that predate provider capacity weights.
@@ -725,30 +794,7 @@ impl StateBroadcast {
             .filter(|provider| provider.capacity_weight != 1)
             .map(|provider| (provider_capacity_key(provider), provider.capacity_weight))
             .collect::<BTreeMap<_, _>>();
-        let provider_uids: BTreeMap<ProviderIdentity, &str> = self
-            .provider_uids
-            .iter()
-            .map(|provider_uid| (provider_uid.identity.clone(), provider_uid.uid.as_str()))
-            .collect();
-        let mut providers = BTreeMap::new();
-        for provider in self.snapshot.providers.values() {
-            let identity = provider_identity(provider);
-            let uid = provider_uids.get(&identity).map(|uid| (*uid).to_owned());
-            if !provider.tools.is_empty() || uid.is_some() {
-                providers.insert(
-                    provider_capacity_key(provider),
-                    ProviderMetadata {
-                        tools: provider.tools.clone(),
-                        uid,
-                    },
-                );
-            }
-        }
-
-        let provider_state_extension = ProviderStateExtensionV2 {
-            authoritative_provider_state: self.authoritative_provider_state,
-            providers,
-        };
+        let provider_state_extension = self.provider_state_extension();
         let carries_provider_state_extension =
             provider_state_extension.authoritative_provider_state || !provider_state_extension.providers.is_empty();
         let carries_extension = self.gateway_address.is_some()
@@ -773,45 +819,148 @@ impl StateBroadcast {
                 bincode::serde::encode_into_std_write(&self.signals_address, &mut bytes, bincode::config::standard())?;
             }
             if carries_provider_state_extension {
-                let requires_v2 = self.provider_state_extension_version == Some(PROVIDER_STATE_EXTENSION_VERSION_V2)
-                    || provider_state_extension
-                        .providers
-                        .values()
-                        .any(|provider| provider.uid.is_some());
-                let (version, payload) = if requires_v2 {
-                    (
-                        PROVIDER_STATE_EXTENSION_VERSION_V2,
-                        bincode::serde::encode_to_vec(&provider_state_extension, bincode::config::standard())?,
-                    )
-                } else {
-                    let legacy = ProviderStateExtensionV1 {
-                        authoritative_provider_state: provider_state_extension.authoritative_provider_state,
-                        provider_tools: self
-                            .snapshot
-                            .providers
-                            .values()
-                            .filter(|provider| !provider.tools.is_empty())
-                            .map(|provider| (provider_capacity_key(provider), provider.tools.clone()))
-                            .collect(),
-                    };
-                    (
-                        PROVIDER_STATE_EXTENSION_VERSION_V1,
-                        bincode::serde::encode_to_vec(&legacy, bincode::config::standard())?,
-                    )
-                };
-                let payload_length = u32::try_from(payload.len()).map_err(|_error| {
-                    bincode::error::EncodeError::Other("provider-state extension exceeds the frame length limit")
-                })?;
-                let header = ProviderStateExtensionHeader {
-                    magic: PROVIDER_STATE_EXTENSION_MAGIC,
-                    payload_length,
-                    version,
-                };
-                bincode::serde::encode_into_std_write(header, &mut bytes, bincode::config::standard())?;
-                bytes.extend_from_slice(&payload);
+                self.append_provider_state_extension_frames(&mut bytes, &provider_state_extension)?;
             }
         }
         Ok(bytes)
+    }
+
+    /// Collect provider metadata for the bounded compatibility extension.
+    fn provider_state_extension(&self) -> ProviderStateExtensionV3 {
+        let provider_uids: BTreeMap<ProviderIdentity, &str> = self
+            .provider_uids
+            .iter()
+            .map(|provider_uid| (provider_uid.identity.clone(), provider_uid.uid.as_str()))
+            .collect();
+        let providers = self
+            .snapshot
+            .providers
+            .values()
+            .filter_map(|provider| {
+                let identity = provider_identity(provider);
+                let uid = provider_uids.get(&identity).map(|uid| (*uid).to_owned());
+                let adapter_contract = provider
+                    .adapter_contract
+                    .as_ref()
+                    .filter(|contract| adapter_contract_matches_provider(provider, uid.as_deref(), contract))
+                    .cloned();
+                (!provider.tools.is_empty() || uid.is_some() || adapter_contract.is_some()).then(|| {
+                    (
+                        provider_capacity_key(provider),
+                        ProviderMetadataV3 {
+                            tools: provider.tools.clone(),
+                            uid,
+                            adapter_contract,
+                        },
+                    )
+                })
+            })
+            .collect();
+        ProviderStateExtensionV3 {
+            authoritative_provider_state: self.authoritative_provider_state,
+            providers,
+        }
+    }
+
+    /// Append the V1/V2 provider metadata followed by any V3 adapter contracts.
+    fn append_provider_state_extension_frames(
+        &self,
+        bytes: &mut Vec<u8>,
+        extension: &ProviderStateExtensionV3,
+    ) -> Result<(), bincode::error::EncodeError> {
+        let requires_v2 = self.provider_state_extension_version == Some(PROVIDER_STATE_EXTENSION_VERSION_V2)
+            || extension
+                .providers
+                .values()
+                .any(|provider| provider.uid.is_some() || provider.adapter_contract.is_some());
+        let (version, encoded_base) = if requires_v2 {
+            let v2 = ProviderStateExtensionV2 {
+                authoritative_provider_state: extension.authoritative_provider_state,
+                providers: extension
+                    .providers
+                    .iter()
+                    .map(|(key, provider)| {
+                        (
+                            key.clone(),
+                            ProviderMetadataV2 {
+                                tools: provider.tools.clone(),
+                                uid: provider.uid.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            (
+                PROVIDER_STATE_EXTENSION_VERSION_V2,
+                bincode::serde::encode_to_vec(&v2, bincode::config::standard())?,
+            )
+        } else {
+            let legacy = ProviderStateExtensionV1 {
+                authoritative_provider_state: extension.authoritative_provider_state,
+                provider_tools: self
+                    .snapshot
+                    .providers
+                    .values()
+                    .filter(|provider| !provider.tools.is_empty())
+                    .map(|provider| (provider_capacity_key(provider), provider.tools.clone()))
+                    .collect(),
+            };
+            (
+                PROVIDER_STATE_EXTENSION_VERSION_V1,
+                bincode::serde::encode_to_vec(&legacy, bincode::config::standard())?,
+            )
+        };
+        Self::append_provider_state_frame(bytes, version, &encoded_base)?;
+
+        let mut adapter_records = Vec::new();
+        for (index, metadata) in extension.providers.values().enumerate() {
+            let Some(contract) = metadata.adapter_contract.as_ref() else {
+                continue;
+            };
+            let provider_index = u32::try_from(index).map_err(|_error| {
+                bincode::error::EncodeError::Other("provider adapter index exceeds the V4 frame limit")
+            })?;
+            let provider_uid = (metadata.uid.as_deref() != Some(contract.provider_uid.as_str()))
+                .then(|| contract.provider_uid.clone());
+            adapter_records.push(ProviderAdapterMetadataV4 {
+                provider_index,
+                adapter_kind: contract.adapter_kind.clone(),
+                adapter_version: contract.adapter_version,
+                provider_uid,
+                provider_generation: contract.provider_generation,
+                primary_model: contract.primary_model.clone(),
+                model_scope: contract.model_scope.clone(),
+                concurrency_profile: contract.concurrency_profile.clone(),
+                concurrency_capacity: contract.concurrency_capacity,
+            });
+        }
+        if !adapter_records.is_empty() {
+            let v4 = ProviderAdapterExtensionV4 {
+                providers: adapter_records,
+            };
+            let encoded_adapters = bincode::serde::encode_to_vec(&v4, bincode::config::standard())?;
+            Self::append_provider_state_frame(bytes, PROVIDER_STATE_EXTENSION_VERSION_V4, &encoded_adapters)?;
+        }
+        Ok(())
+    }
+
+    /// Append one length-delimited provider-state frame.
+    fn append_provider_state_frame(
+        bytes: &mut Vec<u8>,
+        version: u8,
+        payload: &[u8],
+    ) -> Result<(), bincode::error::EncodeError> {
+        let payload_length = u32::try_from(payload.len()).map_err(|_error| {
+            bincode::error::EncodeError::Other("provider-state extension exceeds the frame length limit")
+        })?;
+        let header = ProviderStateExtensionHeader {
+            magic: PROVIDER_STATE_EXTENSION_MAGIC,
+            payload_length,
+            version,
+        };
+        bincode::serde::encode_into_std_write(header, bytes, bincode::config::standard())?;
+        bytes.extend_from_slice(payload);
+        Ok(())
     }
 
     /// Decode this broadcast from bincode bytes.
@@ -854,6 +1003,11 @@ impl StateBroadcast {
             }
             if let Some(metadata) = provider_state_extension.providers.get(&key) {
                 provider.tools.clone_from(&metadata.tools);
+                provider.adapter_contract = metadata
+                    .adapter_contract
+                    .as_ref()
+                    .filter(|contract| adapter_contract_matches_provider(provider, metadata.uid.as_deref(), contract))
+                    .cloned();
             }
         }
 
@@ -887,7 +1041,7 @@ impl StateBroadcast {
     /// single-shot struct decode is not enough during a rolling update.
     fn decode_extension(
         remaining: &[u8],
-    ) -> (BroadcastExtension, Option<String>, ProviderStateExtensionV2, Option<u8>) {
+    ) -> (BroadcastExtension, Option<String>, ProviderStateExtensionV3, Option<u8>) {
         /// Decode `remaining` as one historical extension shape and the bytes it used.
         fn shape<T: serde::de::DeserializeOwned>(remaining: &[u8]) -> Option<(T, usize)> {
             bincode::serde::decode_from_slice::<T, _>(remaining, bincode::config::standard()).ok()
@@ -896,7 +1050,7 @@ impl StateBroadcast {
             return (
                 BroadcastExtension::default(),
                 None,
-                ProviderStateExtensionV2::default(),
+                ProviderStateExtensionV3::default(),
                 None,
             );
         }
@@ -907,7 +1061,7 @@ impl StateBroadcast {
                 .then_some((None, 0))
                 .or_else(|| shape::<Option<String>>(after_extension))
             else {
-                return (ext, None, ProviderStateExtensionV2::default(), None);
+                return (ext, None, ProviderStateExtensionV3::default(), None);
             };
             let framed = after_extension.get(signals_used..).unwrap_or(&[]);
             let (provider_state, provider_state_version) = decode_provider_state_extension(framed);
@@ -942,20 +1096,20 @@ impl StateBroadcast {
                 ..BroadcastExtension::default()
             }
         };
-        (ext, None, ProviderStateExtensionV2::default(), None)
+        (ext, None, ProviderStateExtensionV3::default(), None)
     }
 }
 
 /// Decode a framed provider-state extension, ignoring unknown or malformed
 /// frames so legacy metadata remains usable.
-fn decode_provider_state_extension(remaining: &[u8]) -> (ProviderStateExtensionV2, Option<u8>) {
+fn decode_provider_state_extension(remaining: &[u8]) -> (ProviderStateExtensionV3, Option<u8>) {
     if remaining.is_empty() {
-        return (ProviderStateExtensionV2::default(), None);
+        return (ProviderStateExtensionV3::default(), None);
     }
     let Ok((header, header_length)) =
         bincode::serde::decode_from_slice::<ProviderStateExtensionHeader, _>(remaining, bincode::config::standard())
     else {
-        return (ProviderStateExtensionV2::default(), None);
+        return (ProviderStateExtensionV3::default(), None);
     };
     if header.magic != PROVIDER_STATE_EXTENSION_MAGIC
         || !matches!(
@@ -963,48 +1117,200 @@ fn decode_provider_state_extension(remaining: &[u8]) -> (ProviderStateExtensionV
             PROVIDER_STATE_EXTENSION_VERSION_V1 | PROVIDER_STATE_EXTENSION_VERSION_V2
         )
     {
-        return (ProviderStateExtensionV2::default(), None);
+        return (ProviderStateExtensionV3::default(), None);
     }
     let Ok(payload_length) = usize::try_from(header.payload_length) else {
-        return (ProviderStateExtensionV2::default(), None);
+        return (ProviderStateExtensionV3::default(), None);
     };
     let Some(payload_end) = header_length.checked_add(payload_length) else {
-        return (ProviderStateExtensionV2::default(), None);
+        return (ProviderStateExtensionV3::default(), None);
     };
     let Some(payload) = remaining.get(header_length..payload_end) else {
-        return (ProviderStateExtensionV2::default(), None);
+        return (ProviderStateExtensionV3::default(), None);
     };
-    if header.version == PROVIDER_STATE_EXTENSION_VERSION_V1 {
-        let Ok((extension, consumed)) =
-            bincode::serde::decode_from_slice::<ProviderStateExtensionV1, _>(payload, bincode::config::standard())
-        else {
-            return (ProviderStateExtensionV2::default(), None);
-        };
-        if consumed == payload.len() {
-            return (
-                ProviderStateExtensionV2 {
-                    authoritative_provider_state: extension.authoritative_provider_state,
-                    providers: extension
-                        .provider_tools
-                        .into_iter()
-                        .map(|(key, tools)| (key, ProviderMetadata { tools, uid: None }))
-                        .collect(),
-                },
-                Some(PROVIDER_STATE_EXTENSION_VERSION_V1),
-            );
+    let Some(trailing) = remaining.get(payload_end..) else {
+        return (ProviderStateExtensionV3::default(), None);
+    };
+    let Some((mut extension, base_version)) = decode_provider_state_payload(header.version, payload) else {
+        return (ProviderStateExtensionV3::default(), None);
+    };
+
+    match decode_provider_adapter_extension(trailing) {
+        Some(DecodedProviderAdapterExtension::V3(adapter_extension)) => {
+            for (key, adapter_contract) in adapter_extension.providers {
+                extension
+                    .providers
+                    .entry(key)
+                    .or_insert_with(|| ProviderMetadataV3 {
+                        tools: Vec::new(),
+                        uid: None,
+                        adapter_contract: None,
+                    })
+                    .adapter_contract = Some(adapter_contract);
+            }
+            (extension, Some(PROVIDER_STATE_EXTENSION_VERSION_V3))
+        },
+        Some(DecodedProviderAdapterExtension::V4(adapter_extension)) => {
+            apply_compact_provider_adapter_extension(&mut extension, adapter_extension);
+            (extension, Some(PROVIDER_STATE_EXTENSION_VERSION_V4))
+        },
+        None => (extension, Some(base_version)),
+    }
+}
+
+/// Decode one existing V1 or V2 provider-state payload into the current metadata shape.
+fn decode_provider_state_payload(version: u8, payload: &[u8]) -> Option<(ProviderStateExtensionV3, u8)> {
+    if version == PROVIDER_STATE_EXTENSION_VERSION_V1 {
+        let (extension, consumed): (ProviderStateExtensionV1, usize) =
+            bincode::serde::decode_from_slice(payload, bincode::config::standard()).ok()?;
+        if consumed != payload.len() {
+            return None;
         }
-        return (ProviderStateExtensionV2::default(), None);
+        return Some((
+            ProviderStateExtensionV3 {
+                authoritative_provider_state: extension.authoritative_provider_state,
+                providers: extension
+                    .provider_tools
+                    .into_iter()
+                    .map(|(key, tools)| {
+                        (
+                            key,
+                            ProviderMetadataV3 {
+                                tools,
+                                uid: None,
+                                adapter_contract: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            PROVIDER_STATE_EXTENSION_VERSION_V1,
+        ));
     }
-    let Ok((extension, consumed)) =
-        bincode::serde::decode_from_slice::<ProviderStateExtensionV2, _>(payload, bincode::config::standard())
-    else {
-        return (ProviderStateExtensionV2::default(), None);
-    };
-    if consumed == payload.len() {
-        (extension, Some(PROVIDER_STATE_EXTENSION_VERSION_V2))
-    } else {
-        (ProviderStateExtensionV2::default(), None)
+    let (extension, consumed): (ProviderStateExtensionV2, usize) =
+        bincode::serde::decode_from_slice(payload, bincode::config::standard()).ok()?;
+    if consumed != payload.len() {
+        return None;
     }
+    Some((
+        ProviderStateExtensionV3 {
+            authoritative_provider_state: extension.authoritative_provider_state,
+            providers: extension
+                .providers
+                .into_iter()
+                .map(|(key, provider)| {
+                    (
+                        key,
+                        ProviderMetadataV3 {
+                            tools: provider.tools,
+                            uid: provider.uid,
+                            adapter_contract: None,
+                        },
+                    )
+                })
+                .collect(),
+        },
+        PROVIDER_STATE_EXTENSION_VERSION_V2,
+    ))
+}
+
+/// Decode one V3 or V4 adapter frame after an existing V1/V2 provider frame.
+fn decode_provider_adapter_extension(remaining: &[u8]) -> Option<DecodedProviderAdapterExtension> {
+    let (header, header_length): (ProviderStateExtensionHeader, usize) =
+        bincode::serde::decode_from_slice(remaining, bincode::config::standard()).ok()?;
+    if header.magic != PROVIDER_STATE_EXTENSION_MAGIC
+        || !matches!(
+            header.version,
+            PROVIDER_STATE_EXTENSION_VERSION_V3 | PROVIDER_STATE_EXTENSION_VERSION_V4
+        )
+    {
+        return None;
+    }
+    let payload_length = usize::try_from(header.payload_length).ok()?;
+    let payload_end = header_length.checked_add(payload_length)?;
+    let payload = remaining.get(header_length..payload_end)?;
+    if payload_end != remaining.len() {
+        return None;
+    }
+    match header.version {
+        PROVIDER_STATE_EXTENSION_VERSION_V3 => {
+            let (extension, consumed) = bincode::serde::decode_from_slice::<ProviderAdapterExtensionV3, _>(
+                payload,
+                bincode::config::standard(),
+            )
+            .ok()?;
+            (consumed == payload.len()).then_some(DecodedProviderAdapterExtension::V3(extension))
+        },
+        PROVIDER_STATE_EXTENSION_VERSION_V4 => {
+            let (extension, consumed) = bincode::serde::decode_from_slice::<ProviderAdapterExtensionV4, _>(
+                payload,
+                bincode::config::standard(),
+            )
+            .ok()?;
+            (consumed == payload.len()).then_some(DecodedProviderAdapterExtension::V4(extension))
+        },
+        _ => None,
+    }
+}
+
+/// Reconstruct full adapter contracts from their compact indices and shared V2 metadata.
+fn apply_compact_provider_adapter_extension(
+    extension: &mut ProviderStateExtensionV3,
+    adapter_extension: ProviderAdapterExtensionV4,
+) {
+    let keys: Vec<String> = extension.providers.keys().cloned().collect();
+    let mut seen = BTreeSet::new();
+    for record in adapter_extension.providers {
+        if !seen.insert(record.provider_index) {
+            continue;
+        }
+        let Ok(index) = usize::try_from(record.provider_index) else {
+            continue;
+        };
+        let Some(key) = keys.get(index) else {
+            continue;
+        };
+        let Some(identity) = parse_provider_identity(key) else {
+            continue;
+        };
+        let Some(metadata) = extension.providers.get_mut(key) else {
+            continue;
+        };
+        let provider_uid = match (metadata.uid.as_deref(), record.provider_uid.as_deref()) {
+            (Some(base), Some(compact)) if base == compact => base.to_owned(),
+            (Some(base), None) => base.to_owned(),
+            (None, Some(compact)) => compact.to_owned(),
+            _ => continue,
+        };
+        let contract = grid_signals::provider_observation::ProviderAdapterContract {
+            provider_id: identity.provider,
+            adapter_kind: record.adapter_kind,
+            adapter_version: record.adapter_version,
+            provider_uid,
+            provider_generation: record.provider_generation,
+            primary_model: record.primary_model,
+            model_scope: record.model_scope,
+            concurrency_profile: record.concurrency_profile,
+            concurrency_capacity: record.concurrency_capacity,
+        };
+        if contract.is_valid() {
+            metadata.adapter_contract = Some(contract);
+        }
+    }
+}
+
+/// Whether a signed adapter identity belongs to this exact provider and static model. A legacy
+/// UID record, when present, must agree with the UID inside the signed adapter contract.
+fn adapter_contract_matches_provider(
+    provider: &crdt::ProviderState,
+    uid: Option<&str>,
+    contract: &grid_signals::provider_observation::ProviderAdapterContract,
+) -> bool {
+    contract.is_valid()
+        && uid.is_none_or(|uid| uid == contract.provider_uid.as_str())
+        && provider.provider_id == contract.provider_id
+        && provider.models.len() == 1
+        && provider.models.first() == Some(&contract.primary_model)
 }
 
 /// Apply a remote capacity extension only when it satisfies the shared
@@ -2441,6 +2747,7 @@ mod tests {
                 queue_depth: Some(queue_depth),
                 ..ProviderMetricsSnapshot::default()
             },
+            adapter_contract: None,
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision,
             writer_id: site.to_owned(),
@@ -3090,6 +3397,240 @@ mod tests {
 
         assert_eq!(decoded.provider_uids, broadcast.provider_uids);
         assert_eq!(decoded.grid_id, broadcast.grid_id);
+        Ok(())
+    }
+
+    #[test]
+    fn signed_v4_provider_adapter_contract_round_trips_and_binds_its_identity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let broadcast = provider_adapter_broadcast();
+        let signed = sign_state_broadcast(broadcast, &private_key);
+        let decoded = StateBroadcast::decode(&signed.encode()?)?;
+        let signature = decoded.signature.as_deref().ok_or("signature must survive decoding")?;
+        let provider = decoded
+            .snapshot
+            .provider("net", "site-p", "provider")
+            .ok_or("provider metadata must survive decoding")?;
+
+        assert_eq!(
+            decoded.provider_state_extension_version,
+            Some(PROVIDER_STATE_EXTENSION_VERSION_V4)
+        );
+        assert_eq!(
+            provider.adapter_contract,
+            signed
+                .snapshot
+                .provider("net", "site-p", "provider")
+                .ok_or("signed provider")?
+                .adapter_contract
+        );
+        assert_eq!(decoded.provider_uids, signed.provider_uids);
+        crate::signing::verify_ecdsa_p256(&public_key, &decoded.signable_bytes()?, signature)?;
+
+        let mut changed = decoded.clone();
+        changed
+            .snapshot
+            .providers
+            .values_mut()
+            .next()
+            .ok_or("provider metadata must be mutable")?
+            .adapter_contract
+            .as_mut()
+            .ok_or("adapter contract must survive decoding")?
+            .provider_generation += 1;
+        assert!(
+            crate::signing::verify_ecdsa_p256(&public_key, &changed.signable_bytes()?, signature).is_err(),
+            "the provider adapter identity is covered by the site signature"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn signed_v4_provider_adapter_contract_round_trips_without_a_legacy_uid_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let mut broadcast = provider_adapter_broadcast();
+        broadcast.provider_uids.clear();
+        let signed = sign_state_broadcast(broadcast, &private_key);
+        let decoded = StateBroadcast::decode(&signed.encode()?)?;
+        let signature = decoded.signature.as_deref().ok_or("signature must survive decoding")?;
+        let provider = decoded
+            .snapshot
+            .provider("net", "site-p", "provider")
+            .ok_or("provider metadata must survive decoding")?;
+
+        assert_eq!(
+            decoded.provider_state_extension_version,
+            Some(PROVIDER_STATE_EXTENSION_VERSION_V4)
+        );
+        assert!(
+            decoded.provider_uids.is_empty(),
+            "the adapter contract carries its own signed UID"
+        );
+        assert_eq!(
+            provider.adapter_contract,
+            signed
+                .snapshot
+                .provider("net", "site-p", "provider")
+                .ok_or("signed provider")?
+                .adapter_contract
+        );
+        crate::signing::verify_ecdsa_p256(&public_key, &decoded.signable_bytes()?, signature)?;
+        Ok(())
+    }
+
+    #[test]
+    fn v4_adapter_frame_keeps_the_existing_v2_uid_frame_as_its_prefix() -> Result<(), Box<dyn std::error::Error>> {
+        let broadcast = provider_adapter_broadcast();
+        let bytes = broadcast.encode()?;
+        let (_, base_used): (StateBroadcastV1, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+        let after_base = bytes.get(base_used..).ok_or("base payload bounds")?;
+        let (_, extension_used): (BroadcastExtension, usize) =
+            bincode::serde::decode_from_slice(after_base, bincode::config::standard())?;
+        let after_extension = after_base.get(extension_used..).ok_or("broadcast extension bounds")?;
+        let (_, signals_used): (Option<String>, usize) =
+            bincode::serde::decode_from_slice(after_extension, bincode::config::standard())?;
+        let framed = after_extension.get(signals_used..).ok_or("signals address bounds")?;
+        let (header, header_length): (ProviderStateExtensionHeader, usize) =
+            bincode::serde::decode_from_slice(framed, bincode::config::standard())?;
+        assert_eq!(header.version, PROVIDER_STATE_EXTENSION_VERSION_V2);
+        let payload_length = usize::try_from(header.payload_length)?;
+        let base_frame_end = header_length
+            .checked_add(payload_length)
+            .ok_or("frame length overflow")?;
+        let (legacy, legacy_version) =
+            decode_provider_state_extension(framed.get(..base_frame_end).ok_or("V2 frame bounds")?);
+        assert_eq!(legacy_version, Some(PROVIDER_STATE_EXTENSION_VERSION_V2));
+        assert_eq!(
+            legacy
+                .providers
+                .get("net/site-p/provider")
+                .and_then(|provider| provider.uid.as_deref()),
+            Some("uid-p"),
+            "an older V2 peer still reads the UID-bound provider metadata"
+        );
+        let (current, current_version) = decode_provider_state_extension(framed);
+        assert_eq!(current_version, Some(PROVIDER_STATE_EXTENSION_VERSION_V4));
+        assert!(
+            current
+                .providers
+                .get("net/site-p/provider")
+                .and_then(|provider| provider.adapter_contract.as_ref())
+                .is_some(),
+            "a V4 peer reads the compact adapter identity appended after the V2 frame"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v4_adapter_contract_is_omitted_when_its_provider_uid_binding_disagrees() {
+        let mut broadcast = provider_adapter_broadcast();
+        if let Some(provider_uid) = broadcast.provider_uids.first_mut() {
+            provider_uid.uid = "different-uid".to_owned();
+        }
+        let decoded = StateBroadcast::decode(&broadcast.encode().unwrap_or_else(|_| std::process::abort()))
+            .unwrap_or_else(|_| std::process::abort());
+        let provider = decoded
+            .snapshot
+            .provider("net", "site-p", "provider")
+            .unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(
+            decoded.provider_state_extension_version,
+            Some(PROVIDER_STATE_EXTENSION_VERSION_V2),
+            "unbound adapter identity must not be emitted"
+        );
+        assert!(provider.adapter_contract.is_none());
+    }
+
+    #[test]
+    fn legacy_v3_adapter_frame_still_decodes_and_verifies_its_signature() -> Result<(), Box<dyn std::error::Error>> {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let signed = sign_state_broadcast(provider_adapter_broadcast(), &private_key);
+        let expected = signed
+            .snapshot
+            .provider("net", "site-p", "provider")
+            .and_then(|provider| provider.adapter_contract.clone())
+            .ok_or("signed adapter contract")?;
+        let mut base = signed;
+        if let Some(provider) = base.snapshot.providers.values_mut().next() {
+            provider.adapter_contract = None;
+        }
+        let mut bytes = base.encode()?;
+        let v3 = ProviderAdapterExtensionV3 {
+            providers: BTreeMap::from([("net/site-p/provider".to_owned(), expected.clone())]),
+        };
+        let encoded_v3 = bincode::serde::encode_to_vec(&v3, bincode::config::standard())?;
+        StateBroadcast::append_provider_state_frame(&mut bytes, PROVIDER_STATE_EXTENSION_VERSION_V3, &encoded_v3)?;
+
+        let decoded = StateBroadcast::decode(&bytes)?;
+        let signature = decoded.signature.as_deref().ok_or("signature must survive decoding")?;
+        let provider = decoded
+            .snapshot
+            .provider("net", "site-p", "provider")
+            .ok_or("provider state")?;
+        assert_eq!(
+            decoded.provider_state_extension_version,
+            Some(PROVIDER_STATE_EXTENSION_VERSION_V3)
+        );
+        assert_eq!(provider.adapter_contract.as_ref(), Some(&expected));
+        crate::signing::verify_ecdsa_p256(&public_key, &decoded.signable_bytes()?, signature)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compact_v4_adapter_frame_avoids_repeating_the_provider_key_and_uid() -> Result<(), Box<dyn std::error::Error>> {
+        let contract = grid_signals::provider_observation::ProviderAdapterContract {
+            provider_id: "dynamo-site-provider".to_owned(),
+            adapter_kind: "dynamo/frontend".to_owned(),
+            adapter_version: 1,
+            provider_uid: "0d71ac11-7955-4212-8e6b-0e9741bac19d".to_owned(),
+            provider_generation: 1,
+            primary_model: "Qwen/Qwen3-0.6B".to_owned(),
+            model_scope: "dedicatedSingleModel".to_owned(),
+            concurrency_profile: Some("dynamo-mocker-bounded-4-v1".to_owned()),
+            concurrency_capacity: Some(4),
+        };
+        let key = "grid-dynamo-peer-test/site/dynamo-site-provider".to_owned();
+        let legacy = ProviderAdapterExtensionV3 {
+            providers: BTreeMap::from([(key, contract.clone())]),
+        };
+        let compact = ProviderAdapterExtensionV4 {
+            providers: vec![ProviderAdapterMetadataV4 {
+                provider_index: 0,
+                adapter_kind: contract.adapter_kind.clone(),
+                adapter_version: contract.adapter_version,
+                provider_uid: None,
+                provider_generation: contract.provider_generation,
+                primary_model: contract.primary_model.clone(),
+                model_scope: contract.model_scope.clone(),
+                concurrency_profile: contract.concurrency_profile.clone(),
+                concurrency_capacity: contract.concurrency_capacity,
+            }],
+        };
+        let legacy_payload = bincode::serde::encode_to_vec(&legacy, bincode::config::standard())?;
+        let compact_payload = bincode::serde::encode_to_vec(&compact, bincode::config::standard())?;
+        let mut legacy_frame = Vec::new();
+        StateBroadcast::append_provider_state_frame(
+            &mut legacy_frame,
+            PROVIDER_STATE_EXTENSION_VERSION_V3,
+            &legacy_payload,
+        )?;
+        let mut compact_frame = Vec::new();
+        StateBroadcast::append_provider_state_frame(
+            &mut compact_frame,
+            PROVIDER_STATE_EXTENSION_VERSION_V4,
+            &compact_payload,
+        )?;
+
+        assert!(
+            compact_frame.len() + 64 < legacy_frame.len(),
+            "the compact frame should save at least 64 bytes: V3={} V4={}",
+            legacy_frame.len(),
+            compact_frame.len()
+        );
         Ok(())
     }
 
@@ -6028,6 +6569,35 @@ mod tests {
             .with_authoritative_provider_state()
     }
 
+    /// One static model provider with a UID- and generation-bound adapter contract.
+    fn provider_adapter_broadcast() -> StateBroadcast {
+        let mut snapshot = snapshot("site-p", 1, 0.2);
+        let provider = snapshot
+            .providers
+            .values_mut()
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+        provider.adapter_contract = Some(grid_signals::provider_observation::ProviderAdapterContract {
+            provider_id: "provider".to_owned(),
+            adapter_kind: "dynamo/frontend".to_owned(),
+            adapter_version: 1,
+            provider_uid: "uid-p".to_owned(),
+            provider_generation: 1,
+            primary_model: "model-x".to_owned(),
+            model_scope: "dedicatedSingleModel".to_owned(),
+            concurrency_profile: Some("dynamo-mocker-bounded-4-v1".to_owned()),
+            concurrency_capacity: Some(4),
+        });
+        let identity = provider_identity(provider);
+        StateBroadcast::new("site-p".to_owned(), 1, snapshot, None)
+            .with_grid_id(Some("grid-p".to_owned()))
+            .with_provider_uids(vec![ProviderUid {
+                identity,
+                uid: "uid-p".to_owned(),
+            }])
+            .with_authoritative_provider_state()
+    }
+
     fn pre_tools_signable_bytes(broadcast: &StateBroadcast) -> Vec<u8> {
         let v1 = StateBroadcastV1 {
             version: broadcast.version,
@@ -6120,6 +6690,7 @@ mod tests {
             capacity_weight: 1,
             phase: ProviderPhase::Available,
             metrics: ProviderMetricsSnapshot::default(),
+            adapter_contract: None,
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision,
             writer_id: "site-a".to_owned(),

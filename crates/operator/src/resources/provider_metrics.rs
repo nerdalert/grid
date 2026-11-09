@@ -5,12 +5,13 @@
 //! names, and returns a map keyed by provider routing identity for use with
 //! `render_routing_overlay`.
 //!
-//! Scrape failures are non-fatal: when a valid cached sample exists within the
-//! `staleMetricsSeconds` grace period, it is reused.  When no cache entry is
-//! available (or the grace period has expired), the provider is inserted with
-//! `UNOBSERVABLE_METRICS` (`healthy: false`), which causes the scoring engine
-//! to exclude it from active routing.  Providers without `metricsConfig` are
-//! unaffected; they receive neutral default scoring as before.
+//! Legacy scrape failures are non-fatal: when a valid cached sample exists within
+//! the `staleMetricsSeconds` grace period, it is reused. When no cache entry is
+//! available (or the grace period has expired), the provider is marked unobservable
+//! for legacy scoring. Versioned adapters retain explicit unknown/stale states; only
+//! a fresh, valid model-readiness `0` excludes by adapter readiness. Unknown adapter
+//! telemetry cannot become a zero-load sample and falls back to provider health and
+//! the configured non-comparative routing order.
 //!
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 
@@ -23,7 +24,7 @@ use futures::StreamExt as _;
 use tokio::sync::Mutex;
 
 use crate::{
-    crd::inference_provider::{EndpointTlsConfig, InferenceProvider, MetricSignalNames},
+    crd::inference_provider::{EndpointTlsConfig, InferenceProvider, MetricSignalNames, MetricsAdapterKind},
     metrics_parser::{MetricNames, PartialMetrics, parse_prometheus_text},
     metrics_scraper::{self, scrape_metrics},
     resources::routing_overlay::routing_identity,
@@ -77,6 +78,8 @@ pub(crate) struct TimestampedMetrics {
     pub(crate) scraped_at: Instant,
     /// Monotonic scrape generation assigned when this sample was collected.
     pub(crate) generation: u64,
+    /// Canonical adapter observation, when this provider uses a versioned adapter.
+    pub(crate) observation: Option<grid_signals::provider_observation::ProviderModelObservation>,
 }
 
 /// Cross-reconcile cache for recently-scraped provider metrics.
@@ -108,6 +111,8 @@ pub(crate) struct CollectedMetrics {
     pub(crate) metrics: HashMap<String, scoring::BackendMetrics>,
     /// Scrape generation per provider, monotonically increasing per successful scrape.
     pub(crate) generations: HashMap<String, u64>,
+    /// Canonical per-provider/model observations produced by versioned adapters.
+    pub(crate) observations: HashMap<String, grid_signals::provider_observation::ProviderModelObservation>,
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +134,7 @@ pub(crate) async fn collect_provider_signals(
     providers: &[InferenceProvider],
     client: Option<&kube::Client>,
     readiness: &crate::readiness::ReadinessStore,
+    local_site: Option<&str>,
 ) {
     futures::stream::iter(
         providers
@@ -145,7 +151,7 @@ pub(crate) async fn collect_provider_signals(
             return;
         };
         match scrape_provider_signals(provider, &plan, client).await {
-            Ok(text) => record_scrape(readiness, &key, provider, &plan, &text),
+            Ok(text) => record_scrape_for_site(readiness, &key, provider, &plan, &text, local_site),
             Err(class) => {
                 crate::metrics::record_provider_scrape(crate::readiness::provider_of(&key), class.as_str());
                 readiness.record_failure(&key, class, Instant::now());
@@ -156,12 +162,30 @@ pub(crate) async fn collect_provider_signals(
 }
 
 /// Record one successful scrape: its ready-endpoint count and its declared signals.
+#[cfg(test)]
 fn record_scrape(
     readiness: &crate::readiness::ReadinessStore,
     key: &str,
     provider: &InferenceProvider,
     plan: &SignalScrapePlan<'_>,
     text: &str,
+) {
+    record_scrape_for_site(readiness, key, provider, plan, text, None);
+}
+
+/// Record one successful scrape, projecting an opted-in versioned adapter into
+/// bounded canonical series before the existing peer publication fence.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "scrape projection needs the revision store, identity, provider plan, raw response, and local site"
+)]
+fn record_scrape_for_site(
+    readiness: &crate::readiness::ReadinessStore,
+    key: &str,
+    provider: &InferenceProvider,
+    plan: &SignalScrapePlan<'_>,
+    text: &str,
+    local_site: Option<&str>,
 ) {
     // Every sample feeds this site's own windows; only gauges are republished.
     let (parsed, republishable): (Vec<_>, Vec<_>) = crate::signals::parse_scrape(text).into_iter().unzip();
@@ -179,7 +203,7 @@ fn record_scrape(
     let missing = count_scrape(crate::readiness::provider_of(key), plan, pool, ready);
     let in_flight = in_flight_observation(&parsed, ready, pool, plan.identity);
     let latency = readiness.record_latency(key, &parsed, Instant::now());
-    let observations = parsed
+    let mut observations: Vec<_> = parsed
         .into_iter()
         .zip(republishable)
         .filter_map(|(o, republishable)| republishable.then_some(o))
@@ -195,7 +219,130 @@ fn record_scrape(
         .chain(in_flight)
         .chain(latency)
         .collect();
+    if provider
+        .spec
+        .metrics_config
+        .as_ref()
+        .is_some_and(|config| config.adapter.is_some())
+    {
+        match parse_adapter_observation(provider, local_site, text) {
+            Ok(observation) => observations.extend(canonical_adapter_signals(&observation)),
+            Err(error) => {
+                tracing::warn!(provider = plan.identity, %error, "versioned adapter observation is unknown for this scrape");
+            },
+        }
+    }
     readiness.record_success(key, ready, missing, observations, Instant::now());
+}
+
+/// Project one typed observation into the fixed, bounded Grid peer vocabulary.
+/// Absence of the readiness series is its explicit `Unknown` wire state.
+fn canonical_adapter_signals(
+    observation: &grid_signals::provider_observation::ProviderModelObservation,
+) -> Vec<crate::signals::Observation> {
+    use grid_signals::provider_observation::{ModelReadiness, ObservationFreshness};
+
+    if observation.freshness != ObservationFreshness::Fresh {
+        return Vec::new();
+    }
+    let mut projected = Vec::new();
+    // The validated serving candidate binds this provider series to its sole
+    // configured primary model. Keeping the model name out of Prometheus labels
+    // avoids losing it when the bounded shared LoadStore folds a provider batch.
+    let mut labels = std::collections::BTreeMap::from([
+        (
+            grid_signals::provider_observation::ADAPTER_KIND_LABEL.to_owned(),
+            "dynamo/frontend".to_owned(),
+        ),
+        (
+            grid_signals::provider_observation::ADAPTER_VERSION_LABEL.to_owned(),
+            observation.source.adapter.version.to_string(),
+        ),
+        (
+            grid_signals::provider_observation::PROVIDER_UID_LABEL.to_owned(),
+            observation.source.provider_uid.clone(),
+        ),
+        (
+            grid_signals::provider_observation::PROVIDER_GENERATION_LABEL.to_owned(),
+            observation.source.provider_generation.to_string(),
+        ),
+        (
+            grid_signals::provider_observation::MODEL_LABEL.to_owned(),
+            observation.model.clone(),
+        ),
+        (
+            grid_signals::provider_observation::MODEL_SCOPE_LABEL.to_owned(),
+            "dedicatedSingleModel".to_owned(),
+        ),
+    ]);
+    if let Some(value) = match observation.readiness {
+        ModelReadiness::Ready => Some(1.0),
+        ModelReadiness::NotReady => Some(0.0),
+        ModelReadiness::Unknown => None,
+    } {
+        projected.push(canonical_observation(
+            grid_signals::provider_observation::DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+            labels.clone(),
+            value,
+        ));
+    }
+    if let Some(active) = observation.active_requests
+        && let Some(value) = count_as_signal(active.value)
+    {
+        projected.push(canonical_observation(
+            grid_signals::provider_observation::DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+            labels.clone(),
+            value,
+        ));
+    }
+    if let Some(stages) = &observation.stage_requests {
+        for stage in stages {
+            labels.insert("stage".to_owned(), stage.stage.clone());
+            labels.insert("phase".to_owned(), stage.phase.clone());
+            if let Some(value) = count_as_signal(stage.count.value) {
+                projected.push(canonical_observation(
+                    grid_signals::provider_observation::DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC,
+                    labels.clone(),
+                    value,
+                ));
+            }
+            labels.remove("stage");
+            labels.remove("phase");
+        }
+    }
+    projected
+}
+
+/// Counts cross the Prometheus float wire as integers. Values above 2^53 cannot
+/// be represented exactly, so refuse them instead of silently rounding pressure.
+fn count_as_signal(value: u64) -> Option<f64> {
+    const MAX_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
+    if value > MAX_EXACT_INTEGER {
+        return None;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bounded to the exact integer range of binary64"
+    )]
+    {
+        Some(value as f64)
+    }
+}
+
+/// Build one un-attributed canonical sample. The publisher adds Grid ownership
+/// labels and the complete batch's revision in the existing signal path.
+fn canonical_observation(
+    metric: &str,
+    labels: std::collections::BTreeMap<String, String>,
+    value: f64,
+) -> crate::signals::Observation {
+    crate::signals::Observation {
+        metric: metric.to_owned(),
+        labels,
+        value,
+        timestamp_ms: None,
+        age: Duration::ZERO,
+    }
 }
 
 /// Whether the scrape carried a per-unit queue series for the pool: the EPP's collector for
@@ -389,6 +536,156 @@ fn parse_or_neutral(text: &str, names: &MetricNames, provider: &str) -> PartialM
     })
 }
 
+/// Result of parsing a successful provider scrape.
+enum ParsedProviderMetrics {
+    /// Legacy configurable signal mapping.
+    Legacy(PartialMetrics),
+    /// Versioned, model-scoped adapter observation.
+    Adapter(grid_signals::provider_observation::ProviderModelObservation),
+}
+
+/// Parse the explicitly configured Dynamo Frontend v1 adapter.
+fn parse_adapter_observation(
+    provider: &InferenceProvider,
+    local_site: Option<&str>,
+    text: &str,
+) -> Result<grid_signals::provider_observation::ProviderModelObservation, String> {
+    let adapter = provider
+        .spec
+        .metrics_config
+        .as_ref()
+        .and_then(|metrics| metrics.adapter.as_ref())
+        .ok_or_else(|| "adapter configuration is absent".to_owned())?;
+    let site = local_site
+        .filter(|site| !site.trim().is_empty())
+        .ok_or_else(|| "local Grid site identity is unavailable".to_owned())?;
+    let provider_uid = provider
+        .metadata
+        .uid
+        .clone()
+        .filter(|uid| !uid.trim().is_empty())
+        .ok_or_else(|| "InferenceProvider UID is unavailable".to_owned())?;
+    let provider_generation = provider
+        .metadata
+        .generation
+        .ok_or_else(|| "InferenceProvider generation is unavailable".to_owned())?;
+    let observed_at_ms = i64::try_from(
+        time::OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .map_err(|_error| "current timestamp is outside the supported millisecond range".to_owned())?;
+    match adapter.kind {
+        MetricsAdapterKind::DynamoFrontendV1 => {
+            let concurrency = adapter.concurrency.as_ref();
+            let config = grid_signals::dynamo_frontend::DynamoFrontendConfig {
+                primary_model: &adapter.primary_model,
+                model_aliases: &adapter.model_aliases,
+                concurrency_profile: concurrency.map(|value| value.profile.as_str()),
+                concurrency_capacity: concurrency.map(|value| value.capacity),
+            };
+            grid_signals::dynamo_frontend::parse_dynamo_frontend_v1(
+                text,
+                &config,
+                grid_signals::dynamo_frontend::ProviderRevision {
+                    site: site.to_owned(),
+                    provider_uid,
+                    provider_generation,
+                },
+                observed_at_ms,
+            )
+        },
+    }
+}
+
+/// Record an adapter observation when the scrape failed or violated its metric contract.
+fn unavailable_adapter_observation(
+    provider: &InferenceProvider,
+    local_site: Option<&str>,
+    freshness: grid_signals::provider_observation::ObservationFreshness,
+) -> Option<grid_signals::provider_observation::ProviderModelObservation> {
+    let mut observation = parse_adapter_observation(provider, local_site, "").ok()?;
+    observation.freshness = freshness;
+    Some(observation)
+}
+
+/// Whether a current, contract-valid observation explicitly says its model cannot route.
+///
+/// Missing, stale, or invalid telemetry carries no load score and falls back to provider
+/// health and the configured non-comparative routing order. It must not be converted into an
+/// idle sample or a readiness failure. This also lets signal-poll mode use its Gateway path
+/// while the local operator intentionally skips overlay scrapes.
+pub(crate) fn freshly_reports_model_not_ready(
+    observation: &grid_signals::provider_observation::ProviderModelObservation,
+) -> bool {
+    observation.freshness == grid_signals::provider_observation::ObservationFreshness::Fresh
+        && observation.readiness == grid_signals::provider_observation::ModelReadiness::NotReady
+}
+
+/// Whether a cached adapter observation still belongs to this provider revision and site.
+fn observation_matches_provider(
+    observation: &grid_signals::provider_observation::ProviderModelObservation,
+    provider: &InferenceProvider,
+    local_site: Option<&str>,
+) -> bool {
+    let Some(adapter) = provider
+        .spec
+        .metrics_config
+        .as_ref()
+        .and_then(|metrics| metrics.adapter.as_ref())
+    else {
+        return false;
+    };
+    let source = &observation.source;
+    local_site.is_some_and(|site| source.site == site)
+        && provider
+            .metadata
+            .uid
+            .as_deref()
+            .is_some_and(|uid| source.provider_uid == uid)
+        && provider
+            .metadata
+            .generation
+            .is_some_and(|generation| source.provider_generation == generation)
+        && observation.model == adapter.primary_model
+        && source.adapter.kind == grid_signals::provider_observation::AdapterKind::DynamoFrontend
+        && source.adapter.version == 1
+}
+
+/// Copy a recent cached adapter observation as explicitly Stale without making it routable.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cache age, provider revision, site, and output map are independent freshness inputs"
+)]
+fn try_cached_adapter_observation(
+    identity: &str,
+    stale_metrics_seconds: Option<u32>,
+    cache_snapshot: &HashMap<String, TimestampedMetrics>,
+    now: Instant,
+    provider: &InferenceProvider,
+    local_site: Option<&str>,
+    observations: &mut HashMap<String, grid_signals::provider_observation::ProviderModelObservation>,
+) -> bool {
+    let Some(ttl_seconds) = stale_metrics_seconds.filter(|seconds| *seconds > 0) else {
+        return false;
+    };
+    let Some(cached) = cache_snapshot.get(identity) else {
+        return false;
+    };
+    if now.saturating_duration_since(cached.scraped_at) > Duration::from_secs(u64::from(ttl_seconds)) {
+        return false;
+    }
+    let Some(mut observation) = cached.observation.clone() else {
+        return false;
+    };
+    if !observation_matches_provider(&observation, provider, local_site) {
+        return false;
+    }
+    observation.freshness = grid_signals::provider_observation::ObservationFreshness::Stale;
+    observations.insert(identity.to_owned(), observation);
+    true
+}
+
 /// Parse a timeout string (`"2s"`, `"500ms"`) to a [`Duration`].
 ///
 /// Supports `s` and `ms` suffixes only; minutes and bare numbers are not
@@ -460,6 +757,32 @@ pub(crate) async fn collect_provider_metrics(
     collect_provider_metrics_with_refresh_interval(network_name, providers, cache, now, Duration::ZERO, client).await
 }
 
+/// Collect provider metrics and attribute adapter observations to this local site.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "refresh, site attribution, client trust, provider set, and cache are independent collection inputs"
+)]
+pub(crate) async fn collect_provider_metrics_with_refresh_interval_for_site(
+    network_name: &str,
+    providers: &[InferenceProvider],
+    cache: &Mutex<MetricsCache>,
+    now: Instant,
+    refresh_interval: Duration,
+    local_site: Option<&str>,
+    client: Option<&kube::Client>,
+) -> CollectedMetrics {
+    collect_provider_metrics_inner(
+        network_name,
+        providers,
+        cache,
+        now,
+        refresh_interval,
+        local_site,
+        client,
+    )
+    .await
+}
+
 /// Collect provider metrics, reusing samples collected within `refresh_interval`.
 ///
 /// Reconciliation can be triggered by an overlay write or another watch event
@@ -467,18 +790,36 @@ pub(crate) async fn collect_provider_metrics(
 /// window is important: it preserves the sample generation and prevents one
 /// underlying EPP observation from advancing admission hysteresis twice.
 #[expect(
-    clippy::cognitive_complexity,
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::large_stack_frames,
     reason = "sequential per-provider scrape loop with cache reuse, TLS resolution, and error handling"
 )]
+#[cfg(test)]
 pub(crate) async fn collect_provider_metrics_with_refresh_interval(
     network_name: &str,
     providers: &[InferenceProvider],
     cache: &Mutex<MetricsCache>,
     now: Instant,
     refresh_interval: Duration,
+    client: Option<&kube::Client>,
+) -> CollectedMetrics {
+    collect_provider_metrics_inner(network_name, providers, cache, now, refresh_interval, None, client).await
+}
+
+/// Shared scrape loop; `local_site` is required to construct a revision-bound adapter sample.
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::large_stack_frames,
+    reason = "sequential per-provider scrape loop with cache reuse, TLS resolution, and error handling"
+)]
+async fn collect_provider_metrics_inner(
+    network_name: &str,
+    providers: &[InferenceProvider],
+    cache: &Mutex<MetricsCache>,
+    now: Instant,
+    refresh_interval: Duration,
+    local_site: Option<&str>,
     client: Option<&kube::Client>,
 ) -> CollectedMetrics {
     // Snapshot the relevant cache entries and allocate a generation for this
@@ -500,6 +841,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
 
     let mut result = HashMap::new();
     let mut generations: HashMap<String, u64> = HashMap::new();
+    let mut observations = HashMap::new();
     let mut cache_updates: Vec<((String, String), TimestampedMetrics)> = Vec::new();
 
     for provider in providers {
@@ -543,15 +885,51 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
         if refresh_interval > Duration::ZERO
             && let Some(cached) = cache_snapshot.get(identity)
             && now.saturating_duration_since(cached.scraped_at) < refresh_interval
+            && mc.adapter.is_none() == cached.observation.is_none()
+            && cached
+                .observation
+                .as_ref()
+                .is_none_or(|observation| observation_matches_provider(observation, provider, local_site))
         {
             result.insert(identity.to_owned(), cached.metrics);
             generations.insert(identity.to_owned(), cached.generation);
+            if let Some(observation) = cached.observation.as_ref() {
+                observations.insert(identity.to_owned(), observation.clone());
+            }
             continue;
         }
 
         let tls_config = match resolve_tls_config(tls_settings, client, identity).await {
             Ok(cfg) => cfg,
             Err((_reason, e)) => {
+                if mc.adapter.is_some() {
+                    let reused = try_cached_adapter_observation(
+                        identity,
+                        mc.stale_metrics_seconds,
+                        &cache_snapshot,
+                        now,
+                        provider,
+                        local_site,
+                        &mut observations,
+                    );
+                    if !reused
+                        && let Some(observation) = unavailable_adapter_observation(
+                            provider,
+                            local_site,
+                            grid_signals::provider_observation::ObservationFreshness::Missing,
+                        )
+                    {
+                        observations.insert(identity.to_owned(), observation);
+                    }
+                    result.insert(identity.to_owned(), UNOBSERVABLE_METRICS);
+                    generations.insert(identity.to_owned(), scrape_generation);
+                    tracing::warn!(
+                        provider = identity,
+                        error = %e,
+                        "adapter metrics TLS resolution failed; provider excluded from routing"
+                    );
+                    continue;
+                }
                 let used_cache = try_cached_metrics(
                     identity,
                     mc.stale_metrics_seconds,
@@ -589,11 +967,14 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
 
         let scrape_result = scrape_metrics(&url, timeout, tls_config, mc.auth.as_ref().zip(client)).await;
         let parse_result = match &scrape_result {
-            Ok(text) => Ok(parse_or_neutral(text, &names, identity)),
+            Ok(text) => match mc.adapter.as_ref() {
+                Some(_) => parse_adapter_observation(provider, local_site, text).map(ParsedProviderMetrics::Adapter),
+                None => Ok(ParsedProviderMetrics::Legacy(parse_or_neutral(text, &names, identity))),
+            },
             Err(e) => Err(e.to_string()),
         };
         match parse_result {
-            Ok(parsed) => {
+            Ok(ParsedProviderMetrics::Legacy(parsed)) => {
                 let bm = parsed.into_backend_metrics();
                 cache_updates.push((
                     (network_name.to_owned(), identity.to_owned()),
@@ -601,12 +982,71 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
                         metrics: bm,
                         scraped_at: now,
                         generation: scrape_generation,
+                        observation: None,
                     },
                 ));
                 result.insert(identity.to_owned(), bm);
                 generations.insert(identity.to_owned(), scrape_generation);
             },
+            Ok(ParsedProviderMetrics::Adapter(observation)) => {
+                let bm = if observation.freshness == grid_signals::provider_observation::ObservationFreshness::Fresh
+                    && observation.readiness == grid_signals::provider_observation::ModelReadiness::Ready
+                {
+                    scoring::BackendMetrics::healthy_default()
+                } else {
+                    UNOBSERVABLE_METRICS
+                };
+                cache_updates.push((
+                    (network_name.to_owned(), identity.to_owned()),
+                    TimestampedMetrics {
+                        metrics: bm,
+                        scraped_at: now,
+                        generation: scrape_generation,
+                        observation: Some(observation.clone()),
+                    },
+                ));
+                result.insert(identity.to_owned(), bm);
+                generations.insert(identity.to_owned(), scrape_generation);
+                observations.insert(identity.to_owned(), observation);
+            },
             Err(e) => {
+                if mc.adapter.is_some() {
+                    if scrape_result.is_err() {
+                        let reused = try_cached_adapter_observation(
+                            identity,
+                            mc.stale_metrics_seconds,
+                            &cache_snapshot,
+                            now,
+                            provider,
+                            local_site,
+                            &mut observations,
+                        );
+                        if !reused
+                            && let Some(observation) = unavailable_adapter_observation(
+                                provider,
+                                local_site,
+                                grid_signals::provider_observation::ObservationFreshness::Missing,
+                            )
+                        {
+                            observations.insert(identity.to_owned(), observation);
+                        }
+                    } else if let Some(observation) = unavailable_adapter_observation(
+                        provider,
+                        local_site,
+                        grid_signals::provider_observation::ObservationFreshness::Invalid,
+                    ) {
+                        observations.insert(identity.to_owned(), observation);
+                    }
+                    result.insert(identity.to_owned(), UNOBSERVABLE_METRICS);
+                    generations.insert(identity.to_owned(), scrape_generation);
+                    tracing::warn!(
+                        provider = identity,
+                        url = %url,
+                        error = %e,
+                        "Dynamo Frontend adapter sample unavailable; dynamic pressure is disabled and provider readiness is handled separately"
+                    );
+                    continue;
+                }
                 let reason_str = scrape_result
                     .as_ref()
                     .err()
@@ -663,6 +1103,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
     CollectedMetrics {
         metrics: result,
         generations,
+        observations,
     }
 }
 
@@ -1066,6 +1507,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                 ..Default::default()
             },
             stale_metrics_seconds: None,
+            adapter: None,
             endpoint: None,
             pool_name: None,
             queue_capacity: None,
@@ -1083,11 +1525,159 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                 ..Default::default()
             },
             stale_metrics_seconds: Some(ttl),
+            adapter: None,
             endpoint: None,
             pool_name: None,
             queue_capacity: None,
             tls: None,
             auth: None,
+        }
+    }
+
+    fn dynamo_adapter_config(ttl: Option<u32>) -> MetricsConfig {
+        MetricsConfig {
+            path: "/metrics".to_owned(),
+            stale_metrics_seconds: ttl,
+            adapter: Some(crate::crd::inference_provider::MetricsAdapterConfig {
+                kind: MetricsAdapterKind::DynamoFrontendV1,
+                scope: crate::crd::inference_provider::MetricsAdapterScope::DedicatedSingleModel,
+                primary_model: "model-a".to_owned(),
+                model_aliases: Vec::new(),
+                concurrency: None,
+            }),
+            ..MetricsConfig::default()
+        }
+    }
+
+    #[test]
+    fn dynamo_adapter_projects_only_versioned_canonical_signals() {
+        use grid_signals::provider_observation::{
+            DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+            DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC,
+        };
+
+        let provider = provider_fixture("dynamo", "http://frontend:8000", Some(dynamo_adapter_config(None)));
+        let plan = signal_scrape_plan(&provider).unwrap_or_else(|| std::process::abort());
+        let readiness = crate::readiness::ReadinessStore::default();
+        readiness.bind_revision("net/dynamo", Some("uid-dynamo"), Some(1));
+        record_scrape_for_site(
+            &readiness,
+            "net/dynamo",
+            &provider,
+            &plan,
+            "dynamo_frontend_model_ready{model=\"model-a\"} 1\n\
+             dynamo_frontend_active_requests{model=\"model-a\"} 3\n\
+             dynamo_frontend_stage_requests{phase=\"aggregated\",stage=\"dispatch\"} 2\n",
+            Some("site-a"),
+        );
+        let observations = readiness.take_fresh("net/dynamo").unwrap_or_default();
+        let has_identity = |labels: &std::collections::BTreeMap<String, String>| {
+            labels
+                .get(grid_signals::provider_observation::ADAPTER_KIND_LABEL)
+                .is_some_and(|value| value == "dynamo/frontend")
+                && labels
+                    .get(grid_signals::provider_observation::ADAPTER_VERSION_LABEL)
+                    .is_some_and(|value| value == "1")
+                && labels
+                    .get(grid_signals::provider_observation::PROVIDER_UID_LABEL)
+                    .is_some_and(|value| value == "uid-dynamo")
+                && labels
+                    .get(grid_signals::provider_observation::PROVIDER_GENERATION_LABEL)
+                    .is_some_and(|value| value == "1")
+                && labels
+                    .get(grid_signals::provider_observation::MODEL_LABEL)
+                    .is_some_and(|value| value == "model-a")
+                && labels
+                    .get(grid_signals::provider_observation::MODEL_SCOPE_LABEL)
+                    .is_some_and(|value| value == "dedicatedSingleModel")
+        };
+
+        assert!(
+            observations
+                .iter()
+                .any(|sample| sample.metric == DYNAMO_FRONTEND_V1_MODEL_READY_METRIC
+                    && sample.value.to_bits() == 1.0_f64.to_bits()
+                    && has_identity(&sample.labels))
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|sample| sample.metric == DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC
+                    && sample.value.to_bits() == 3.0_f64.to_bits()
+                    && has_identity(&sample.labels))
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|sample| sample.metric == DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC
+                    && sample.value.to_bits() == 2.0_f64.to_bits()
+                    && has_identity(&sample.labels)
+                    && sample.labels.get("stage").is_some_and(|value| value == "dispatch")
+                    && sample.labels.get("phase").is_some_and(|value| value == "aggregated"))
+        );
+
+        let absent_readiness = parse_adapter_observation(
+            &provider,
+            Some("site-a"),
+            "dynamo_frontend_active_requests{model=\"model-a\"} 0\n",
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let projected = canonical_adapter_signals(&absent_readiness);
+        assert!(
+            projected
+                .iter()
+                .all(|sample| sample.metric != DYNAMO_FRONTEND_V1_MODEL_READY_METRIC)
+        );
+        assert!(
+            projected
+                .iter()
+                .any(|sample| sample.metric == DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC),
+            "missing readiness remains unknown even when active request count is zero"
+        );
+    }
+
+    #[test]
+    fn canonical_adapter_counts_above_exact_prometheus_integer_range_are_omitted() {
+        assert_eq!(count_as_signal(9_007_199_254_740_991), Some(9_007_199_254_740_991.0));
+        assert_eq!(count_as_signal(9_007_199_254_740_992), None);
+    }
+
+    #[test]
+    fn only_fresh_explicit_model_not_ready_excludes_by_adapter_readiness() {
+        let mut observation = grid_signals::dynamo_frontend::parse_dynamo_frontend_v1(
+            "dynamo_frontend_model_ready{model=\"model-a\"} 0\n",
+            &grid_signals::dynamo_frontend::DynamoFrontendConfig {
+                primary_model: "model-a",
+                model_aliases: &[],
+                concurrency_profile: None,
+                concurrency_capacity: None,
+            },
+            grid_signals::dynamo_frontend::ProviderRevision {
+                site: "site-a".to_owned(),
+                provider_uid: "uid-a".to_owned(),
+                provider_generation: 1,
+            },
+            1_799_996_400_000,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(freshly_reports_model_not_ready(&observation));
+
+        observation.readiness = grid_signals::provider_observation::ModelReadiness::Unknown;
+        assert!(
+            !freshly_reports_model_not_ready(&observation),
+            "an absent readiness series remains unknown"
+        );
+        observation.readiness = grid_signals::provider_observation::ModelReadiness::NotReady;
+        for freshness in [
+            grid_signals::provider_observation::ObservationFreshness::Stale,
+            grid_signals::provider_observation::ObservationFreshness::Missing,
+            grid_signals::provider_observation::ObservationFreshness::Invalid,
+        ] {
+            observation.freshness = freshness;
+            assert!(
+                !freshly_reports_model_not_ready(&observation),
+                "{freshness:?} readiness is not authoritative"
+            );
         }
     }
 
@@ -1322,7 +1912,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
         provider.spec.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("shared-ca"));
 
         let readiness = crate::readiness::ReadinessStore::default();
-        collect_provider_signals("net", &[provider], Some(&client), &readiness).await;
+        collect_provider_signals("net", &[provider], Some(&client), &readiness, Some("site-a")).await;
         let observations = readiness.take_fresh("net/prov-a").unwrap_or_default();
 
         assert!(
@@ -1347,7 +1937,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
         provider.spec.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("missing-shared-ca"));
 
         let readiness = crate::readiness::ReadinessStore::default();
-        collect_provider_signals("net", &[provider], Some(&client), &readiness).await;
+        collect_provider_signals("net", &[provider], Some(&client), &readiness, Some("site-a")).await;
         let observations = readiness.take_fresh("net/prov-a").unwrap_or_default();
 
         assert!(
@@ -1365,7 +1955,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
         provider.spec.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("missing-shared-ca"));
 
         let readiness = crate::readiness::ReadinessStore::default();
-        collect_provider_signals("net", &[provider], Some(&client), &readiness).await;
+        collect_provider_signals("net", &[provider], Some(&client), &readiness, Some("site-a")).await;
 
         assert!(
             readiness.take_fresh("net/prov-a").is_none(),
@@ -1388,7 +1978,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
         let readiness = crate::readiness::ReadinessStore::default();
         let started = tokio::time::Instant::now();
 
-        collect_provider_signals("net", &[slow, fast], None, &readiness).await;
+        collect_provider_signals("net", &[slow, fast], None, &readiness, Some("site-a")).await;
 
         let elapsed = started.elapsed();
         assert!(
@@ -1417,7 +2007,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
 
         let collected = tokio::time::timeout(
             Duration::from_secs(15),
-            collect_provider_signals("net", &providers, None, &readiness),
+            collect_provider_signals("net", &providers, None, &readiness, Some("site-a")),
         )
         .await;
         assert!(collected.is_ok(), "the bounded scrape pass should finish");
@@ -1722,6 +2312,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                     },
                     scraped_at: t0,
                     generation: 0,
+                    observation: None,
                 },
             );
         }
@@ -1764,6 +2355,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                     },
                     scraped_at: t0,
                     generation: 0,
+                    observation: None,
                 },
             );
         }
@@ -1794,6 +2386,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                     },
                     scraped_at: Instant::now(),
                     generation: 0,
+                    observation: None,
                 },
             );
         }
@@ -1830,6 +2423,476 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     }
 
     #[tokio::test]
+    async fn dynamo_adapter_scrape_keeps_frontend_counts_model_scoped_and_unit_typed() {
+        let body = concat!(
+            "dynamo_frontend_active_requests{model=\"model-a\"} 3\n",
+            "dynamo_frontend_model_ready{model=\"model-a\"} 1\n",
+            "dynamo_frontend_stage_requests{phase=\"aggregated\",stage=\"dispatch\"} 2\n",
+        );
+        let endpoint = start_test_server(ok_response(body)).await;
+        let provider = provider_fixture("dynamo-a", &endpoint, Some(dynamo_adapter_config(None)));
+        let collected = collect_provider_metrics_with_refresh_interval_for_site(
+            "net",
+            std::slice::from_ref(&provider),
+            &empty_cache(),
+            Instant::now(),
+            Duration::ZERO,
+            Some("site-a"),
+            None,
+        )
+        .await;
+        let observation = collected
+            .observations
+            .get("dynamo-a")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            observation.source.site, "site-a",
+            "the local site is part of source identity"
+        );
+        assert_eq!(
+            observation.source.provider_uid, "uid-dynamo-a",
+            "provider UID is revision-bound"
+        );
+        assert_eq!(
+            observation.source.provider_generation, 1,
+            "provider generation is revision-bound"
+        );
+        assert_eq!(observation.model, "model-a", "the primary model is canonical");
+        assert_eq!(
+            observation.readiness,
+            grid_signals::provider_observation::ModelReadiness::Ready,
+            "Dynamo model readiness remains an explicit boolean state"
+        );
+        assert_eq!(
+            observation.active_requests.map(|count| (count.value, count.unit)),
+            Some((3, grid_signals::provider_observation::CountUnit::Requests)),
+            "Frontend active requests are not converted to queue depth"
+        );
+        assert_eq!(
+            observation.stage_requests.as_ref().map(Vec::len),
+            Some(1),
+            "stage gauge remains a separate signal"
+        );
+        assert_eq!(
+            collected.metrics.get("dynamo-a").map(|metrics| metrics.queue_depth),
+            Some(0.5),
+            "the legacy queueDepth field retains its neutral default"
+        );
+    }
+
+    #[tokio::test]
+    async fn deterministic_dynamo_scrapes_flow_through_canonical_observations_into_overlay_scores() {
+        // This is a Grid contract test over controlled HTTP exposition. The
+        // separate Kind smoke is the evidence for a real Dynamo runtime.
+        let serve = |active| {
+            let body = format!(
+                "dynamo_frontend_active_requests{{model=\"model-a\"}} {active}\n\
+                 dynamo_frontend_model_ready{{model=\"model-a\"}} 1\n"
+            );
+            start_test_server(ok_response(&body))
+        };
+        let (busier_endpoint, idler_endpoint) = tokio::join!(serve(6), serve(2));
+        let configured = |endpoint: &str, name: &str| {
+            let mut metrics = dynamo_adapter_config(None);
+            if let Some(adapter) = metrics.adapter.as_mut() {
+                adapter.concurrency = Some(crate::crd::inference_provider::MetricsConcurrencyConfig {
+                    profile: "mock-concurrency-v1".to_owned(),
+                    capacity: 10,
+                });
+            }
+            provider_fixture(name, endpoint, Some(metrics))
+        };
+        let providers = [
+            configured(&busier_endpoint, "pool-busier"),
+            configured(&idler_endpoint, "pool-idle"),
+        ];
+        let collected = collect_provider_metrics_with_refresh_interval_for_site(
+            "net",
+            &providers,
+            &empty_cache(),
+            Instant::now(),
+            Duration::ZERO,
+            Some("site-a"),
+            None,
+        )
+        .await;
+        let network: crate::crd::grid_network::GridNetwork = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "net" },
+            "spec": {
+                "seeds": [],
+                "routingPolicy": "scoreFirst",
+                "scoringPolicy": { "strategy": "dynamoRequestPressure" }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let overlay = crate::resources::routing_overlay::render_routing_overlay_with_adapter_observations(
+            &network,
+            &[],
+            &providers,
+            &[],
+            &[],
+            &[],
+            "grid-a",
+            "site-a",
+            None,
+            None,
+            None,
+            &crate::crd::grid_network::ScoringStrategy::DynamoRequestPressure.weights(),
+            None,
+            &crate::served_models::ServedModelStore::new(),
+            crate::resources::routing_overlay::CandidateExpirySupport::Supported,
+            Some(&collected.observations),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            overlay
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.as_str())
+                .collect::<Vec<_>>(),
+            ["pool-idle", "pool-busier"],
+            "real HTTP scraping, adapter normalization, and overlay scoring must preserve pressure order"
+        );
+        let [idler, busier] = overlay.candidates.as_slice() else {
+            std::process::abort();
+        };
+        assert_eq!(idler.score, Some(0.8));
+        assert_eq!(busier.score, Some(0.4));
+        assert!(
+            overlay
+                .candidates
+                .iter()
+                .all(|candidate| candidate.score_breakdown.is_none())
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the captured two-pool contract is intentionally exercised through scrape, normalization, and ranking"
+    )]
+    async fn captured_two_pool_frontend_samples_preserve_pressure_order_in_the_overlay_contract() {
+        // These exact series were captured from two real pinned Frontend Pods
+        // during the bounded Mocker load run. The test replays the exposition
+        // through Grid's scraper/parser and overlay renderer; its test-only
+        // denominator is not a production serving-capacity qualification.
+        let loaded_endpoint = start_test_server(ok_response(include_str!(
+            "../../tests/fixtures/dynamo-two-pool/pool-a-pressure.prom"
+        )))
+        .await;
+        let idle_endpoint = start_test_server(ok_response(include_str!(
+            "../../tests/fixtures/dynamo-two-pool/pool-b-idle.prom"
+        )))
+        .await;
+        let configured = |endpoint: &str, name: &str| {
+            let mut metrics = dynamo_adapter_config(None);
+            if let Some(adapter) = metrics.adapter.as_mut() {
+                adapter.primary_model = "Qwen/Qwen3-0.6B".to_owned();
+                adapter.concurrency = Some(crate::crd::inference_provider::MetricsConcurrencyConfig {
+                    profile: "captured-mocker-batch-4".to_owned(),
+                    capacity: 4,
+                });
+            }
+            let mut provider = provider_fixture(name, endpoint, Some(metrics));
+            if let Some(model) = provider.spec.models.first_mut() {
+                model.name = "Qwen/Qwen3-0.6B".to_owned();
+            }
+            provider
+        };
+        let providers = [
+            configured(&loaded_endpoint, "pool-a"),
+            configured(&idle_endpoint, "pool-b"),
+        ];
+        let collected = collect_provider_metrics_with_refresh_interval_for_site(
+            "net",
+            &providers,
+            &empty_cache(),
+            Instant::now(),
+            Duration::ZERO,
+            Some("site-a"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            collected
+                .observations
+                .get("pool-a")
+                .and_then(|observation| observation.active_requests)
+                .map(|count| count.value),
+            Some(4),
+            "the live pressure sample reaches the canonical observation"
+        );
+        assert_eq!(
+            collected
+                .observations
+                .get("pool-b")
+                .and_then(|observation| observation.active_requests)
+                .map(|count| count.value),
+            Some(0),
+            "the simultaneously captured idle pool remains measured at zero"
+        );
+        let network: crate::crd::grid_network::GridNetwork = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "net" },
+            "spec": {
+                "seeds": [],
+                "routingPolicy": "scoreFirst",
+                "scoringPolicy": { "strategy": "dynamoRequestPressure" }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let overlay = crate::resources::routing_overlay::render_routing_overlay_with_adapter_observations(
+            &network,
+            &[],
+            &providers,
+            &[],
+            &[],
+            &[],
+            "grid-a",
+            "site-a",
+            None,
+            None,
+            None,
+            &crate::crd::grid_network::ScoringStrategy::DynamoRequestPressure.weights(),
+            None,
+            &crate::served_models::ServedModelStore::new(),
+            crate::resources::routing_overlay::CandidateExpirySupport::Supported,
+            Some(&collected.observations),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.as_str())
+                .collect::<Vec<_>>(),
+            ["pool-b", "pool-a"],
+            "the captured active-versus-idle observations determine local candidate order"
+        );
+        let [idle, loaded] = overlay.candidates.as_slice() else {
+            std::process::abort();
+        };
+        assert_eq!(idle.score, Some(1.0), "zero active requests has zero pressure");
+        assert_eq!(
+            loaded.score,
+            Some(0.0),
+            "four observed requests meet the test denominator"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamo_adapter_preserves_not_ready_and_unknown_as_distinct_states() {
+        let not_ready_endpoint =
+            start_test_server(ok_response("dynamo_frontend_model_ready{model=\"model-a\"} 0\n")).await;
+        let not_ready_provider = provider_fixture(
+            "dynamo-not-ready",
+            &not_ready_endpoint,
+            Some(dynamo_adapter_config(None)),
+        );
+        let not_ready = collect_provider_metrics_with_refresh_interval_for_site(
+            "net",
+            &[not_ready_provider],
+            &empty_cache(),
+            Instant::now(),
+            Duration::ZERO,
+            Some("site-a"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            not_ready
+                .observations
+                .get("dynamo-not-ready")
+                .map(|observation| observation.readiness),
+            Some(grid_signals::provider_observation::ModelReadiness::NotReady),
+            "zero readiness remains explicit"
+        );
+        assert!(
+            not_ready
+                .metrics
+                .get("dynamo-not-ready")
+                .is_some_and(|metrics| !metrics.healthy),
+            "reported not-ready does not receive a healthy neutral metric sample"
+        );
+
+        let missing_endpoint =
+            start_test_server(ok_response("dynamo_frontend_active_requests{model=\"model-a\"} 0\n")).await;
+        let missing_provider = provider_fixture(
+            "dynamo-missing-ready",
+            &missing_endpoint,
+            Some(dynamo_adapter_config(None)),
+        );
+        let missing = collect_provider_metrics_with_refresh_interval_for_site(
+            "net",
+            &[missing_provider],
+            &empty_cache(),
+            Instant::now(),
+            Duration::ZERO,
+            Some("site-a"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            missing
+                .observations
+                .get("dynamo-missing-ready")
+                .map(|observation| observation.readiness),
+            Some(grid_signals::provider_observation::ModelReadiness::Unknown),
+            "missing readiness is never translated to ready-and-idle"
+        );
+        assert!(
+            missing
+                .metrics
+                .get("dynamo-missing-ready")
+                .is_some_and(|metrics| !metrics.healthy),
+            "unknown readiness is not represented as a healthy idle metric sample"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_and_malformed_dynamo_scrapes_have_explicit_unknown_observations() {
+        let failed_provider =
+            provider_fixture("dynamo-failed", "http://127.0.0.1:1", Some(dynamo_adapter_config(None)));
+        let failed = collect_provider_metrics_with_refresh_interval_for_site(
+            "net",
+            &[failed_provider],
+            &empty_cache(),
+            Instant::now(),
+            Duration::ZERO,
+            Some("site-a"),
+            None,
+        )
+        .await;
+        let missing = failed
+            .observations
+            .get("dynamo-failed")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            missing.freshness,
+            grid_signals::provider_observation::ObservationFreshness::Missing,
+            "a failed scrape without a usable cache is explicitly missing"
+        );
+        assert_eq!(
+            missing.readiness,
+            grid_signals::provider_observation::ModelReadiness::Unknown,
+            "a failed scrape cannot claim the model is ready"
+        );
+        assert!(
+            failed
+                .metrics
+                .get("dynamo-failed")
+                .is_some_and(|metrics| !metrics.healthy),
+            "a missing observation fails closed"
+        );
+
+        let malformed_endpoint =
+            start_test_server(ok_response("dynamo_frontend_model_ready{model=\"model-a\"} NaN\n")).await;
+        let malformed_provider = provider_fixture(
+            "dynamo-malformed",
+            &malformed_endpoint,
+            Some(dynamo_adapter_config(None)),
+        );
+        let malformed = collect_provider_metrics_with_refresh_interval_for_site(
+            "net",
+            &[malformed_provider],
+            &empty_cache(),
+            Instant::now(),
+            Duration::ZERO,
+            Some("site-a"),
+            None,
+        )
+        .await;
+        let invalid = malformed
+            .observations
+            .get("dynamo-malformed")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            invalid.freshness,
+            grid_signals::provider_observation::ObservationFreshness::Invalid,
+            "a malformed current sample is distinct from a missing scrape"
+        );
+        assert_eq!(
+            invalid.readiness,
+            grid_signals::provider_observation::ModelReadiness::Unknown,
+            "malformed readiness cannot claim the model is ready"
+        );
+        assert!(
+            malformed
+                .metrics
+                .get("dynamo-malformed")
+                .is_some_and(|metrics| !metrics.healthy),
+            "an invalid observation fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_dynamo_scrape_keeps_stale_observation_marked_and_unroutable() {
+        let config = dynamo_adapter_config(Some(60));
+        let provider = provider_fixture("dynamo-a", "http://127.0.0.1:1", Some(config));
+        let t0 = Instant::now();
+        let mut cached_observation = grid_signals::dynamo_frontend::parse_dynamo_frontend_v1(
+            "dynamo_frontend_model_ready{model=\"model-a\"} 1\n\
+             dynamo_frontend_active_requests{model=\"model-a\"} 0\n",
+            &grid_signals::dynamo_frontend::DynamoFrontendConfig {
+                primary_model: "model-a",
+                model_aliases: &[],
+                concurrency_profile: None,
+                concurrency_capacity: None,
+            },
+            grid_signals::dynamo_frontend::ProviderRevision {
+                site: "site-a".to_owned(),
+                provider_uid: "uid-dynamo-a".to_owned(),
+                provider_generation: 1,
+            },
+            1_000,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        cached_observation.freshness = grid_signals::provider_observation::ObservationFreshness::Fresh;
+        let cache = empty_cache();
+        {
+            let mut guard = cache.lock().await;
+            guard.entries.insert(
+                ("net".to_owned(), "dynamo-a".to_owned()),
+                TimestampedMetrics {
+                    metrics: scoring::BackendMetrics::healthy_default(),
+                    scraped_at: t0,
+                    generation: 1,
+                    observation: Some(cached_observation),
+                },
+            );
+        }
+        let collected = collect_provider_metrics_with_refresh_interval_for_site(
+            "net",
+            &[provider],
+            &cache,
+            t0 + Duration::from_secs(1),
+            Duration::ZERO,
+            Some("site-a"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            collected
+                .observations
+                .get("dynamo-a")
+                .map(|observation| observation.freshness),
+            Some(grid_signals::provider_observation::ObservationFreshness::Stale),
+            "cached adapter values carry explicit stale state"
+        );
+        assert!(
+            collected
+                .metrics
+                .get("dynamo-a")
+                .is_some_and(|metrics| !metrics.healthy),
+            "stale adapter telemetry never makes the provider routable"
+        );
+    }
+
+    #[tokio::test]
     async fn zero_ttl_treated_as_absent_plaintext_omits_entry() {
         let provider = provider_fixture("prov-a", "http://127.0.0.1:1", Some(mc_with_queue_and_ttl("q", 0)));
         let cache = empty_cache();
@@ -1848,6 +2911,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                     },
                     scraped_at: Instant::now(),
                     generation: 0,
+                    observation: None,
                 },
             );
         }

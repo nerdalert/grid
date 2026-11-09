@@ -303,6 +303,49 @@ pub(crate) struct PortForwardGuard {
     child: Option<Child>,
 }
 
+/// Port-forward configuration for an isolated Kind cluster using a task-owned kubeconfig.
+pub(crate) struct KubePortForwardRequest<'request> {
+    /// Kind context name for the target cluster.
+    pub(crate) context: &'request str,
+    /// Kubeconfig created for this qualification run.
+    pub(crate) kubeconfig: &'request std::path::Path,
+    /// Namespace containing the target service.
+    pub(crate) namespace: &'request str,
+    /// Service name to forward.
+    pub(crate) service: &'request str,
+    /// Available loopback port on the host.
+    pub(crate) local_port: u16,
+    /// Service port inside the cluster.
+    pub(crate) service_port: u16,
+    /// Stream for port-forward diagnostics.
+    pub(crate) stderr: Stdio,
+}
+
+/// Arguments shared by the different port-forward constructors.
+struct PortForwardSpec<'spec> {
+    /// Optional task-owned kubeconfig path.
+    kubeconfig: Option<&'spec std::path::Path>,
+    /// Kind context name for the target cluster.
+    context: &'spec str,
+    /// Namespace containing the target service.
+    namespace: &'spec str,
+    /// `kubectl` resource argument.
+    resource: String,
+    /// `kubectl` local-to-remote port mapping.
+    mapping: String,
+    /// Stream for port-forward diagnostics.
+    stderr: Stdio,
+}
+
+/// Kubernetes resource to target with a diagnostic port-forward.
+#[derive(Clone, Copy)]
+pub(crate) struct PortForwardResource<'resource> {
+    /// Kubernetes resource kind such as `svc` or `deployment`.
+    pub(crate) resource_type: &'resource str,
+    /// Name of the Kubernetes resource.
+    pub(crate) resource_name: &'resource str,
+}
+
 impl PortForwardGuard {
     /// Start a `kubectl port-forward` to a named service.
     pub(crate) fn start(
@@ -312,7 +355,14 @@ impl PortForwardGuard {
         svc_port: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (resource, mapping) = port_forward_args("svc", svc_name, local_port, svc_port);
-        Self::start_inner(context, NAMESPACE, &resource, &mapping, Stdio::null())
+        Self::start_inner(PortForwardSpec {
+            kubeconfig: None,
+            context,
+            namespace: NAMESPACE,
+            resource,
+            mapping,
+            stderr: Stdio::null(),
+        })
     }
 
     /// Start a port-forward with child diagnostics inherited by the xtask log.
@@ -323,22 +373,71 @@ impl PortForwardGuard {
         local_port: u16,
         svc_port: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (resource, mapping) = port_forward_args("svc", svc_name, local_port, svc_port);
-        Self::start_inner(context, namespace, &resource, &mapping, Stdio::inherit())
+        Self::start_resource_with_diagnostics(
+            context,
+            namespace,
+            PortForwardResource {
+                resource_type: "svc",
+                resource_name: svc_name,
+            },
+            local_port,
+            svc_port,
+        )
+    }
+
+    /// Start a port-forward to a named Kubernetes resource with child diagnostics inherited by the xtask log.
+    pub(crate) fn start_resource_with_diagnostics(
+        context: &str,
+        namespace: &str,
+        target: PortForwardResource<'_>,
+        local_port: u16,
+        target_port: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (resource, mapping) =
+            port_forward_args(target.resource_type, target.resource_name, local_port, target_port);
+        Self::start_inner(PortForwardSpec {
+            kubeconfig: None,
+            context,
+            namespace,
+            resource,
+            mapping,
+            stderr: Stdio::inherit(),
+        })
+    }
+
+    /// Start a port-forward using a task-owned kubeconfig and a caller-selected diagnostic stream.
+    pub(crate) fn start_with_kubeconfig_diagnostics(
+        request: KubePortForwardRequest<'_>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (resource, mapping) = port_forward_args("svc", request.service, request.local_port, request.service_port);
+        Self::start_inner(PortForwardSpec {
+            kubeconfig: Some(request.kubeconfig),
+            context: request.context,
+            namespace: request.namespace,
+            resource,
+            mapping,
+            stderr: request.stderr,
+        })
     }
 
     /// Spawn a port-forward with the requested stderr handling.
-    fn start_inner(
-        context: &str,
-        namespace: &str,
-        resource: &str,
-        mapping: &str,
-        stderr: Stdio,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let child = Command::new("kubectl")
-            .args(["--context", context, "-n", namespace, "port-forward", resource, mapping])
+    fn start_inner(spec: PortForwardSpec<'_>) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut command = Command::new("kubectl");
+        if let Some(kubeconfig) = spec.kubeconfig {
+            command.arg("--kubeconfig").arg(kubeconfig);
+        }
+        let child = command
+            .args([
+                "--context",
+                spec.context,
+                "-n",
+                spec.namespace,
+                "port-forward",
+                &spec.resource,
+                &spec.mapping,
+            ])
             .stdout(Stdio::null())
-            .stderr(stderr)
+            .stderr(spec.stderr)
             .spawn()?;
         Ok(Self { child: Some(child) })
     }
@@ -579,6 +678,11 @@ mod tests {
             "resource should be svc/ prefix only"
         );
         assert_eq!(mapping, "12345:8000", "mapping should be local:remote");
+
+        let (deployment_resource, deployment_mapping) =
+            port_forward_args("deployment", "grid-serving-gateway", 12346, 9901);
+        assert_eq!(deployment_resource, "deployment/grid-serving-gateway");
+        assert_eq!(deployment_mapping, "12346:9901");
     }
 
     #[test]

@@ -6,6 +6,9 @@
 
 pub(crate) mod llm_d;
 
+/// Version-pinned Dynamo Frontend observations.
+pub(crate) mod dynamo_frontend;
+
 /// One site's inputs to site selection, read once per candidate per refresh.
 ///
 /// A field is absent when the site publishes nothing for it. In-flight and held are counts
@@ -34,6 +37,9 @@ pub struct SiteReading {
     pub backlogged_at: Option<i64>,
     /// Whether the site's last word on readiness was no, with nothing newer since.
     pub unready: bool,
+    /// Active requests divided by an independently declared Dynamo concurrency capacity.
+    /// This has no llm-d queue or saturation meaning.
+    pub request_pressure: Option<f64>,
     /// When the site's newest sample arrived, the epoch of a smoothing step.
     pub sampled_at: Option<i64>,
     /// Serving units the site last reported. Not a capacity: it says nothing about how much
@@ -94,6 +100,17 @@ pub(crate) enum ComparatorSource {
 pub trait SiteSignals {
     /// The site's reading `over` the horizon behind its newest fresh sample.
     fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading;
+
+    /// Read one provider's pinned Dynamo Frontend signals against its declared source revision.
+    fn read_dynamo_frontend(
+        &self,
+        _site: &str,
+        _routing_cluster: &str,
+        _contract: &grid_signals::provider_observation::ProviderAdapterContract,
+        _over: Over,
+    ) -> SiteReading {
+        SiteReading::default()
+    }
 
     /// Publication serial and qualified learning epoch for a snapshot read.
     fn learning_state(&self, site: &str, cluster: &str, now_ms: i64, max_age_ms: i64) -> grid_signals::LearningState;

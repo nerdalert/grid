@@ -1199,6 +1199,7 @@ mod tests {
             admission: crate::descriptor::AdmissionState::default(),
             cluster: format!("pool-{site}"),
             credential: None,
+            adapter_contract: None,
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: "llama".to_owned(),

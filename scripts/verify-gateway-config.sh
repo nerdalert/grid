@@ -35,7 +35,7 @@ check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1: want $2, got $3"; f
 WORK=$(mktemp -d)
 NET=gw-verify-$$
 cleanup() {
-  "$CRT" ps -aq --filter "name=^$NET-" | xargs -r "$CRT" rm -f -t 0 >/dev/null 2>&1 || true
+  "$CRT" ps -aq --filter "name=$NET-" | xargs -r "$CRT" rm -f >/dev/null 2>&1 || true
   "$CRT" network rm "$NET" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }

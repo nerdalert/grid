@@ -632,7 +632,6 @@ async fn invariant_8_a_signer_neither_the_grid_ca_nor_a_pin_trusts_is_signer_unt
     );
 }
 
-
 /// A signer answering through `app`, its serving CA pinned by a bundle in `api`, accepting
 /// client certificates `ca` issued, as the site section naming it.
 async fn pinned_signer(api: &FakeApi, ca: &str, app: axum::Router, lapsed: bool) -> String {

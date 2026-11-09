@@ -175,6 +175,7 @@ fn candidates(model: &str, sites: &[(&str, &str)]) -> Vec<RouteCandidate> {
             admission: crate::descriptor::AdmissionState::default(),
             cluster: (*cluster).to_owned(),
             credential: None,
+            adapter_contract: None,
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: model.to_owned(),

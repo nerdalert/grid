@@ -188,6 +188,13 @@ pub struct ProviderState {
 
     /// Stable writer identity used to break equal-revision ties.
     pub writer_id: String,
+
+    /// Versioned serving adapter metadata, carried by the membership-free provider catalog.
+    ///
+    /// It is omitted from the positional SWIM base payload. Gossip peers without an explicit
+    /// adapter extension therefore retain their existing legacy candidate behavior.
+    #[serde(skip, default)]
+    pub adapter_contract: Option<grid_signals::provider_observation::ProviderAdapterContract>,
 }
 
 /// Smallest valid operator-configured static capacity weight.
@@ -467,6 +474,7 @@ mod tests {
                 queue_depth: Some(queue_depth),
                 ..ProviderMetricsSnapshot::default()
             },
+            adapter_contract: None,
             access_policy: ProviderAccessPolicy::default(), // Empty policy = allow all
             revision,
             writer_id: site.to_owned(),
@@ -814,6 +822,7 @@ mod tests {
             capacity_weight: 1,
             phase: ProviderPhase::Available,
             metrics: ProviderMetricsSnapshot::default(),
+            adapter_contract: None,
             access_policy: ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-a".to_owned(),

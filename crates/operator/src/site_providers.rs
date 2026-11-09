@@ -83,6 +83,9 @@ pub struct WireProvider {
     pub match_labels: BTreeMap<String, String>,
     /// Monotonic per-site revision.
     pub revision: u64,
+    /// Optional adapter profile bound to the source provider UID and generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_contract: Option<grid_signals::provider_observation::ProviderAdapterContract>,
 }
 
 impl From<crdt::ProviderState> for WireProvider {
@@ -98,6 +101,7 @@ impl From<crdt::ProviderState> for WireProvider {
             phase: state.phase,
             match_labels: state.access_policy.match_labels,
             revision: state.revision,
+            adapter_contract: state.adapter_contract,
         }
     }
 }
@@ -116,6 +120,14 @@ impl WireProvider {
         {
             return None;
         }
+        let adapter_contract = self.adapter_contract.filter(|contract| {
+            contract.is_valid()
+                && self.models.len() == 1
+                && self
+                    .models
+                    .first()
+                    .is_some_and(|model| model == &contract.primary_model)
+        });
         Some(crdt::ProviderState {
             network_id: self.network_id,
             site_id: site.to_owned(),
@@ -132,6 +144,7 @@ impl WireProvider {
             },
             revision: self.revision,
             writer_id: site.to_owned(),
+            adapter_contract,
         })
     }
 }
@@ -926,6 +939,7 @@ mod tests {
             phase: crdt::ProviderPhase::Available,
             match_labels: labels.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
             revision: 3,
+            adapter_contract: None,
         }
     }
 

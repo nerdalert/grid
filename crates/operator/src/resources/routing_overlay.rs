@@ -44,6 +44,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use grid_signals::provider_observation::ProviderModelObservation;
 use k8s_openapi::api::core::v1::ConfigMap;
 use serde::{Deserialize, Serialize};
 
@@ -271,6 +272,7 @@ fn bare_candidate(kind: &str, name: &str, site: &str, cluster: &str, fresh: bool
         cluster: cluster.to_owned(),
         fresh,
         credential: None,
+        adapter_contract: None,
         stable_id: None,
         admission_state: None,
         selection_tier: None,
@@ -420,6 +422,20 @@ pub(crate) fn remote_crdt_provider_to_candidates(
         Some(inventory) => inventory_remote_model_candidates(provider, inventory, capacity_weight),
         None => static_remote_model_candidates(provider, capacity_weight),
     };
+    if let Some(contract) = provider.adapter_contract.as_ref().filter(|contract| {
+        contract.is_valid()
+            && provider.models.len() == 1
+            && provider
+                .models
+                .first()
+                .is_some_and(|model| model == &contract.primary_model)
+    }) {
+        for candidate in &mut candidates {
+            if candidate.kind == CANDIDATE_KIND && candidate.name == contract.primary_model {
+                candidate.adapter_contract = Some(contract.clone());
+            }
+        }
+    }
     candidates.extend(remote_tool_candidates(provider, capacity_weight));
     candidates
 }
@@ -1020,6 +1036,12 @@ pub struct RoutingCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential: Option<ProjectedCredential>,
 
+    /// Versioned provider adapter identity for compatible Grid Gateways. The
+    /// serving-config renderer omits it unless the target declares support.
+    /// It is kept out of the legacy Praxis routing overlay entirely.
+    #[serde(skip)]
+    pub adapter_contract: Option<grid_signals::provider_observation::ProviderAdapterContract>,
+
     /// Deterministic stable ID for consumer-side session binding.
     ///
     /// Computed as `fnv1a_hex8("{kind}/{name}/{site}/{cluster}")`.
@@ -1464,6 +1486,186 @@ fn truncate_candidate_count(candidates: &mut Vec<RoutingCandidate>, network_name
     });
 }
 
+/// Inputs required for one local Dynamo pressure comparison.
+struct DynamoPressureInputs<'inputs> {
+    /// `GridNetwork` being rendered.
+    network_name: &'inputs str,
+    /// Site that collected the observations.
+    local_site: &'inputs str,
+    /// Local `InferenceProvider` resources in the operator cache.
+    providers: &'inputs [InferenceProvider],
+    /// Remote legacy provider summaries, which have no canonical Dynamo data yet.
+    remote_crdt_providers: &'inputs [crdt::ProviderState],
+    /// Current admission states for local and remote providers.
+    precomputed_admission: Option<&'inputs HashMap<String, AdmissionState>>,
+    /// Fresh canonical Dynamo observations from the current scrape pass.
+    observations: Option<&'inputs HashMap<String, ProviderModelObservation>>,
+}
+
+/// One normalized pressure value with the profile fields needed for comparison.
+struct DynamoPressurePoint {
+    /// Routing identity of the provider candidate.
+    identity: String,
+    /// Canonical model shared by comparable pools.
+    model: String,
+    /// Independently declared request-accounting profile.
+    profile: String,
+    /// Independently declared effective concurrent-request capacity.
+    capacity: u64,
+    /// Higher is better after normalizing active requests by capacity.
+    score: f64,
+}
+
+/// Score comparable Dynamo Frontend pools by their measured active-request ratio.
+///
+/// Pressure comparison is all-or-nothing. Missing, stale, invalid, mixed or
+/// revision-mismatched data leaves the ordinary noMetrics scores in place.
+fn dynamo_request_pressure_scores(
+    strategy: crate::crd::grid_network::ScoringStrategy,
+    inputs: &DynamoPressureInputs<'_>,
+) -> HashMap<String, f64> {
+    if strategy != crate::crd::grid_network::ScoringStrategy::DynamoRequestPressure {
+        return HashMap::new();
+    }
+    comparable_dynamo_pressure_scores(inputs).unwrap_or_default()
+}
+
+/// Return comparable pressure scores only when every eligible candidate qualifies.
+fn comparable_dynamo_pressure_scores(inputs: &DynamoPressureInputs<'_>) -> Option<HashMap<String, f64>> {
+    let observations = inputs.observations?;
+    let providers = eligible_local_pressure_providers(inputs);
+    if providers.len() < 2 || has_eligible_remote_provider(inputs) {
+        return None;
+    }
+    let points = providers
+        .into_iter()
+        .map(|provider| dynamo_pressure_point(provider, inputs.local_site, observations))
+        .collect::<Option<Vec<_>>>()?;
+    let first = points.first()?;
+    if points
+        .iter()
+        .any(|point| point.model != first.model || point.profile != first.profile || point.capacity != first.capacity)
+    {
+        return None;
+    }
+    let mut scores = HashMap::with_capacity(points.len());
+    for point in points {
+        if scores.insert(point.identity, point.score).is_some() {
+            return None;
+        }
+    }
+    Some(scores)
+}
+
+/// Local providers that could receive new traffic under the current admission map.
+fn eligible_local_pressure_providers<'providers>(
+    inputs: &DynamoPressureInputs<'providers>,
+) -> Vec<&'providers InferenceProvider> {
+    inputs
+        .providers
+        .iter()
+        .filter(|provider| {
+            provider.spec.grid_network_ref == inputs.network_name
+                && !is_explicitly_unavailable(provider)
+                && routing_identity(provider).is_some_and(|identity| {
+                    inputs
+                        .precomputed_admission
+                        .and_then(|states| states.get(identity))
+                        .is_none_or(|state| *state != AdmissionState::Excluded)
+                })
+        })
+        .collect()
+}
+
+/// Whether a non-excluded remote provider makes local pressure incomparable.
+fn has_eligible_remote_provider(inputs: &DynamoPressureInputs<'_>) -> bool {
+    inputs.remote_crdt_providers.iter().any(|provider| {
+        provider.phase != crdt::ProviderPhase::Unavailable
+            && inputs
+                .precomputed_admission
+                .and_then(|states| states.get(&provider.routing_cluster))
+                .is_none_or(|state| *state != AdmissionState::Excluded)
+    })
+}
+
+/// Validate and normalize one provider's revision-bound Dynamo observation.
+fn dynamo_pressure_point(
+    provider: &InferenceProvider,
+    local_site: &str,
+    observations: &HashMap<String, ProviderModelObservation>,
+) -> Option<DynamoPressurePoint> {
+    use grid_signals::provider_observation::{
+        AdapterKind, CountUnit, ModelReadiness, ObservationCapability, ObservationFreshness, ObservationScope,
+    };
+
+    let identity = routing_identity(provider)?;
+    let adapter = provider.spec.metrics_config.as_ref()?.adapter.as_ref()?;
+    if adapter.kind != crate::crd::inference_provider::MetricsAdapterKind::DynamoFrontendV1
+        || adapter.scope != crate::crd::inference_provider::MetricsAdapterScope::DedicatedSingleModel
+        || provider.spec.model_discovery.is_some()
+        || provider.spec.models.len() != 1
+        || provider
+            .spec
+            .models
+            .first()
+            .is_none_or(|model| model.name != adapter.primary_model)
+    {
+        return None;
+    }
+    let observation = observations.get(identity)?;
+    if observation.source.site != local_site
+        || provider
+            .metadata
+            .uid
+            .as_deref()
+            .is_none_or(|uid| observation.source.provider_uid != uid)
+        || provider
+            .metadata
+            .generation
+            .is_none_or(|generation| observation.source.provider_generation != generation)
+        || observation.source.adapter.kind != AdapterKind::DynamoFrontend
+        || observation.source.adapter.version != 1
+        || observation.scope != ObservationScope::DedicatedSingleModel
+        || observation.model != adapter.primary_model
+        || observation.freshness != ObservationFreshness::Fresh
+        || observation.readiness != ModelReadiness::Ready
+        || !observation
+            .capabilities
+            .contains(&ObservationCapability::ActiveRequests)
+        || !observation
+            .capabilities
+            .contains(&ObservationCapability::ComparableRequestPressure)
+    {
+        return None;
+    }
+    let active = observation.active_requests?;
+    let capacity = observation.concurrency_capacity?;
+    let configured = adapter.concurrency.as_ref()?;
+    if active.unit != CountUnit::Requests
+        || capacity.unit != CountUnit::ConcurrentRequests
+        || capacity.value == 0
+        || capacity.value != u64::from(configured.capacity)
+        || observation.concurrency_profile.as_deref() != Some(configured.profile.as_str())
+        || configured.profile.trim().is_empty()
+    {
+        return None;
+    }
+    // f64 is only the final presentation of this bounded ratio. Counts remain
+    // integers and are never relabeled as queue depth.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the normalized pressure ratio is a bounded presentation score"
+    )]
+    let pressure = (active.value as f64 / capacity.value as f64).clamp(0.0, 1.0);
+    Some(DynamoPressurePoint {
+        identity: identity.to_owned(),
+        model: observation.model.clone(),
+        profile: configured.profile.clone(),
+        capacity: capacity.value,
+        score: 1.0 - pressure,
+    })
+}
+
 /// Render an overlay using controller-owned admission states and the local
 /// discovery store. The compatibility wrapper above retains the renderer
 /// signature for callers without discovery state; it omits dynamic candidates.
@@ -1480,7 +1682,7 @@ fn truncate_candidate_count(candidates: &mut Vec<RoutingCandidate>, network_name
     clippy::too_many_lines,
     reason = "sequential render steps: ordering, collect, enrich, filter, sort, dedup, rank; splitting would hide the pipeline"
 )]
-pub fn render_routing_overlay_with_admission(
+pub(crate) fn render_routing_overlay_with_adapter_observations(
     network: &GridNetwork,
     sites: &[GridSite],
     providers: &[InferenceProvider],
@@ -1496,6 +1698,7 @@ pub fn render_routing_overlay_with_admission(
     precomputed_admission: Option<&HashMap<String, AdmissionState>>,
     served_model_store: &ServedModelStore,
     candidate_expiry_support: CandidateExpirySupport,
+    adapter_observations: Option<&HashMap<String, ProviderModelObservation>>,
 ) -> Result<RoutingOverlay, String> {
     let network_name = network
         .metadata
@@ -1510,6 +1713,23 @@ pub fn render_routing_overlay_with_admission(
         network.spec.region.as_deref(),
         metrics,
         weights,
+    );
+    let adapter_scores = dynamo_request_pressure_scores(
+        network
+            .spec
+            .scoring_policy
+            .as_ref()
+            .map_or(crate::crd::grid_network::ScoringStrategy::NoMetrics, |policy| {
+                policy.strategy
+            }),
+        &DynamoPressureInputs {
+            network_name,
+            local_site,
+            providers,
+            remote_crdt_providers,
+            precomputed_admission,
+            observations: adapter_observations,
+        },
     );
 
     let admission_map = build_admission_map(
@@ -1596,7 +1816,13 @@ pub fn render_routing_overlay_with_admission(
         .spec
         .routing_policy
         .unwrap_or(crate::crd::grid_network::RoutingPolicy::GeographyFirst);
-    let score_of = |cluster: &str| ordering.get(cluster).map_or(DEFAULT_LOCALITY, |bd| bd.total);
+    let score_of = |candidate: &RoutingCandidate| {
+        (candidate.kind == CANDIDATE_KIND)
+            .then(|| adapter_scores.get(&candidate.cluster).copied())
+            .flatten()
+            .or_else(|| ordering.get(&candidate.cluster).map(|breakdown| breakdown.total))
+            .unwrap_or(DEFAULT_LOCALITY)
+    };
     match policy {
         crate::crd::grid_network::RoutingPolicy::GeographyFirst => {
             candidates.sort_by(|a, b| {
@@ -1604,7 +1830,7 @@ pub fn render_routing_overlay_with_admission(
                     .cmp(&admission_sort_key(b.admission_state))
                     .then(locality_sort_key(a.selection_tier).cmp(&locality_sort_key(b.selection_tier)))
                     .then(b.fresh.cmp(&a.fresh))
-                    .then_with(|| score_of(&b.cluster).total_cmp(&score_of(&a.cluster)))
+                    .then_with(|| score_of(b).total_cmp(&score_of(a)))
                     .then(a.site.cmp(&b.site))
                     .then(a.name.cmp(&b.name))
                     .then(a.cluster.cmp(&b.cluster))
@@ -1615,7 +1841,7 @@ pub fn render_routing_overlay_with_admission(
                 admission_sort_key(a.admission_state)
                     .cmp(&admission_sort_key(b.admission_state))
                     .then(b.fresh.cmp(&a.fresh))
-                    .then_with(|| score_of(&b.cluster).total_cmp(&score_of(&a.cluster)))
+                    .then_with(|| score_of(b).total_cmp(&score_of(a)))
                     .then(locality_sort_key(a.selection_tier).cmp(&locality_sort_key(b.selection_tier)))
                     .then(a.site.cmp(&b.site))
                     .then(a.name.cmp(&b.name))
@@ -1633,10 +1859,7 @@ pub fn render_routing_overlay_with_admission(
         )]
         let rank = i as u32;
         candidate.rank = Some(rank);
-        if let Some(bd) = ordering.get(candidate.cluster.as_str()) {
-            candidate.score = Some(bd.total);
-            candidate.score_breakdown = Some(bd.clone());
-        }
+        assign_candidate_score(candidate, &ordering, &adapter_scores);
     }
 
     assign_selection_groups(&mut candidates, policy);
@@ -1672,6 +1895,70 @@ pub fn render_routing_overlay_with_admission(
         selection_policy,
         generated_at: generated_at.map(str::to_owned),
     })
+}
+
+/// Assign the adapter score when one qualifies, falling back to the existing score breakdown.
+fn assign_candidate_score(
+    candidate: &mut RoutingCandidate,
+    ordering: &HashMap<String, scoring::ScoreBreakdown>,
+    adapter_scores: &HashMap<String, f64>,
+) {
+    if candidate.kind == CANDIDATE_KIND
+        && let Some(score) = adapter_scores.get(candidate.cluster.as_str())
+    {
+        candidate.score = Some(*score);
+        candidate.score_breakdown = None;
+    } else if let Some(breakdown) = ordering.get(candidate.cluster.as_str()) {
+        candidate.score = Some(breakdown.total);
+        candidate.score_breakdown = Some(breakdown.clone());
+    }
+}
+
+/// Render with the established admission and score inputs, without adapter observations.
+///
+/// # Errors
+///
+/// Returns an error when the network or an eligible provider lacks the
+/// metadata required to construct a valid routing candidate.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "retains the public renderer signature while adapter observations stay opt-in"
+)]
+pub fn render_routing_overlay_with_admission(
+    network: &GridNetwork,
+    sites: &[GridSite],
+    providers: &[InferenceProvider],
+    tool_providers: &[AgentToolProvider],
+    remote_crdt_providers: &[crdt::ProviderState],
+    remote_model_inventories: &[swim::ModelInventory],
+    grid_id: &str,
+    local_site: &str,
+    owning_site: Option<&str>,
+    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
+    generated_at: Option<&str>,
+    weights: &scoring::ScoringWeights,
+    precomputed_admission: Option<&HashMap<String, AdmissionState>>,
+    served_model_store: &ServedModelStore,
+    candidate_expiry_support: CandidateExpirySupport,
+) -> Result<RoutingOverlay, String> {
+    render_routing_overlay_with_adapter_observations(
+        network,
+        sites,
+        providers,
+        tool_providers,
+        remote_crdt_providers,
+        remote_model_inventories,
+        grid_id,
+        local_site,
+        owning_site,
+        metrics,
+        generated_at,
+        weights,
+        precomputed_admission,
+        served_model_store,
+        candidate_expiry_support,
+        None,
+    )
 }
 
 /// Convert a CRDT `ProviderAccessPolicy` to an operator `AccessPolicy` for evaluation.
@@ -1957,6 +2244,7 @@ fn candidates_from_inventory(
                 fresh,
                 expires_at: model_inventory.expires_at().map(str::to_owned),
                 credential: credential.clone(),
+                adapter_contract: crate::controller::grid_network::provider_adapter_contract(provider),
                 stable_id: None,
                 admission_state: None,
                 selection_tier: None,
@@ -2271,6 +2559,7 @@ mod tests {
             cluster: cluster.to_owned(),
             fresh,
             credential: None,
+            adapter_contract: None,
             stable_id: None,
             admission_state: Some(admission_state),
             selection_tier: Some(tier),
@@ -2456,6 +2745,254 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn test_dynamo_network(name: &str) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": name },
+            "spec": {
+                "seeds": [],
+                "routingPolicy": "scoreFirst",
+                "scoringPolicy": { "strategy": "dynamoRequestPressure" }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn test_dynamo_provider(name: &str, model: &str, profile_and_capacity: Option<(&str, u32)>) -> InferenceProvider {
+        let concurrency = profile_and_capacity
+            .map(|(profile, capacity)| serde_json::json!({ "profile": profile, "capacity": capacity }));
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name, "uid": format!("uid-{name}"), "generation": 4 },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": [{ "name": model }],
+                "metricsConfig": {
+                    "adapter": {
+                        "kind": "dynamo/frontend-v1",
+                        "scope": "dedicatedSingleModel",
+                        "primaryModel": model,
+                        "concurrency": concurrency
+                    }
+                }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn test_dynamo_observation(
+        provider: &InferenceProvider,
+        model: &str,
+        profile: Option<&str>,
+        capacity: Option<u64>,
+        active: Option<u64>,
+    ) -> ProviderModelObservation {
+        use grid_signals::provider_observation::{
+            AdapterIdentity, AdapterKind, CountObservation, CountUnit, ModelReadiness, ObservationCapability,
+            ObservationFreshness, ObservationScope, ObservationSource,
+        };
+
+        let mut capabilities = BTreeSet::from([
+            ObservationCapability::ModelReadiness,
+            ObservationCapability::ActiveRequests,
+            ObservationCapability::StageRequests,
+        ]);
+        if capacity.is_some() && profile.is_some() {
+            capabilities.insert(ObservationCapability::ComparableRequestPressure);
+        }
+        ProviderModelObservation {
+            source: ObservationSource {
+                site: "site-a".to_owned(),
+                provider_uid: provider.metadata.uid.clone().unwrap_or_default(),
+                provider_generation: provider.metadata.generation.unwrap_or_default(),
+                adapter: AdapterIdentity {
+                    kind: AdapterKind::DynamoFrontend,
+                    version: 1,
+                },
+            },
+            model: model.to_owned(),
+            scope: ObservationScope::DedicatedSingleModel,
+            observed_at_ms: 1_799_996_400_000,
+            freshness: ObservationFreshness::Fresh,
+            readiness: ModelReadiness::Ready,
+            active_requests: active.map(|value| CountObservation {
+                value,
+                unit: CountUnit::Requests,
+            }),
+            stage_requests: None,
+            concurrency_capacity: capacity.map(|value| CountObservation {
+                value,
+                unit: CountUnit::ConcurrentRequests,
+            }),
+            concurrency_profile: profile.map(str::to_owned),
+            capabilities,
+        }
+    }
+
+    fn test_admission_for(providers: &[InferenceProvider]) -> HashMap<String, AdmissionState> {
+        providers
+            .iter()
+            .filter_map(|provider| {
+                routing_identity(provider).map(|identity| (identity.to_owned(), AdmissionState::NewAndExisting))
+            })
+            .collect()
+    }
+
+    fn test_pressure_scores(
+        providers: &[InferenceProvider],
+        observations: &HashMap<String, ProviderModelObservation>,
+    ) -> HashMap<String, f64> {
+        dynamo_request_pressure_scores(
+            crate::crd::grid_network::ScoringStrategy::DynamoRequestPressure,
+            &DynamoPressureInputs {
+                network_name: "net",
+                local_site: "site-a",
+                providers,
+                remote_crdt_providers: &[],
+                precomputed_admission: Some(&test_admission_for(providers)),
+                observations: Some(observations),
+            },
+        )
+    }
+
+    #[test]
+    fn comparable_dynamo_pressure_scores_and_ranks_pools_without_queue_depth_aliasing() {
+        let network = test_dynamo_network("net");
+        let providers = [
+            test_dynamo_provider("pool-busier", "model", Some(("mock-concurrency-v1", 10))),
+            test_dynamo_provider("pool-idle", "model", Some(("mock-concurrency-v1", 10))),
+        ];
+        let observations = HashMap::from([
+            (
+                "pool-busier".to_owned(),
+                test_dynamo_observation(&providers[0], "model", Some("mock-concurrency-v1"), Some(10), Some(6)),
+            ),
+            (
+                "pool-idle".to_owned(),
+                test_dynamo_observation(&providers[1], "model", Some("mock-concurrency-v1"), Some(10), Some(2)),
+            ),
+        ]);
+        let admission = test_admission_for(&providers);
+        let overlay = render_routing_overlay_with_adapter_observations(
+            &network,
+            &[],
+            &providers,
+            &[],
+            &[],
+            &[],
+            "grid-a",
+            "site-a",
+            None,
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            Some(&admission),
+            &ServedModelStore::new(),
+            CandidateExpirySupport::Supported,
+            Some(&observations),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(overlay.candidates[0].cluster, "pool-idle");
+        assert_eq!(overlay.candidates[0].rank, Some(0));
+        assert_eq!(overlay.candidates[0].score, Some(0.8));
+        assert!(overlay.candidates[0].score_breakdown.is_none());
+        assert_eq!(overlay.candidates[1].cluster, "pool-busier");
+        assert_eq!(overlay.candidates[1].rank, Some(1));
+        assert_eq!(overlay.candidates[1].score, Some(0.4));
+        assert!(overlay.candidates[1].score_breakdown.is_none());
+    }
+
+    #[test]
+    fn dynamo_pressure_falls_back_when_observation_or_capacity_is_missing() {
+        let providers = [
+            test_dynamo_provider("pool-a", "model", Some(("mock-concurrency-v1", 10))),
+            test_dynamo_provider("pool-b", "model", Some(("mock-concurrency-v1", 10))),
+        ];
+        let one_sample = HashMap::from([(
+            "pool-a".to_owned(),
+            test_dynamo_observation(&providers[0], "model", Some("mock-concurrency-v1"), Some(10), Some(0)),
+        )]);
+        assert!(test_pressure_scores(&providers, &one_sample).is_empty());
+
+        let missing_capacity = HashMap::from([
+            (
+                "pool-a".to_owned(),
+                test_dynamo_observation(&providers[0], "model", Some("mock-concurrency-v1"), Some(10), Some(0)),
+            ),
+            (
+                "pool-b".to_owned(),
+                test_dynamo_observation(&providers[1], "model", None, None, Some(0)),
+            ),
+        ]);
+        assert!(test_pressure_scores(&providers, &missing_capacity).is_empty());
+    }
+
+    #[test]
+    fn dynamo_pressure_falls_back_for_mismatched_model_or_profile() {
+        let same_model = [
+            test_dynamo_provider("pool-a", "model", Some(("mock-concurrency-v1", 10))),
+            test_dynamo_provider("pool-b", "model", Some(("mock-concurrency-v2", 10))),
+        ];
+        let mismatched_profiles = HashMap::from([
+            (
+                "pool-a".to_owned(),
+                test_dynamo_observation(&same_model[0], "model", Some("mock-concurrency-v1"), Some(10), Some(0)),
+            ),
+            (
+                "pool-b".to_owned(),
+                test_dynamo_observation(&same_model[1], "model", Some("mock-concurrency-v2"), Some(10), Some(0)),
+            ),
+        ]);
+        assert!(test_pressure_scores(&same_model, &mismatched_profiles).is_empty());
+
+        let different_models = [
+            test_dynamo_provider("pool-a", "model-a", Some(("mock-concurrency-v1", 10))),
+            test_dynamo_provider("pool-b", "model-b", Some(("mock-concurrency-v1", 10))),
+        ];
+        let mismatched_models = HashMap::from([
+            (
+                "pool-a".to_owned(),
+                test_dynamo_observation(
+                    &different_models[0],
+                    "model-a",
+                    Some("mock-concurrency-v1"),
+                    Some(10),
+                    Some(0),
+                ),
+            ),
+            (
+                "pool-b".to_owned(),
+                test_dynamo_observation(
+                    &different_models[1],
+                    "model-b",
+                    Some("mock-concurrency-v1"),
+                    Some(10),
+                    Some(0),
+                ),
+            ),
+        ]);
+        assert!(test_pressure_scores(&different_models, &mismatched_models).is_empty());
+    }
+
+    #[test]
+    fn mixed_llm_d_and_dynamo_pressure_uses_fallback_scores() {
+        let providers = [
+            test_dynamo_provider("dynamo-pool", "model", Some(("mock-concurrency-v1", 10))),
+            test_provider("llm-d-pool", "net", &["model"]),
+        ];
+        let observations = HashMap::from([(
+            "dynamo-pool".to_owned(),
+            test_dynamo_observation(&providers[0], "model", Some("mock-concurrency-v1"), Some(10), Some(1)),
+        )]);
+        assert!(test_pressure_scores(&providers, &observations).is_empty());
     }
 
     #[test]
@@ -5955,6 +6492,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site_id.to_owned(),
+            adapter_contract: None,
         }
     }
 
@@ -6979,6 +7517,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "w".to_owned(),
+            adapter_contract: None,
         }
     }
 
@@ -7241,6 +7780,7 @@ mod tests {
             access_policy,
             revision: 1,
             writer_id: site_id.to_owned(),
+            adapter_contract: None,
         }
     }
 
@@ -8570,6 +9110,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-a".to_owned(),
+            adapter_contract: None,
         };
         let candidates = remote_crdt_provider_to_candidates(&provider, &[], "");
         let mut tuples: Vec<_> = candidates
@@ -8603,6 +9144,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-b".to_owned(),
+            adapter_contract: None,
         };
         let candidates = remote_crdt_provider_to_candidates(&provider, &[], "");
         let mut tuples: Vec<_> = candidates
@@ -8636,6 +9178,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-a".to_owned(),
+            adapter_contract: None,
         };
         let candidates = remote_crdt_provider_to_candidates(&provider, &[], "");
         assert!(candidates.is_empty(), "unavailable provider must produce no candidates");
@@ -8678,6 +9221,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-a".to_owned(),
+            adapter_contract: None,
         };
         let candidates = remote_crdt_provider_to_candidates(&provider, &[], "");
         assert_eq!(candidates.len(), 1);
@@ -8996,6 +9540,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-remote".to_owned(),
+            adapter_contract: None,
         };
         let overlay = render_routing_overlay(
             &network,
@@ -9035,6 +9580,7 @@ mod tests {
                 access_policy: crdt::ProviderAccessPolicy::default(),
                 revision: 1,
                 writer_id: format!("site-{provider_index}"),
+                adapter_contract: None,
             })
             .collect();
         let overlay = render_routing_overlay(

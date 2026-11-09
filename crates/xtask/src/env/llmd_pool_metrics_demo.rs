@@ -200,8 +200,8 @@ const OPERATOR_METRICS_PORT: u16 = 9090;
 /// Operator peer-signal listener port exposed by the signals Service.
 const OPERATOR_SIGNALS_PORT: u16 = 9091;
 
-/// Grid Gateway's TLS metrics listener port.
-const GRID_SERVING_METRICS_PORT: u16 = 9443;
+/// Grid Gateway's loopback admin metrics port, reached through a run-owned port-forward.
+const GRID_SERVING_METRICS_PORT: u16 = 9901;
 
 /// Cluster exposing the Grid Gateway's cross-site route.
 const GRID_SERVING_SITE: &str = "pool-a";

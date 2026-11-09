@@ -70,6 +70,7 @@ fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
                 stable_id: site,
                 dial: None,
                 weight: 1,
+                adapter_contract: None,
             }
         })
         .collect();

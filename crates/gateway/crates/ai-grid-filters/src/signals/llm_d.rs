@@ -213,6 +213,16 @@ impl SiteSignals for Mapped<'_> {
         )
     }
 
+    fn read_dynamo_frontend(
+        &self,
+        site: &str,
+        routing_cluster: &str,
+        contract: &grid_signals::provider_observation::ProviderAdapterContract,
+        over: Over,
+    ) -> SiteReading {
+        super::dynamo_frontend::read(self.store, site, routing_cluster, contract, over)
+    }
+
     /// Running over KV share at queue-free instants, the least in the window.
     fn implied_capacity(&self, site: &str, cluster: &str, over: Over) -> Option<f64> {
         let key = LoadStore::key(site, cluster);
@@ -270,6 +280,7 @@ impl Mapped<'_> {
             deepest_queue: first(self.series.per_unit_queue),
             backlogged_at: sampled_at.filter(|at| self.in_flight(key, *at, 0, backlog).is_some()),
             unready: self.unready(key, sampled_at),
+            request_pressure: None,
             sampled_at,
             units: self.units(key),
             published_saturation,
@@ -446,6 +457,16 @@ impl SiteSignals for LoadStore {
         .read(site, cluster, over)
     }
 
+    fn read_dynamo_frontend(
+        &self,
+        site: &str,
+        routing_cluster: &str,
+        contract: &grid_signals::provider_observation::ProviderAdapterContract,
+        over: Over,
+    ) -> SiteReading {
+        super::dynamo_frontend::read(self, site, routing_cluster, contract, over)
+    }
+
     fn implied_capacity(&self, site: &str, cluster: &str, over: Over) -> Option<f64> {
         Mapped {
             store: self,
@@ -516,6 +537,7 @@ mod tests {
             deepest_queue: Some(2.0),
             backlogged_at: Some(1_000),
             unready: false,
+            request_pressure: None,
             sampled_at: Some(1_000),
             units: Some(2.0),
             // No KV share and no published saturation, so no comparator: this site is learned.

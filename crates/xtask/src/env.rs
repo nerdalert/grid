@@ -4,6 +4,7 @@ pub(crate) mod certs;
 pub(crate) mod combined_site_demo;
 pub(crate) mod config;
 pub(crate) mod consumer;
+pub(crate) mod dynamo_pluggable_demo;
 pub(crate) mod external_provider;
 pub(crate) mod forge_config;
 pub(crate) mod gateway;
@@ -1073,6 +1074,24 @@ pub(crate) enum Action {
         kv_cache: bool,
     },
 
+    /// Run deterministic Grid-only contract checks for Dynamo signal routing.
+    ///
+    /// This mode does not start Dynamo or claim runtime, Kind, or cross-site qualification.
+    RunGridDynamoPluggableQuick {
+        /// Directory for run-scoped machine-readable evidence and command logs.
+        #[arg(long)]
+        evidence_dir: Option<PathBuf>,
+    },
+
+    /// Qualify real Dynamo Frontend + Mocker pools with live pressure and recovery.
+    ///
+    /// This is a Dynamo runtime gate; the result explicitly leaves Grid overlay and cross-site gates unqualified.
+    RunGridDynamoPluggableFull {
+        /// Directory for run-scoped machine-readable evidence and command logs.
+        #[arg(long)]
+        evidence_dir: Option<PathBuf>,
+    },
+
     /// Qualify the provider-gateway traffic topology, proving equal
     /// selection across its active provider group.
     RunGridProviderTrafficQualification {
@@ -1183,6 +1202,56 @@ mod llmd_pool_metrics_demo_cli_tests {
     #[test]
     fn kv_cache_flag_parses_when_passed() {
         assert!(parsed_kv_cache_flag(&["--kv-cache"]));
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
+mod dynamo_pluggable_quick_cli_tests {
+    use std::path::PathBuf;
+
+    use clap::Parser as _;
+
+    use super::Action;
+    use crate::{Cli, Command};
+
+    #[test]
+    fn quick_mode_parses_its_evidence_directory() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "env",
+            "run-grid-dynamo-pluggable-quick",
+            "--evidence-dir",
+            "/tmp/grid-dynamo-evidence",
+        ])
+        .expect("valid quick mode invocation must parse");
+        let Command::Env { action } = cli.command else {
+            panic!("expected the env subcommand");
+        };
+        let Action::RunGridDynamoPluggableQuick { evidence_dir } = action else {
+            panic!("expected the Grid-only Dynamo quick action");
+        };
+        assert_eq!(evidence_dir, Some(PathBuf::from("/tmp/grid-dynamo-evidence")));
+    }
+
+    #[test]
+    fn full_mode_parses_its_evidence_directory() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "env",
+            "run-grid-dynamo-pluggable-full",
+            "--evidence-dir",
+            "/tmp/grid-dynamo-full-evidence",
+        ])
+        .expect("valid full mode invocation must parse");
+        let Command::Env { action } = cli.command else {
+            panic!("expected the env subcommand");
+        };
+        let Action::RunGridDynamoPluggableFull { evidence_dir } = action else {
+            panic!("expected the real Dynamo full action");
+        };
+        assert_eq!(evidence_dir, Some(PathBuf::from("/tmp/grid-dynamo-full-evidence")));
     }
 }
 
@@ -1354,6 +1423,12 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             metrics_mtls,
             kv_cache,
         } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
+        Action::RunGridDynamoPluggableQuick { evidence_dir } => {
+            dynamo_pluggable_demo::run_grid_only_quick(evidence_dir.as_deref())
+        },
+        Action::RunGridDynamoPluggableFull { evidence_dir } => {
+            dynamo_pluggable_demo::run_full_runtime(evidence_dir.as_deref())
+        },
         Action::RunGridProviderTrafficQualification { forge_config, options } => {
             provider_traffic_qualification::run(forge_config, options)
         },

@@ -33,7 +33,6 @@ use crate::{
     shutdown::Shutdown,
 };
 
-
 /// Longest wait between checks, so an identity replaced out of band is still watched.
 const CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
 

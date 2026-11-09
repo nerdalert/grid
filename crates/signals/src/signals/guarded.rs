@@ -202,11 +202,13 @@ impl LoadStore {
             provider.invalidate();
             return Commit::Rejected;
         }
+        let publication_serial = batch.revision.as_ref().map(|_| provider.guard.serial);
         for mut row in batch.rows {
             let Some(at_ms) = rebase_age(scrape.reference_ms, row.origin_ms, scrape.local_now_ms) else {
                 continue;
             };
             row.sample.at_ms = at_ms;
+            row.sample.publication_serial = publication_serial;
             push_observation(&mut provider, &row, (self.combine)(row.metric), self.window);
         }
         drop(provider);

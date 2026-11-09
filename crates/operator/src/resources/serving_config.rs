@@ -264,6 +264,9 @@ pub(crate) struct ServingCandidate {
     /// A local candidate's credential locator, which `grid_site_route` selects for `credential_inject`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential: Option<ProjectedCredential>,
+    /// Versioned adapter identity, omitted for Gateways without declared support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) adapter_contract: Option<grid_signals::provider_observation::ProviderAdapterContract>,
     /// Declared capacity weight from the provider's `capacityWeight`, carried from the overlay's
     /// `capacity_weight`. Always emitted by the renderer. Older gateways reject this field via
     /// `deny_unknown_fields`, so compatible gateways must ship first in every rollout.
@@ -334,6 +337,8 @@ pub(crate) struct ServingInputs<'input> {
     pub(crate) zones: &'input BTreeMap<String, String>,
     /// Whether the gateway's generated config injects the local credentials the router selects.
     pub(crate) inject_local_credentials: bool,
+    /// Whether the target Gateway declares provider-adapter contract v1 support.
+    pub(crate) supports_provider_adapter_contract: bool,
 }
 
 /// Render for one gateway. Its only peer is the local operator, which relays
@@ -430,6 +435,8 @@ struct Folded {
     expires_at_ms: Option<u64>,
     /// The largest declared weight across duplicates.
     weight: u32,
+    /// Adapter metadata shared exactly by every duplicate candidate.
+    adapter_contract: Option<grid_signals::provider_observation::ProviderAdapterContract>,
 }
 
 /// Each routable candidate once, folded.
@@ -474,6 +481,7 @@ fn dedup<'overlay>(
             credential: None,
             expires_at_ms,
             weight: candidate.capacity_weight,
+            adapter_contract: candidate.adapter_contract.clone(),
         });
         folded.fresh &= candidate.fresh;
         folded.admission = folded.admission.max(admission);
@@ -489,6 +497,9 @@ fn dedup<'overlay>(
             (None, None) => None,
         };
         folded.weight = folded.weight.max(candidate.capacity_weight);
+        if folded.adapter_contract.as_ref() != candidate.adapter_contract.as_ref() {
+            folded.adapter_contract = None;
+        }
     }
     unique
 }
@@ -513,21 +524,28 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
         kept.sort_by_key(|(key, _)| *key);
     }
     kept.into_iter()
-        .map(|((remote, site, name, cluster), folded)| ServingCandidate {
-            stable_id: folded.stable_id,
-            kind: INFERENCE_MODEL,
-            name: name.to_owned(),
-            site: site.to_owned(),
-            cluster: cluster.to_owned(),
-            fresh: folded.fresh,
-            admission: folded.admission,
-            publishes_load: publishes_load(inputs, remote, site, cluster),
-            // Never on another site's cluster or a provider hop, so the secret stays on this site.
-            credential: folded.credential.filter(|_| {
-                inputs.inject_local_credentials && !remote && !inputs.provider_hop_clusters.contains(cluster)
-            }),
-            expires_at_ms: folded.expires_at_ms,
-            weight: folded.weight,
+        .map(|((remote, site, name, cluster), folded)| {
+            let adapter_contract = inputs
+                .supports_provider_adapter_contract
+                .then(|| folded.adapter_contract.clone())
+                .flatten();
+            ServingCandidate {
+                stable_id: folded.stable_id,
+                kind: INFERENCE_MODEL,
+                name: name.to_owned(),
+                site: site.to_owned(),
+                cluster: cluster.to_owned(),
+                fresh: folded.fresh,
+                admission: folded.admission,
+                publishes_load: publishes_load(inputs, remote, site, cluster),
+                // Never on another site's cluster or a provider hop, so the secret stays on this site.
+                credential: folded.credential.filter(|_| {
+                    inputs.inject_local_credentials && !remote && !inputs.provider_hop_clusters.contains(cluster)
+                }),
+                expires_at_ms: folded.expires_at_ms,
+                adapter_contract,
+                weight: folded.weight,
+            }
         })
         .collect()
 }
@@ -751,6 +769,7 @@ mod tests {
         quiet_local: &NO_PROVIDER_HOPS,
         zones: &NO_ZONES,
         inject_local_credentials: false,
+        supports_provider_adapter_contract: false,
     };
 
     fn cand(name: &str, site: &str, cluster: &str, admission: Option<&str>) -> RoutingCandidate {
@@ -901,6 +920,61 @@ mod tests {
         assert!(
             !text.contains("\"publishes_load\": true"),
             "the default is never written"
+        );
+    }
+
+    #[test]
+    fn adapter_source_name_does_not_replace_the_routing_cluster_signal_key() {
+        let quiet = BTreeSet::from(["pool-a".to_owned()]);
+        let heard = |site: &str, cluster: &str| site == "site-b" && cluster == "pool-b";
+        let inputs = ServingInputs {
+            heard: &heard,
+            quiet_local: &quiet,
+            supports_provider_adapter_contract: true,
+            ..INPUTS
+        };
+        let adapter =
+            |provider_id: &str, provider_uid: &str| grid_signals::provider_observation::ProviderAdapterContract {
+                provider_id: provider_id.to_owned(),
+                adapter_kind: "dynamo/frontend".to_owned(),
+                adapter_version: 1,
+                provider_uid: provider_uid.to_owned(),
+                provider_generation: 1,
+                primary_model: "llama".to_owned(),
+                model_scope: "dedicatedSingleModel".to_owned(),
+                concurrency_profile: Some("bounded-four".to_owned()),
+                concurrency_capacity: Some(4),
+            };
+        let mut local_candidate = cand("llama", "site-a", "pool-a", None);
+        local_candidate.adapter_contract = Some(adapter("provider-a", "0d71ac11-7955-4212-8e6b-0e9741bac19d"));
+        let mut remote_candidate = cand("llama", "site-b", "pool-b", None);
+        remote_candidate.adapter_contract = Some(adapter("provider-b", "c4fbbb84-6181-4dd3-b5f9-183050920eff"));
+
+        let config = render(&overlay(vec![local_candidate, remote_candidate]), &inputs);
+        let rendered_local = config
+            .candidates
+            .iter()
+            .find(|candidate| candidate.site == "site-a")
+            .expect("local candidate");
+        let rendered_remote = config
+            .candidates
+            .iter()
+            .find(|candidate| candidate.site == "site-b")
+            .expect("remote candidate");
+        assert!(
+            !rendered_local.publishes_load,
+            "local quiet state is keyed by routing cluster"
+        );
+        assert!(
+            rendered_remote.publishes_load,
+            "peer load-heard state is keyed by routing cluster"
+        );
+        assert_eq!(
+            rendered_remote
+                .adapter_contract
+                .as_ref()
+                .map(|contract| contract.provider_id.as_str()),
+            Some("provider-b")
         );
     }
 

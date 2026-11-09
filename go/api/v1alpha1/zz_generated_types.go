@@ -227,9 +227,10 @@ const (
 type ScoringStrategy string
 
 const (
-	ScoringStrategyNoMetrics       ScoringStrategy = "noMetrics"
-	ScoringStrategyQueueDepth      ScoringStrategy = "queueDepth"
-	ScoringStrategyKVCachePressure ScoringStrategy = "kvCachePressure"
+	ScoringStrategyNoMetrics             ScoringStrategy = "noMetrics"
+	ScoringStrategyQueueDepth            ScoringStrategy = "queueDepth"
+	ScoringStrategyKVCachePressure       ScoringStrategy = "kvCachePressure"
+	ScoringStrategyDynamoRequestPressure ScoringStrategy = "dynamoRequestPressure"
 )
 
 // SelectionMode is a string enumeration.
@@ -309,6 +310,20 @@ const (
 	GridSitePhaseActive      GridSitePhase = "Active"
 	GridSitePhaseUnreachable GridSitePhase = "Unreachable"
 	GridSitePhaseLeft        GridSitePhase = "Left"
+)
+
+// InferenceProviderMetricsConfigAdapterKind is a string enumeration.
+type InferenceProviderMetricsConfigAdapterKind string
+
+const (
+	InferenceProviderMetricsConfigAdapterKindDynamoFrontendV1 InferenceProviderMetricsConfigAdapterKind = "dynamo/frontend-v1"
+)
+
+// InferenceProviderMetricsConfigAdapterScope is a string enumeration.
+type InferenceProviderMetricsConfigAdapterScope string
+
+const (
+	InferenceProviderMetricsConfigAdapterScopeDedicatedSingleModel InferenceProviderMetricsConfigAdapterScope = "dedicatedSingleModel"
 )
 
 // MetricsAuthType is a string enumeration.
@@ -641,6 +656,9 @@ type GridNetworkConsumerGatewaysItem struct {
 	// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the routing filter siteRouter selects, intelligent_route or grid_site_route, a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
 	// The generated ConfigMap contains no token bytes. Credential-bearing overlays are withheld until the consumer has explicitly declared that its compatible filter config is already running.
 	PraxisConfig *GridNetworkConsumerGatewaysItemPraxisConfig `json:"praxisConfig,omitempty"`
+	// Provider telemetry contract version supported by the running Gateway.
+	// Set this only after the Gateway understands versioned provider adapter metadata and exact source-revision checks. The operator omits adapter metadata unless this is exactly v1.
+	ProviderAdapterContractVersion *string `json:"providerAdapterContractVersion,omitempty"`
 	// Explicit mTLS provider-hop endpoints for the embedded grid-gateway serving config. With the default praxisConfig.siteRouter intelligentRoute this allowlist is independent of praxisConfig, so a missing or disabled generated Praxis config cannot alter embedded serving behavior. With gridSiteRoute the hops are the generated config's mutual TLS endpoints instead, and this must be empty. Every entry must declare mutual_tls and a nonblank SNI. The embedded gateway compares each declaration against the loaded Praxis load-balancer's verified mTLS backend before it sends provider-hop context. Changing Praxis backend transport requires a gateway restart while gridServing is enabled.
 	ProviderHopEndpoints []GridNetworkConsumerGatewaysItemProviderHopEndpointsItem `json:"providerHopEndpoints,omitempty"`
 	// Local site name for the intelligent_route overlay generated for this gateway.
@@ -1056,6 +1074,31 @@ type HealthCheckConfig struct {
 	TLS *EndpointTLSConfig `json:"tls,omitempty"`
 }
 
+// InferenceProviderMetricsConfigAdapterConcurrency Optional, independently declared effective concurrency denominator.
+// A matching profile and capacity are required before Dynamo request pressure can be compared with another provider. The declaration is not inferred from readiness, worker count, or queue metrics.
+type InferenceProviderMetricsConfigAdapterConcurrency struct {
+	// Effective concurrent requests for this pool under the named profile.
+	Capacity int64 `json:"capacity"`
+	// Identifier for the shared request-accounting profile.
+	Profile string `json:"profile"`
+}
+
+// InferenceProviderMetricsConfigAdapter Optional typed, versioned interpretation of the scraped metrics.
+// Omission preserves the legacy signalNames parser and its llm-d compatibility behavior. An adapter defines its own model scope, readiness, units, and missing-data semantics.
+type InferenceProviderMetricsConfigAdapter struct {
+	// Optional, independently declared effective concurrency denominator.
+	// A matching profile and capacity are required before Dynamo request pressure can be compared with another provider. The declaration is not inferred from readiness, worker count, or queue metrics.
+	Concurrency *InferenceProviderMetricsConfigAdapterConcurrency `json:"concurrency,omitempty"`
+	// Versioned adapter contract.
+	Kind InferenceProviderMetricsConfigAdapterKind `json:"kind"`
+	// Explicit metric-label aliases that map to primaryModel.
+	ModelAliases []string `json:"modelAliases,omitempty"`
+	// Primary model name represented by the provider and its canonical observation.
+	PrimaryModel string `json:"primaryModel"`
+	// Required scope declaration for the adapter.
+	Scope InferenceProviderMetricsConfigAdapterScope `json:"scope"`
+}
+
 // MetricsAuth How the scraper authenticates to the metrics endpoint. Absent sends no credential.
 type MetricsAuth struct {
 	// Send the credential over plain http://. Off by default, because a bearer token on an unencrypted connection can be read off the network. For a lab only.
@@ -1088,6 +1131,9 @@ type MetricSignalNames struct {
 // When set, the Grid operator scrapes the provider's metrics endpoint during each [GridNetwork] reconcile and incorporates the parsed signals into the routing overlay scoring pass. When absent, the provider uses locality and cost as the only scoring signals (static ordering).
 // [GridNetwork]: crate::crd::grid_network::GridNetwork
 type MetricsConfig struct {
+	// Optional typed, versioned interpretation of the scraped metrics.
+	// Omission preserves the legacy signalNames parser and its llm-d compatibility behavior. An adapter defines its own model scope, readiness, units, and missing-data semantics.
+	Adapter *InferenceProviderMetricsConfigAdapter `json:"adapter,omitempty"`
 	// How the scraper authenticates to the metrics endpoint. Absent sends no credential.
 	Auth *MetricsAuth `json:"auth,omitempty"`
 	// Base URL for the metrics endpoint, independent of spec.endpoint.

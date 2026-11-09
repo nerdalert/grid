@@ -684,6 +684,7 @@ mod tests {
                 queue_depth: Some(queue),
                 ..Default::default()
             },
+            adapter_contract: None,
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site.to_owned(),
@@ -770,6 +771,59 @@ mod tests {
         let snap = provider_snap("site-a", 0.2);
         let bc = StateBroadcast::new("site-a".to_owned(), 1, snap, None);
         node.publish_state_broadcast(&bc)
+            .unwrap_or_else(|_| std::process::abort());
+    }
+
+    #[test]
+    fn compact_dynamo_adapter_state_fits_the_safe_swim_payload_budget() {
+        let site = "site";
+        let network = "grid-dynamo-peer-test";
+        let provider_id = "dynamo-site-provider";
+        let uid = "0d71ac11-7955-4212-8e6b-0e9741bac19d";
+        let mut snapshot = provider_snap(site, 0.2);
+        let Some(provider) = snapshot.providers.values_mut().next() else {
+            std::process::abort();
+        };
+        provider.network_id = network.to_owned();
+        provider.provider_id = provider_id.to_owned();
+        provider.routing_cluster = "dynamo-site-pool".to_owned();
+        provider.models = vec!["Qwen/Qwen3-0.6B".to_owned()];
+        provider.adapter_contract = Some(grid_signals::provider_observation::ProviderAdapterContract {
+            provider_id: provider_id.to_owned(),
+            adapter_kind: "dynamo/frontend".to_owned(),
+            adapter_version: 1,
+            provider_uid: uid.to_owned(),
+            provider_generation: 1,
+            primary_model: "Qwen/Qwen3-0.6B".to_owned(),
+            model_scope: "dedicatedSingleModel".to_owned(),
+            concurrency_profile: Some("dynamo-mocker-bounded-4-v1".to_owned()),
+            concurrency_capacity: Some(4),
+        });
+        let broadcast = StateBroadcast::new(site.to_owned(), 1, snapshot, Some("192.0.2.213:8443".to_owned()))
+            .with_cert(Some("A".repeat(500)))
+            .with_signature(Some(vec![0; 64]))
+            .with_signed_at(Some(1_794_061_325_000))
+            .with_grid_id(Some(network.to_owned()))
+            .with_signals_address(Some("192.0.2.212:9091".to_owned()))
+            .with_provider_uids(vec![crate::state_broadcast::ProviderUid {
+                identity: crate::state_broadcast::ProviderIdentity {
+                    network: network.to_owned(),
+                    site: site.to_owned(),
+                    provider: provider_id.to_owned(),
+                },
+                uid: uid.to_owned(),
+            }])
+            .with_authoritative_provider_state();
+        let id = local_id(site, 19_109);
+        let byte_budget = state_broadcast_byte_budget(&id).unwrap_or_else(|_| std::process::abort());
+        let encoded_length = broadcast.encode().map_or(usize::MAX, |encoded| encoded.len());
+        let (mut node, _) = make_node(site, 19_109);
+
+        assert!(
+            encoded_length <= byte_budget,
+            "compact adapter broadcast is {encoded_length} bytes, exceeding the {byte_budget}-byte budget"
+        );
+        node.publish_state_broadcast(&broadcast)
             .unwrap_or_else(|_| std::process::abort());
     }
 

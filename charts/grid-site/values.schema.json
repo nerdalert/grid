@@ -78,7 +78,7 @@
           "properties": {
             "strategy": {
               "type": "string",
-              "enum": ["noMetrics", "queueDepth", "kvCachePressure"]
+              "enum": ["noMetrics", "queueDepth", "kvCachePressure", "dynamoRequestPressure"]
             }
           }
         },

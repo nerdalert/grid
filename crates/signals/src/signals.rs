@@ -132,12 +132,16 @@ impl Ingested {
 }
 
 /// One observation of a series.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
     /// Operator observation time, in milliseconds since the epoch.
     pub at_ms: i64,
     /// Value as the provider reported it.
     pub value: f64,
+    /// Source adapter identity, retained exactly for canonical provider samples.
+    pub adapter_identity: Option<crate::provider_observation::ProviderSignalIdentity>,
+    /// Accepted complete publication that carried this sample, absent for unguarded input.
+    pub publication_serial: Option<u64>,
 }
 
 /// A bounded window of one series, oldest first.
@@ -157,13 +161,13 @@ impl Series {
     /// newest sample if it is another label set at the same instant or the same published
     /// observation restamped, then evict past `window`.
     fn push(&mut self, observation: &Observation<'_>, combine: Combine, window: Duration) {
-        let sample = observation.sample;
+        let sample = observation.sample.clone();
         if let Some(last) = self.samples.last() {
             let republished = self
                 .newest_origin_ms
                 .is_some_and(|held| observation.origin_ms.abs_diff(held) <= ORIGIN_TOLERANCE_MS);
-            if republished || sample.at_ms == last.at_ms {
-                self.fold(observation.labels, sample.value, combine);
+            if (republished || sample.at_ms == last.at_ms) && sample.publication_serial == last.publication_serial {
+                self.fold(observation.labels, &sample, combine);
                 return;
             }
             if sample.at_ms < last.at_ms {
@@ -173,13 +177,14 @@ impl Series {
         self.newest_labels.clear();
         self.newest_labels.push(observation.labels);
         self.newest_origin_ms = Some(observation.origin_ms);
+        let sample_at_ms = sample.at_ms;
         self.samples.push(sample);
         // Window eviction needs the window in millis. If it does not fit i64 (a
         // caller passing an implausible Duration), skip only the window cutoff; the
         // count cap below still runs, so the series stays bounded regardless.
         let keep_from = match i64::try_from(window.as_millis()) {
             Ok(window_ms) => {
-                let cutoff = sample.at_ms.saturating_sub(window_ms);
+                let cutoff = sample_at_ms.saturating_sub(window_ms);
                 self.samples.partition_point(|held| held.at_ms < cutoff)
             },
             Err(_) => 0,
@@ -195,15 +200,18 @@ impl Series {
     }
 
     /// Combine `value` into the newest sample unless its label set was already folded.
-    fn fold(&mut self, labels: u64, value: f64, combine: Combine) {
+    fn fold(&mut self, labels: u64, sample: &Sample, combine: Combine) {
         if self.newest_labels.contains(&labels) {
             return;
         }
         self.newest_labels.push(labels);
         if let Some(last) = self.samples.last_mut() {
+            if last.adapter_identity != sample.adapter_identity {
+                last.adapter_identity = None;
+            }
             last.value = match combine {
-                Combine::Max => last.value.max(value),
-                Combine::Sum => last.value + value,
+                Combine::Max => last.value.max(sample.value),
+                Combine::Sum => last.value + sample.value,
             };
         }
     }
@@ -365,7 +373,70 @@ impl LoadStore {
     #[must_use]
     pub fn latest(&self, key: &str, metric: &str) -> Option<Sample> {
         let provider = self.providers.get(key)?;
-        provider.metrics.get(metric)?.samples.last().copied()
+        provider.metrics.get(metric)?.samples.last().cloned()
+    }
+
+    /// Latest sample whose adapter source matches `identity` and whose age is within `max_age_ms`.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "adapter identity and explicit freshness bounds are required to reject stale or mismatched samples"
+    )]
+    pub fn latest_for_adapter(
+        &self,
+        key: &str,
+        metric: &str,
+        identity: &crate::provider_observation::ProviderSignalIdentity,
+        now_ms: i64,
+        max_age_ms: i64,
+    ) -> Option<Sample> {
+        self.latest(key, metric).filter(|sample| {
+            sample.adapter_identity.as_ref() == Some(identity)
+                && (0..=max_age_ms).contains(&now_ms.saturating_sub(sample.at_ms))
+        })
+    }
+
+    /// Worst adapter sample in the bounded lookback, requiring the exact source identity.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "adapter identity, time window, and comparison direction define the bounded sample query"
+    )]
+    pub fn window_worst_for_adapter(
+        &self,
+        key: &str,
+        metric: &str,
+        identity: &crate::provider_observation::ProviderSignalIdentity,
+        now_ms: i64,
+        window_ms: i64,
+        lower_is_better: bool,
+    ) -> Option<f64> {
+        let provider = self.providers.get(key)?;
+        let series = provider.metrics.get(metric)?;
+        if series
+            .samples
+            .last()
+            .is_none_or(|sample| sample.adapter_identity.as_ref() != Some(identity))
+        {
+            return None;
+        }
+        let cutoff = now_ms.saturating_sub(window_ms);
+        let worst = series
+            .samples
+            .iter()
+            .filter(|sample| {
+                sample.adapter_identity.as_ref() == Some(identity) && sample.at_ms >= cutoff && sample.at_ms <= now_ms
+            })
+            .map(|sample| sample.value)
+            .reduce(|held, value| {
+                if lower_is_better {
+                    held.max(value)
+                } else {
+                    held.min(value)
+                }
+            });
+        drop(provider);
+        worst
     }
 
     /// When anything was last observed for `key`, across all its metrics.
@@ -738,9 +809,73 @@ fn parse_sample(line: &str) -> Option<Observation<'_>> {
         sample: Sample {
             at_ms,
             value: metric.value(),
+            adapter_identity: provider_signal_identity(&metric),
+            publication_serial: None,
         },
 
         origin_ms: at_ms,
+    })
+}
+
+/// Read the fixed adapter identity labels from a canonical provider series.
+fn provider_signal_identity(
+    metric: &exposition::Metric<'_>,
+) -> Option<crate::provider_observation::ProviderSignalIdentity> {
+    use crate::provider_observation::{
+        ADAPTER_KIND_LABEL, ADAPTER_VERSION_LABEL, DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+        DYNAMO_FRONTEND_V1_MODEL_READY_METRIC, DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC, MODEL_LABEL,
+        MODEL_SCOPE_LABEL, PROVIDER_GENERATION_LABEL, PROVIDER_UID_LABEL, ProviderSignalIdentity,
+    };
+
+    if ![
+        DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+        DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+        DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC,
+    ]
+    .contains(&metric.name())
+    {
+        return None;
+    }
+    let mut labels = std::collections::BTreeMap::new();
+    for (name, value) in metric.labels() {
+        if labels.insert(name.to_owned(), value.into_owned()).is_some() {
+            return None;
+        }
+    }
+    let adapter_kind = labels.get(ADAPTER_KIND_LABEL)?.clone();
+    let adapter_version_text = labels.get(ADAPTER_VERSION_LABEL)?;
+    let adapter_version = adapter_version_text.parse::<u16>().ok()?;
+    if adapter_version.to_string() != *adapter_version_text {
+        return None;
+    }
+    let provider_uid = labels.get(PROVIDER_UID_LABEL)?.clone();
+    let provider_generation_text = labels.get(PROVIDER_GENERATION_LABEL)?;
+    let provider_generation = provider_generation_text.parse::<u64>().ok()?;
+    if provider_generation == 0
+        || provider_generation > crate::revision::MAX_GENERATION
+        || provider_generation.to_string() != *provider_generation_text
+        || !crate::revision::valid_id(&provider_uid)
+    {
+        return None;
+    }
+    let model = labels.get(MODEL_LABEL)?.clone();
+    let model_scope = labels.get(MODEL_SCOPE_LABEL)?.clone();
+    if adapter_kind != "dynamo/frontend"
+        || adapter_version != 1
+        || model.trim().is_empty()
+        || model.len() > 256
+        || model.chars().any(char::is_control)
+        || model_scope != "dedicatedSingleModel"
+    {
+        return None;
+    }
+    Some(ProviderSignalIdentity {
+        adapter_kind,
+        adapter_version,
+        provider_uid,
+        provider_generation,
+        model,
+        model_scope,
     })
 }
 
@@ -833,9 +968,73 @@ mod tests {
             sample,
             Sample {
                 at_ms: 1_000,
-                value: 3.0
+                value: 3.0,
+                adapter_identity: None,
+                publication_serial: None,
             },
             "value and time as reported"
+        );
+    }
+
+    #[test]
+    fn adapter_windows_require_the_latest_exact_provider_revision() {
+        use crate::provider_observation::{DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, ProviderSignalIdentity};
+
+        let store = store();
+        let identity = ProviderSignalIdentity {
+            adapter_kind: "dynamo/frontend".to_owned(),
+            adapter_version: 1,
+            provider_uid: "uid-dynamo".to_owned(),
+            provider_generation: 1,
+            model: "model-a".to_owned(),
+            model_scope: "dedicatedSingleModel".to_owned(),
+        };
+        let line = |generation: u64, at_ms: i64, value: u64| {
+            format!(
+                "{DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC}{{grid_site=\"east\",grid_provider=\"pool-a\",grid_adapter_kind=\"dynamo/frontend\",grid_adapter_version=\"1\",grid_provider_uid=\"uid-dynamo\",grid_provider_generation=\"{generation}\",grid_model=\"model-a\",grid_model_scope=\"dedicatedSingleModel\"}} {value} {at_ms}"
+            )
+        };
+        let key = LoadStore::key("east", "pool-a");
+        store.ingest(&line(1, 1_000, 4));
+        assert_eq!(
+            store
+                .latest_for_adapter(&key, DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, &identity, 1_000, 1_000)
+                .map(|sample| sample.value),
+            Some(4.0),
+            "the exact provider revision reads"
+        );
+        assert_eq!(
+            store.window_worst_for_adapter(
+                &key,
+                DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+                &identity,
+                1_000,
+                1_000,
+                true
+            ),
+            Some(4.0),
+            "the matching revision's window reads"
+        );
+
+        store.ingest(&line(2, 2_000, 0));
+        assert!(
+            store
+                .latest_for_adapter(&key, DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, &identity, 2_000, 1_000)
+                .is_none(),
+            "a newer generation cannot be read through the old contract"
+        );
+        assert!(
+            store
+                .window_worst_for_adapter(
+                    &key,
+                    DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+                    &identity,
+                    2_000,
+                    2_000,
+                    true
+                )
+                .is_none(),
+            "old-generation pressure cannot outlive a newer provider revision"
         );
     }
 

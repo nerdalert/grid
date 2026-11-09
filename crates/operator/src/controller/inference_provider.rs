@@ -273,6 +273,56 @@ pub(crate) fn validate_provider_config(provider: &InferenceProvider) -> Option<&
             return Some("blank model name");
         }
     }
+    if let Some(metrics) = provider.spec.metrics_config.as_ref()
+        && let Some(adapter) = metrics.adapter.as_ref()
+    {
+        match adapter.kind {
+            crate::crd::inference_provider::MetricsAdapterKind::DynamoFrontendV1 => {
+                if adapter.scope != crate::crd::inference_provider::MetricsAdapterScope::DedicatedSingleModel {
+                    return Some("unsupported Dynamo Frontend model scope");
+                }
+                if provider.spec.models.len() != 1
+                    || provider
+                        .spec
+                        .models
+                        .first()
+                        .is_none_or(|model| model.name != adapter.primary_model)
+                {
+                    return Some("Dynamo Frontend adapter requires exactly one declared primary model");
+                }
+                let mut aliases = std::collections::BTreeSet::new();
+                for alias in &adapter.model_aliases {
+                    if alias.trim().is_empty() || alias == &adapter.primary_model || !aliases.insert(alias) {
+                        return Some("Dynamo Frontend model aliases must be non-blank and unique");
+                    }
+                }
+                if adapter
+                    .concurrency
+                    .as_ref()
+                    .is_some_and(|capacity| capacity.profile.trim().is_empty() || capacity.capacity == 0)
+                {
+                    return Some("Dynamo Frontend concurrency profile must have a positive capacity");
+                }
+                let has_legacy_signals = [
+                    metrics.signal_names.queue_depth.as_ref(),
+                    metrics.signal_names.kv_cache_utilization.as_ref(),
+                    metrics.signal_names.latency_p99_ms.as_ref(),
+                    metrics.signal_names.prefix_cache_hit_ratio.as_ref(),
+                    metrics.signal_names.error_rate.as_ref(),
+                    metrics.signal_names.healthy.as_ref(),
+                    metrics.signal_names.ready_endpoints.as_ref(),
+                ]
+                .into_iter()
+                .any(|signal| signal.is_some());
+                if has_legacy_signals || metrics.pool_name.is_some() || metrics.queue_capacity.is_some() {
+                    return Some("Dynamo Frontend adapter cannot use legacy signalNames, poolName, or queueCapacity");
+                }
+                if provider.spec.model_discovery.is_some() {
+                    return Some("Dynamo Frontend adapter cannot use multi-model discovery");
+                }
+            },
+        }
+    }
     None
 }
 
@@ -1960,6 +2010,79 @@ mod tests {
         assert!(
             validate_provider_config(&provider).is_none(),
             "valid provider config must pass static validation"
+        );
+    }
+
+    #[test]
+    fn dynamo_adapter_requires_one_declared_primary_model() {
+        use crate::crd::inference_provider::{
+            MetricsAdapterConfig, MetricsAdapterKind, MetricsAdapterScope, MetricsConfig,
+        };
+
+        let mut provider = test_provider("dynamo", "net", &["Qwen/Qwen3-0.6B"]);
+        provider.spec.metrics_config = Some(MetricsConfig {
+            adapter: Some(MetricsAdapterConfig {
+                kind: MetricsAdapterKind::DynamoFrontendV1,
+                scope: MetricsAdapterScope::DedicatedSingleModel,
+                primary_model: "Qwen/Qwen3-0.6B".to_owned(),
+                model_aliases: vec!["qwen3".to_owned()],
+                concurrency: None,
+            }),
+            ..MetricsConfig::default()
+        });
+        assert!(
+            validate_provider_config(&provider).is_none(),
+            "one declared primary model with an explicit alias is valid"
+        );
+        provider.spec.models.push(crate::crd::inference_provider::ModelInfo {
+            name: "other-model".to_owned(),
+            capabilities: Vec::new(),
+            context_window: None,
+        });
+        assert_eq!(
+            validate_provider_config(&provider),
+            Some("Dynamo Frontend adapter requires exactly one declared primary model"),
+            "the Frontend-wide request gauge must not be assigned to several models"
+        );
+    }
+
+    #[test]
+    fn dynamo_adapter_rejects_ambiguous_alias_and_legacy_signal_configuration() {
+        use crate::crd::inference_provider::{
+            MetricsAdapterConfig, MetricsAdapterKind, MetricsAdapterScope, MetricsConfig,
+        };
+
+        let mut provider = test_provider("dynamo", "net", &["model-a"]);
+        provider.spec.metrics_config = Some(MetricsConfig {
+            adapter: Some(MetricsAdapterConfig {
+                kind: MetricsAdapterKind::DynamoFrontendV1,
+                scope: MetricsAdapterScope::DedicatedSingleModel,
+                primary_model: "model-a".to_owned(),
+                model_aliases: vec!["model-a".to_owned()],
+                concurrency: None,
+            }),
+            ..MetricsConfig::default()
+        });
+        assert_eq!(
+            validate_provider_config(&provider),
+            Some("Dynamo Frontend model aliases must be non-blank and unique"),
+            "an alias cannot shadow the primary model"
+        );
+        if let Some(adapter) = provider
+            .spec
+            .metrics_config
+            .as_mut()
+            .and_then(|metrics| metrics.adapter.as_mut())
+        {
+            adapter.model_aliases.clear();
+        }
+        if let Some(metrics) = provider.spec.metrics_config.as_mut() {
+            metrics.signal_names.queue_depth = Some("legacy_queue".to_owned());
+        }
+        assert_eq!(
+            validate_provider_config(&provider),
+            Some("Dynamo Frontend adapter cannot use legacy signalNames, poolName, or queueCapacity"),
+            "Dynamo signals must not be reinterpreted by the legacy scoring parser"
         );
     }
 

@@ -3501,6 +3501,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-x".to_owned(),
+            adapter_contract: None,
         });
         drop(state_tx.send(provider_state.clone()));
         assert!(
@@ -3767,6 +3768,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 7,
             writer_id: "site-a".to_owned(),
+            adapter_contract: None,
         });
         swim::StateBroadcast::new("site-a".to_owned(), 7, snapshot, Some("10.0.0.1:8443".to_owned()))
     }
@@ -3941,6 +3943,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-a".to_owned(),
+            adapter_contract: None,
         });
         drop(state_tx.send(snap));
 

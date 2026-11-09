@@ -109,6 +109,10 @@ pub struct CandidateConfig {
     #[serde(default)]
     pub credential: Option<CandidateCredential>,
 
+    /// Versioned provider telemetry identity, present only for compatible candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_contract: Option<grid_signals::provider_observation::ProviderAdapterContract>,
+
     /// Whether this candidate is fresh (default: `true`).
     #[serde(default = "default_fresh")]
     pub fresh: bool,
@@ -192,6 +196,9 @@ pub struct RouteCandidate {
 
     /// Optional final-hop credential reference.
     pub credential: Option<CandidateCredential>,
+
+    /// Versioned provider telemetry identity, when the Gateway and provider support it.
+    pub adapter_contract: Option<grid_signals::provider_observation::ProviderAdapterContract>,
 
     /// Whether this candidate is fresh. Preserved from config, but Grid owns
     /// freshness ordering.
@@ -318,6 +325,7 @@ fn validate_candidates_with_empty(
             silent: false,
             cluster: Arc::from(cand.cluster.as_str()),
             credential: cand.credential,
+            adapter_contract: cand.adapter_contract,
             fresh: cand.fresh,
             kind: cand.kind,
             name: Arc::from(cand.name.as_str()),
@@ -471,6 +479,7 @@ mod tests {
             admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,
+            adapter_contract: None,
             fresh: true,
             kind,
             name: name.to_owned(),

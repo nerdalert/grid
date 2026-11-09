@@ -344,6 +344,64 @@ spec:
                     [`GridNetwork`]: crate::crd::grid_network::GridNetwork
                   nullable: true
                   properties:
+                    adapter:
+                      description: |-
+                        Optional typed, versioned interpretation of the scraped metrics.
+
+                        Omission preserves the legacy signalNames parser and its llm-d
+                        compatibility behavior. An adapter defines its own model scope,
+                        readiness, units, and missing-data semantics.
+                      nullable: true
+                      properties:
+                        concurrency:
+                          description: |-
+                            Optional, independently declared effective concurrency denominator.
+
+                            A matching profile and capacity are required before Dynamo request
+                            pressure can be compared with another provider. The declaration is not
+                            inferred from readiness, worker count, or queue metrics.
+                          nullable: true
+                          properties:
+                            capacity:
+                              description: Effective concurrent requests for this pool under the named profile.
+                              format: uint32
+                              maximum: 1000000.0
+                              minimum: 1.0
+                              type: integer
+                            profile:
+                              description: Identifier for the shared request-accounting profile.
+                              maxLength: 64
+                              minLength: 1
+                              type: string
+                          required:
+                            - capacity
+                            - profile
+                          type: object
+                        kind:
+                          description: Versioned adapter contract.
+                          enum:
+                            - dynamo/frontend-v1
+                          type: string
+                        modelAliases:
+                          description: Explicit metric-label aliases that map to primaryModel.
+                          items:
+                            type: string
+                          type: array
+                        primaryModel:
+                          description: Primary model name represented by the provider and its canonical observation.
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        scope:
+                          description: Required scope declaration for the adapter.
+                          enum:
+                            - dedicatedSingleModel
+                          type: string
+                      required:
+                        - kind
+                        - primaryModel
+                        - scope
+                      type: object
                     auth:
                       description: |-
                         How the scraper authenticates to the metrics endpoint. Absent sends no

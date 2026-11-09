@@ -665,6 +665,7 @@ name = "crdt"
 version = "0.3.0"
 dependencies = [
  "bincode",
+ "grid-signals",
  "serde",
  "serde_json",
 ]
@@ -1450,6 +1451,7 @@ name = "grid-signals"
 version = "0.3.0"
 dependencies = [
  "dashmap",
+ "serde",
 ]
 
 [[package]]
@@ -3898,6 +3900,7 @@ dependencies = [
  "bincode",
  "crdt",
  "foca",
+ "grid-signals",
  "openssl",
  "rand 0.9.5",
  "rcgen",

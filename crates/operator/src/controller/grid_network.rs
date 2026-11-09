@@ -61,7 +61,6 @@ use crate::{
     swim_runtime::{PeerPins, SwimHandle},
 };
 
-
 // ---------------------------------------------------------------------------
 // Operator context
 // ---------------------------------------------------------------------------
@@ -712,6 +711,7 @@ async fn scrape_providers(ctx: &OperatorCtx, client: &Client, providers: &[Infer
         providers,
         Some(client),
         &ctx.readiness,
+        ctx.site_name(),
     ))
     .await;
     ctx.record_scrape_pass(network_name, scrape_started.elapsed());
@@ -1349,12 +1349,33 @@ fn site_pins(site: &GridSite, pinned: bool) -> Vec<String> {
 /// The cluster names this site owns: its providers' routing identities and the clusters its
 /// gateways name explicitly, none of which a peer's record may claim.
 fn reserved_clusters(network: &GridNetwork, providers: &[InferenceProvider]) -> std::collections::HashSet<String> {
+    let local_sites: StdHashSet<String> = network
+        .spec
+        .consumer_gateways
+        .iter()
+        .filter_map(|gateway| gateway.site_name.as_deref())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let site_claims = cluster_site_claims(network);
     let explicit = network
         .spec
         .consumer_gateways
         .iter()
         .filter_map(|gateway| gateway.praxis_config.as_ref())
-        .flat_map(|config| config.cluster_endpoints.iter().map(|entry| entry.cluster.clone()));
+        .flat_map(|config| config.cluster_endpoints.iter())
+        .filter_map(|entry| {
+            let endpoint_site = entry
+                .transport
+                .as_ref()
+                .and_then(|transport| peer_site_from_tls(&transport.mode, transport.sni.as_deref()));
+            let explicitly_remote = endpoint_site.as_ref().is_some_and(|site| {
+                !local_sites.contains(site)
+                    && site_claims
+                        .get(&entry.cluster)
+                        .is_some_and(|claims| claims.len() == 1 && claims.contains(site))
+            });
+            (!explicitly_remote).then(|| entry.cluster.clone())
+        });
     providers
         .iter()
         .filter_map(|provider| routing_overlay::routing_identity(provider).map(str::to_owned))
@@ -1362,18 +1383,57 @@ fn reserved_clusters(network: &GridNetwork, providers: &[InferenceProvider]) -> 
         .collect()
 }
 
-/// Each provider-hop cluster this site's gateways declare, bound to the site its SNI names, the
-/// only peer whose records may route through it.
+/// The site identities declared by each mutual-TLS serving endpoint.
+///
+/// A consumer `clusterEndpoints` entry names the same routing cluster a provider catalog
+/// publishes. Its SNI therefore binds that cluster to the site whose provider gateway it
+/// reaches. Keep the claim only when every `GatewayRef` agrees; an ambiguous cluster is reserved
+/// locally and cannot be claimed by a peer.
+fn cluster_site_claims(network: &GridNetwork) -> BTreeMap<String, BTreeSet<String>> {
+    let mut claims = BTreeMap::<String, BTreeSet<String>>::new();
+    for gateway in &network.spec.consumer_gateways {
+        for endpoint in &gateway.provider_hop_endpoints {
+            if let Some(site) = peer_site_from_tls(&endpoint.transport.mode, endpoint.transport.sni.as_deref()) {
+                claims.entry(endpoint.cluster.clone()).or_default().insert(site);
+            }
+        }
+        if let Some(config) = &gateway.praxis_config {
+            for endpoint in &config.cluster_endpoints {
+                let Some(site) = endpoint
+                    .transport
+                    .as_ref()
+                    .and_then(|transport| peer_site_from_tls(&transport.mode, transport.sni.as_deref()))
+                else {
+                    continue;
+                };
+                claims.entry(endpoint.cluster.clone()).or_default().insert(site);
+            }
+        }
+    }
+    claims
+}
+
+/// Site name carried by a mutual-TLS endpoint SNI, when it is a Grid site identity.
+fn peer_site_from_tls(mode: &TransportMode, sni: Option<&str>) -> Option<String> {
+    if mode != &TransportMode::MutualTls {
+        return None;
+    }
+    let sni = sni?.trim().to_ascii_lowercase();
+    sni.strip_suffix(&format!(".{}", certs::SPIFFE_TRUST_DOMAIN))
+        .filter(|site| !site.is_empty())
+        .map(str::to_owned)
+}
+
+/// Each gateway hop this site declares, bound to the one site its SNI names. Conflicting claims
+/// are omitted so peer admission fails closed.
 fn hop_sites(network: &GridNetwork) -> site_providers::ClusterSites {
-    network
-        .spec
-        .consumer_gateways
-        .iter()
-        .flat_map(|gateway| gateway.provider_hop_endpoints.iter())
-        .filter_map(|hop| {
-            let sni = hop.transport.sni.as_deref()?.trim().to_ascii_lowercase();
-            let site = sni.strip_suffix(&format!(".{}", certs::SPIFFE_TRUST_DOMAIN))?;
-            Some((hop.cluster.clone(), site.to_owned()))
+    cluster_site_claims(network)
+        .into_iter()
+        .filter_map(|(cluster, sites)| {
+            if sites.len() != 1 {
+                return None;
+            }
+            sites.into_iter().next().map(|site| (cluster, site))
         })
         .collect()
 }
@@ -1470,9 +1530,9 @@ pub async fn peer_tls_config(
 
 /// TLS for the signals listener, from the same material peers dial with.
 ///
-/// Client auth is optional on purpose: the co-located gateway connects with
-/// this site's own certificate and a peer presents its own, and that difference
-/// is what the scope rule reads.
+/// Client certificate authentication is required. The co-located gateway
+/// presents this site's own certificate, while a peer presents its own; the
+/// scope rule uses that difference to decide which signals it may read.
 ///
 /// # Errors
 ///
@@ -1816,7 +1876,6 @@ async fn publish_signed_site_cert(
         tracing::warn!(network = name, %error, "failed to publish site cert broadcast");
     }
 }
-
 
 /// Collect the currently verified peer certificates as a complete trust snapshot.
 ///
@@ -2387,42 +2446,76 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     if let Some(wait) = tls_retry {
         requeue_interval = requeue_interval.min(wait);
     }
-    // In poll mode, load travels the signals path:
-    // the operator neither scrapes providers for scoring nor lets a metric
-    // sample reach gossip or the overlay. An empty collection makes the overlay
-    // score neutrally (no load-driven reordering, no ConfigMap churn per scrape)
-    // and makes `publish_real_provider_state` carry no metrics into the gossiped
-    // record, so a scrape no longer mutates replicated state.
-    let collected = if ctx.signal_mode == SignalMode::Poll {
-        provider_metrics::CollectedMetrics::default()
+    let requested_strategy = network
+        .spec
+        .scoring_policy
+        .as_ref()
+        .map_or(crate::crd::grid_network::ScoringStrategy::NoMetrics, |policy| {
+            policy.strategy
+        });
+    let scoring_strategy = local_overlay_strategy(ctx.signal_mode, requested_strategy);
+
+    // Poll mode keeps its established no-local-scoring behavior for legacy
+    // strategies. DynamoRequestPressure is an explicit opt-in exception: its
+    // adapter samples are used only for this site's overlay and never sent to
+    // the legacy signal relay or exposed as llm-d BackendMetrics.
+    let should_collect_adapter = ctx.signal_mode == SignalMode::Poll
+        && requested_strategy == crate::crd::grid_network::ScoringStrategy::DynamoRequestPressure;
+    let poll_adapter_providers: Vec<InferenceProvider> = if should_collect_adapter {
+        providers
+            .iter()
+            .filter(|provider| {
+                provider
+                    .spec
+                    .metrics_config
+                    .as_ref()
+                    .is_some_and(|metrics| metrics.adapter.is_some())
+            })
+            .cloned()
+            .collect()
     } else {
-        provider_metrics::collect_provider_metrics_with_refresh_interval(
+        Vec::new()
+    };
+    let collected = if should_collect_overlay_metrics(ctx.signal_mode, requested_strategy) {
+        provider_metrics::collect_provider_metrics_with_refresh_interval_for_site(
             name,
-            &providers,
+            if should_collect_adapter {
+                &poll_adapter_providers
+            } else {
+                &providers
+            },
             &ctx.metrics_cache,
             Instant::now(),
             requeue_interval,
+            ctx.site_name(),
             Some(client),
         )
         .await
+    } else {
+        provider_metrics::CollectedMetrics::default()
     };
     let raw_metrics = collected.metrics;
+    let adapter_observations = collected.observations;
+    let adapter_identities: StdHashSet<String> = providers
+        .iter()
+        .filter(|provider| {
+            provider
+                .spec
+                .metrics_config
+                .as_ref()
+                .is_some_and(|metrics| metrics.adapter.is_some())
+        })
+        .filter_map(routing_overlay::routing_identity)
+        .map(str::to_owned)
+        .collect();
+    let scoring_metrics: HashMap<String, scoring::BackendMetrics> = raw_metrics
+        .iter()
+        .filter(|(identity, _metrics)| !adapter_identities.contains(*identity))
+        .map(|(identity, metrics)| (identity.clone(), *metrics))
+        .collect();
 
     // Admission is a controller decision held over time, not re-derived from a
-    // metric on every render. With the feature on there are no live metrics, so
-    // the strategy is `NoMetrics`: a provider present and not Unavailable is
-    // offered, and the gateway picks among them from the signal it polls.
-    let scoring_strategy = if ctx.signal_mode == SignalMode::Poll {
-        crate::crd::grid_network::ScoringStrategy::NoMetrics
-    } else {
-        network
-            .spec
-            .scoring_policy
-            .as_ref()
-            .map_or(crate::crd::grid_network::ScoringStrategy::NoMetrics, |policy| {
-                policy.strategy
-            })
-    };
+    // Adapter pressure has no legacy admission signal; adapter readiness stays explicit.
     let admission_policy =
         provider_admission::Policy::from_config(network.spec.admission_policy.as_ref(), scoring_strategy.into())
             .map_err(OperatorError::InvalidResource)?;
@@ -2457,7 +2550,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
                     .as_ref()
                     .and_then(|config| config.signal_names.kv_cache_utilization.as_ref())
                     .is_some(),
-                crate::crd::grid_network::ScoringStrategy::NoMetrics => false,
+                crate::crd::grid_network::ScoringStrategy::NoMetrics
+                | crate::crd::grid_network::ScoringStrategy::DynamoRequestPressure => false,
             };
             let observation = if signal_configured {
                 raw_metrics
@@ -2476,8 +2570,20 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
                 memory.evaluate(&memory_key, observation, admission_policy, now),
                 provider.spec.traffic_policy.as_ref().is_some_and(|p| p.drain),
             );
-            // Readiness gates admission whatever the scoring strategy, NoMetrics included.
-            let not_ready = provider_readiness(&ctx, provider, now).is_some_and(|verdict| verdict.reason.excludes());
+            // A fresh adapter `model_ready=0` gates admission. Unknown/stale/invalid adapter
+            // observations do not become idle samples; they fall back to the existing provider
+            // readiness and non-comparative route. Only explicit Poll-mode Dynamo pressure
+            // collection can produce a local adapter observation.
+            let adapter_not_ready = provider
+                .spec
+                .metrics_config
+                .as_ref()
+                .is_some_and(|config| config.adapter.is_some())
+                && adapter_observations
+                    .get(identity.as_str())
+                    .is_some_and(provider_metrics::freshly_reports_model_not_ready);
+            let not_ready = adapter_not_ready
+                || provider_readiness(&ctx, provider, now).is_some_and(|verdict| verdict.reason.excludes());
             let state = if not_ready {
                 crate::resources::geography::AdmissionState::Excluded
             } else {
@@ -2534,7 +2640,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &remote_crdt_providers,
         &remote_model_inventories,
         &ctx.served_models,
-        &raw_metrics,
+        &scoring_metrics,
+        &adapter_observations,
         &scoring_weights,
         &admission_states,
         serving.as_ref(),
@@ -2562,7 +2669,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
             &grid_id,
             &providers,
             &tool_providers,
-            &raw_metrics,
+            &scoring_metrics,
             &ctx.served_models,
         );
         log_capacity_changes(&ctx.logged, name, &providers);
@@ -3346,6 +3453,7 @@ async fn reconcile_routing_overlay_inner(
     remote_model_inventories: &[swim::ModelInventory],
     served_model_store: &served_models::ServedModelStore,
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
+    adapter_observations: &HashMap<String, grid_signals::provider_observation::ProviderModelObservation>,
     scoring_weights: &scoring::ScoringWeights,
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
     serving: Option<&ServingSource<'_>>,
@@ -3409,7 +3517,7 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let mut overlay = match routing_overlay::render_routing_overlay_with_admission(
+        let mut overlay = match routing_overlay::render_routing_overlay_with_adapter_observations(
             network,
             &sites,
             providers,
@@ -3429,6 +3537,7 @@ async fn reconcile_routing_overlay_inner(
             } else {
                 routing_overlay::CandidateExpirySupport::Unsupported
             },
+            Some(adapter_observations),
         ) {
             Ok(overlay) => overlay,
             Err(error) => {
@@ -3818,8 +3927,12 @@ fn serving_source<'ctx>(
         .iter()
         // The same plan signal publication scrapes by, so a provider it cannot scrape publishes none.
         .filter(|provider| provider_metrics::signal_scrape_plan(provider).is_none())
-        .filter_map(|provider| routing_overlay::routing_identity(provider))
-        .map(str::to_owned)
+        .flat_map(|provider| {
+            [routing_overlay::routing_identity(provider), provider.metadata.name.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(str::to_owned)
+        })
         .collect();
     Some(ServingSource {
         gate: &ctx.serving_writes,
@@ -4077,6 +4190,7 @@ fn render_serving_config(
         quiet_local: &source.quiet_local,
         zones: &source.zones,
         inject_local_credentials: matches!(hops, HopSource::Rendered(_)),
+        supports_provider_adapter_contract: gw_ref.supports_provider_adapter_contract(),
     };
     Ok(serving_config::render(overlay, &inputs))
 }
@@ -6216,7 +6330,47 @@ pub(crate) fn provider_state_from_kube(
         access_policy: access_policy_to_crdt(&provider.spec.access_policy),
         revision,
         writer_id: site_id.to_owned(),
+        adapter_contract: provider_adapter_contract(provider),
     })
+}
+
+/// Return the bounded adapter profile associated with this provider's current source revision.
+pub(crate) fn provider_adapter_contract(
+    provider: &InferenceProvider,
+) -> Option<grid_signals::provider_observation::ProviderAdapterContract> {
+    let adapter = provider.spec.metrics_config.as_ref()?.adapter.as_ref()?;
+    if provider.spec.models.len() != 1
+        || provider
+            .spec
+            .models
+            .first()
+            .is_none_or(|model| model.name != adapter.primary_model)
+    {
+        return None;
+    }
+    let provider_uid = provider.metadata.uid.as_deref()?.to_owned();
+    let provider_generation = u64::try_from(provider.metadata.generation?).ok()?;
+    let contract = match adapter.kind {
+        crate::crd::inference_provider::MetricsAdapterKind::DynamoFrontendV1 => {
+            let concurrency = adapter.concurrency.as_ref();
+            grid_signals::provider_observation::ProviderAdapterContract {
+                provider_id: provider.metadata.name.as_deref()?.to_owned(),
+                adapter_kind: "dynamo/frontend".to_owned(),
+                adapter_version: 1,
+                provider_uid,
+                provider_generation,
+                primary_model: adapter.primary_model.clone(),
+                model_scope: match adapter.scope {
+                    crate::crd::inference_provider::MetricsAdapterScope::DedicatedSingleModel => {
+                        "dedicatedSingleModel".to_owned()
+                    },
+                },
+                concurrency_profile: concurrency.map(|value| value.profile.clone()),
+                concurrency_capacity: concurrency.map(|value| value.capacity),
+            }
+        },
+    };
+    contract.is_valid().then_some(contract)
 }
 
 /// Return the monotonic-ish Kubernetes revision used for CRDT provider records.
@@ -6281,6 +6435,7 @@ fn tool_provider_state_from_kube(
         access_policy: access_policy_to_crdt(&provider.spec.access_policy),
         revision,
         writer_id: site_id.to_owned(),
+        adapter_contract: None,
     })
 }
 
@@ -7902,6 +8057,31 @@ fn requeue_interval_for_network(
     })
 }
 
+/// Select local overlay scoring from the grid signal transport and explicit strategy.
+///
+/// Poll mode keeps legacy local scoring disabled. A configured Dynamo pressure strategy is
+/// the opt-in exception because its local overlay score is independent of the peer signal
+/// projection consumed by the Gateway.
+fn local_overlay_strategy(
+    signal_mode: SignalMode,
+    requested: crate::crd::grid_network::ScoringStrategy,
+) -> crate::crd::grid_network::ScoringStrategy {
+    if signal_mode == SignalMode::Poll && requested != crate::crd::grid_network::ScoringStrategy::DynamoRequestPressure
+    {
+        crate::crd::grid_network::ScoringStrategy::NoMetrics
+    } else {
+        requested
+    }
+}
+
+/// Whether this controller pass scrapes local metrics for the overlay.
+fn should_collect_overlay_metrics(
+    signal_mode: SignalMode,
+    requested: crate::crd::grid_network::ScoringStrategy,
+) -> bool {
+    signal_mode != SignalMode::Poll || requested == crate::crd::grid_network::ScoringStrategy::DynamoRequestPressure
+}
+
 /// Parse the deliberately small duration format accepted by
 /// `metricsRefreshInterval`: seconds or milliseconds, with a one-second
 /// minimum.
@@ -7945,6 +8125,26 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 mod tests {
     use super::*;
     use crate::swim_endpoint::EndpointResolutionFailure;
+
+    #[test]
+    fn poll_mode_only_collects_metrics_for_the_explicit_dynamo_overlay_strategy() {
+        use crate::crd::grid_network::ScoringStrategy::{DynamoRequestPressure, NoMetrics, QueueDepth};
+
+        assert_eq!(
+            local_overlay_strategy(SignalMode::Poll, DynamoRequestPressure),
+            DynamoRequestPressure,
+            "the opt-in Dynamo overlay score is local and does not change the peer signal contract"
+        );
+        assert!(should_collect_overlay_metrics(SignalMode::Poll, DynamoRequestPressure));
+        assert_eq!(
+            local_overlay_strategy(SignalMode::Poll, QueueDepth),
+            NoMetrics,
+            "legacy poll-mode scoring remains disabled"
+        );
+        assert!(!should_collect_overlay_metrics(SignalMode::Poll, QueueDepth));
+        assert_eq!(local_overlay_strategy(SignalMode::Gossip, QueueDepth), QueueDepth);
+        assert!(should_collect_overlay_metrics(SignalMode::Gossip, QueueDepth));
+    }
 
     #[test]
     fn a_provider_not_ready_publishes_ready_zero_without_a_fresh_scrape() {
@@ -9067,6 +9267,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site_id.to_owned(),
+            adapter_contract: None,
         }
     }
 
@@ -9089,6 +9290,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site_id.to_owned(),
+            adapter_contract: None,
         }
     }
 
@@ -9500,6 +9702,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "writer-1".to_owned(),
+            adapter_contract: None,
         }
     }
 
@@ -11733,6 +11936,74 @@ mod tests {
         assert_eq!(reserved.len(), 2);
     }
 
+    #[test]
+    fn mutual_tls_cluster_endpoint_binds_a_remote_provider_to_its_site() {
+        let mut network = network_with_endpoint_transport("mutual_tls", Some("remote.grid.internal"));
+        network
+            .spec
+            .consumer_gateways
+            .first_mut()
+            .unwrap_or_else(|| std::process::abort())
+            .site_name = Some("local".to_owned());
+        let provider = make_provider("vllm-a", "glb-demo", "local_model", 1);
+        let cluster = "sim-provider-us-west";
+        let reserved = reserved_clusters(&network, std::slice::from_ref(&provider));
+
+        assert!(
+            !reserved.contains(cluster),
+            "a uniquely site-bound remote hop is not local: {reserved:?}"
+        );
+        assert_eq!(hop_sites(&network).get(cluster).map(String::as_str), Some("remote"));
+
+        let mut local = network_with_endpoint_transport("mutual_tls", Some("local.grid.internal"));
+        local
+            .spec
+            .consumer_gateways
+            .first_mut()
+            .unwrap_or_else(|| std::process::abort())
+            .site_name = Some("local".to_owned());
+        assert!(
+            reserved_clusters(&local, &[provider]).contains(cluster),
+            "the local hop stays reserved"
+        );
+    }
+
+    #[test]
+    fn conflicting_gateway_sni_claims_reserve_the_cluster_and_withhold_its_hop() {
+        let mut network = network_with_endpoint_transport("mutual_tls", Some("east.grid.internal"));
+        network
+            .spec
+            .consumer_gateways
+            .first_mut()
+            .unwrap_or_else(|| std::process::abort())
+            .site_name = Some("local".to_owned());
+        let mut conflicting = network
+            .spec
+            .consumer_gateways
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::process::abort());
+        let transport = conflicting
+            .praxis_config
+            .as_mut()
+            .and_then(|config| config.cluster_endpoints.first_mut())
+            .and_then(|endpoint| endpoint.transport.as_mut())
+            .unwrap_or_else(|| std::process::abort());
+        transport.sni = Some("west.grid.internal".to_owned());
+        network.spec.consumer_gateways.push(conflicting);
+
+        let provider = make_provider("vllm-a", "glb-demo", "local_model", 1);
+        let cluster = "sim-provider-us-west";
+        assert!(
+            reserved_clusters(&network, &[provider]).contains(cluster),
+            "conflicting endpoint claims fail closed"
+        );
+        assert!(
+            !hop_sites(&network).contains_key(cluster),
+            "no peer gets an ambiguous hop"
+        );
+    }
+
     fn network_with_endpoint_transport(mode: &str, sni: Option<&str>) -> GridNetwork {
         let transport = match sni {
             Some(sni) => serde_json::json!({"mode": mode, "sni": sni}),
@@ -12226,6 +12497,7 @@ mod tests {
             namespace: ns.to_owned(),
             site_name: None,
             model_discovery_contract_version: None,
+            provider_adapter_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,
         }
@@ -14333,6 +14605,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site_id.to_owned(),
+            adapter_contract: None,
         }
     }
 
@@ -15053,6 +15326,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 5,
             writer_id: "site-a".to_owned(),
+            adapter_contract: None,
         };
         upsert_provider_with_capabilities(&mut snap, &mut max_rev, state);
         assert_eq!(max_rev, 5);
@@ -15083,6 +15357,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 3,
             writer_id: "site-a".to_owned(),
+            adapter_contract: None,
         };
         upsert_provider_with_capabilities(&mut snap, &mut max_rev, state);
         assert!(
@@ -15124,6 +15399,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-a".to_owned(),
+            adapter_contract: None,
         });
         let mut broadcast = swim::StateBroadcast::new("site-a".to_owned(), 1, snap, None)
             .with_grid_id(Some("grid".to_owned()))
@@ -15166,6 +15442,7 @@ mod tests {
             access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-a".to_owned(),
+            adapter_contract: None,
         });
         for index in 0..32 {
             snap.upsert_provider(crdt::ProviderState {
@@ -15182,6 +15459,7 @@ mod tests {
                 access_policy: crdt::ProviderAccessPolicy::default(),
                 revision: 1,
                 writer_id: "site-a".to_owned(),
+                adapter_contract: None,
             });
         }
         let mut broadcast =

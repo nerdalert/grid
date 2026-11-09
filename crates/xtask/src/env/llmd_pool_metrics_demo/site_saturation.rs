@@ -11,9 +11,8 @@ use std::{
 };
 
 use super::{
-    DemoContext, GRID_SERVING_GATEWAY, GRID_SERVING_METRICS_PORT, GRID_SERVING_SITE, GRID_SYSTEM_NS, MetricsTransport,
-    ProofResult, VCR_MODEL,
-    cross_site::{read_gateway_metrics, sample_value, start_ready_port_forward},
+    DemoContext, GRID_SERVING_SITE, GRID_SYSTEM_NS, MetricsTransport, ProofResult, VCR_MODEL,
+    cross_site::{read_gateway_metrics, sample_value, start_ready_gateway_metrics_port_forward},
     format_utc_iso, kind_context, kubectl_exec_epp_metrics, set_simulator_fake_metrics,
 };
 
@@ -119,11 +118,7 @@ pub(super) fn proof(context: &DemoContext) -> ProofResult {
 /// Every proof step, in order; the caller restores state whatever this returns.
 fn run(mtls: bool, original_replicas: u64, observations: &mut Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let local = kind_context(GRID_SERVING_SITE);
-    let (port, _forward) = start_ready_port_forward(
-        &local,
-        &format!("{GRID_SERVING_GATEWAY}-metrics"),
-        GRID_SERVING_METRICS_PORT,
-    )?;
+    let (port, _forward) = start_ready_gateway_metrics_port_forward(&local)?;
     moderate_load(port, mtls, observations)?;
     weight_follows_units(port, mtls, original_replicas, observations)?;
     spent_cache_is_not_full(port, mtls, observations)?;

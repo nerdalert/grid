@@ -545,6 +545,7 @@ fn as_serving(config: &ProviderConfig) -> GridServingConfig {
                 admission: AdmissionState::NewAndExisting,
                 cluster: candidate.cluster.clone(),
                 credential: None,
+                adapter_contract: None,
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
                 name: candidate.name.clone(),

@@ -10,13 +10,13 @@ cargo xtask env run-grid-llmd-pool-metrics-demo \
   --quick --teardown
 ```
 
-Quick mode proves the local EPP scrape, score changes, overlay propagation,
-and routing recovery. Full mode also deploys the source-built Grid Gateway and
-proves that each site's EPP signals cross the operator mTLS poll relay, reach
-the Gateway through its local operator, and change live site selection without
-a Gateway restart. It also checks that a stale local signal is excluded while
-SWIM remains connected and that a peer with the wrong pinned identity cannot
-replace an accepted signal.
+Quick mode proves the local EPP metric and model-provenance path and sends an
+attributed baseline request. Full mode also deploys the source-built Grid
+Gateway and proves that each site's EPP signals cross the operator mTLS poll
+relay, reach the Gateway through its local operator, and change live site
+selection without a Gateway restart. Pressure and recovery, stale-signal
+exclusion while SWIM remains connected, and rejection of a peer with the wrong
+pinned identity are full-mode checks.
 
 Build the Grid operator and Gateway from this checkout before a full local run:
 
@@ -52,9 +52,10 @@ a learned ceiling. The proof restores simulator load and replica counts on
 success and failure.
 
 For pressure-driven routing, the full-mode cross-site proof checks the live
-Gateway queue-score order and compares attributed responses with its measured
-two-site capacity-weighted share. This preserves the routing assertion after
-Grid's selector began weighting capacity and smoothed saturation.
+Gateway queue-score order, the active two-site weighted-selector path, and
+provider/site/backend attribution. A small sample must include attributed
+responses from both eligible sites; its observed share is context only and does
+not qualify weighted-share precision.
 
 The cross-site proof uses two waiting requests per simulator endpoint against
 the topology's queue capacity of four. That changes the EPP queue score while
@@ -68,8 +69,8 @@ In the cross-site proof, both scoring flavors report KV-cache usage of `0.6`
 for the pressured site's endpoints. EPP queue depth remains the Grid score/rank
 stimulus; the KV reading gives the Gateway's capacity-weighted selector a
 measurable `rho` of `0.75`, below the `0.8` share at which a pool reads full, so
-both sites remain eligible and the attributed request sample still has to match
-the Gateway's observed weighted share.
+both sites remain eligible. The attributed sample records which site handled
+each request, but weighted-share precision is not a qualification assertion.
 
 The qualification uses upstream `llm-d-inference-sim` as the inference
 backend. Each simulator's startup `fake-metrics` values are mounted from its own

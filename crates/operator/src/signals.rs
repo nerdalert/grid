@@ -258,7 +258,9 @@ fn parse_labels(rest: &str) -> Option<(BTreeMap<String, String>, &str)> {
         let (name, tail) = split_label_name(s)?;
         let tail = tail.trim_start().strip_prefix('=')?.trim_start();
         let (value, tail) = parse_label_value(tail)?;
-        labels.insert(name.to_owned(), value);
+        if labels.insert(name.to_owned(), value).is_some() {
+            return None;
+        }
         s = tail.trim_start();
         s = s.strip_prefix(',').unwrap_or(s);
     }
@@ -2059,7 +2061,7 @@ fn with_query(url: &str, query: &str) -> Option<String> {
 /// Names a hub keeps from a peer: the cross-site contract, plus the EPP pool averages and
 /// ready counts the gateway routes on until it routes on saturation. A peer's custom
 /// `signalNames` are dropped here.
-const PEER_SIGNAL_NAMES: [&str; 21] = [
+const PEER_SIGNAL_NAMES: [&str; 24] = [
     grid_signals::revision::METRIC,
     crate::readiness::READY_SIGNAL,
     crate::readiness::READY_ENDPOINTS_SIGNAL,
@@ -2087,6 +2089,9 @@ const PEER_SIGNAL_NAMES: [&str; 21] = [
     // The EPP's own detector reading, published only with flow control on, preferred by the
     // gateway over its own approximation. Not a share: it reads above one when oversubscribed.
     "llm_d_epp_flow_control_pool_saturation",
+    grid_signals::provider_observation::DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+    grid_signals::provider_observation::DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+    grid_signals::provider_observation::DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC,
 ];
 
 /// Most providers a hub keeps from one peer, so a peer cannot grow the hub's series without
@@ -2094,7 +2099,7 @@ const PEER_SIGNAL_NAMES: [&str; 21] = [
 pub const MAX_PEER_PROVIDERS: usize = 64;
 
 /// Signals that are shares, which a peer may not report above one.
-const UNIT_SIGNALS: [&str; 5] = [
+const UNIT_SIGNALS: [&str; 6] = [
     crate::readiness::READY_SIGNAL,
     crate::latency::ERROR_RATIO_SIGNAL,
     // KV utilization is a fraction, and a provider publishing a percentage would otherwise
@@ -2102,6 +2107,7 @@ const UNIT_SIGNALS: [&str; 5] = [
     "llm_d_epp_average_kv_cache_utilization",
     "inference_pool_average_kv_cache_utilization",
     "llm_d_epp_std_dev_kv_cache_utilization",
+    grid_signals::provider_observation::DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
 ];
 
 /// Whether a hub accepts the value: finite, non-negative, and at most one for a share.
@@ -2109,6 +2115,94 @@ fn in_range(observation: &Observation) -> bool {
     observation.value.is_finite()
         && observation.value >= 0.0
         && (observation.value <= 1.0 || !UNIT_SIGNALS.contains(&observation.metric.as_str()))
+}
+
+/// Enforce the fixed label vocabulary for versioned Dynamo series. The model
+/// is bound by the adapter contract on the candidate; the single-model scope
+/// keeps these provider-level samples unambiguous after label-free storage.
+fn canonical_dynamo_labels_valid(observation: &Observation) -> bool {
+    use grid_signals::provider_observation::{
+        ADAPTER_KIND_LABEL, ADAPTER_VERSION_LABEL, DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+        DYNAMO_FRONTEND_V1_MODEL_READY_METRIC, DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC, MODEL_LABEL,
+        MODEL_SCOPE_LABEL, PROVIDER_GENERATION_LABEL, PROVIDER_UID_LABEL,
+    };
+
+    let valid_label = |value: &str, max: usize, allow_empty: bool| {
+        value.len() <= max && (allow_empty || !value.trim().is_empty()) && !value.chars().any(char::is_control)
+    };
+    let identity_labels = [
+        ADAPTER_KIND_LABEL,
+        ADAPTER_VERSION_LABEL,
+        PROVIDER_UID_LABEL,
+        PROVIDER_GENERATION_LABEL,
+        MODEL_LABEL,
+        MODEL_SCOPE_LABEL,
+    ];
+    let identity_is_valid = || {
+        observation
+            .labels
+            .get(ADAPTER_KIND_LABEL)
+            .is_some_and(|value| value == "dynamo/frontend")
+            && observation
+                .labels
+                .get(ADAPTER_VERSION_LABEL)
+                .is_some_and(|value| value == "1")
+            && observation
+                .labels
+                .get(PROVIDER_UID_LABEL)
+                .is_some_and(|value| grid_signals::revision::valid_id(value))
+            && observation
+                .labels
+                .get(PROVIDER_GENERATION_LABEL)
+                .and_then(|value| grid_signals::revision::positive_integer(value))
+                .is_some_and(|generation| generation <= grid_signals::revision::MAX_GENERATION)
+            && observation
+                .labels
+                .get(MODEL_LABEL)
+                .is_some_and(|value| valid_label(value, 256, false))
+            && observation
+                .labels
+                .get(MODEL_SCOPE_LABEL)
+                .is_some_and(|value| value == "dedicatedSingleModel")
+    };
+    let exact_labels = |extras: &[&str]| {
+        observation.labels.len() == 2 + identity_labels.len() + extras.len()
+            && observation.labels.contains_key(SITE_LABEL)
+            && observation.labels.contains_key(PROVIDER_LABEL)
+            && identity_labels
+                .iter()
+                .all(|name| observation.labels.contains_key(*name))
+            && extras.iter().all(|name| observation.labels.contains_key(*name))
+            && observation.labels.keys().all(|name| {
+                name == SITE_LABEL
+                    || name == PROVIDER_LABEL
+                    || identity_labels.contains(&name.as_str())
+                    || extras.contains(&name.as_str())
+            })
+            && identity_is_valid()
+    };
+    let exact_integer_count = observation.value.fract() == 0.0 && observation.value <= 9_007_199_254_740_991.0;
+    match observation.metric.as_str() {
+        DYNAMO_FRONTEND_V1_MODEL_READY_METRIC => {
+            exact_labels(&[])
+                && (observation.value.to_bits() == 0.0_f64.to_bits()
+                    || observation.value.to_bits() == 1.0_f64.to_bits())
+        },
+        DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC => exact_labels(&[]) && exact_integer_count,
+        DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC => {
+            exact_labels(&["stage", "phase"])
+                && exact_integer_count
+                && observation
+                    .labels
+                    .get("stage")
+                    .is_some_and(|value| valid_label(value, 128, false))
+                && observation
+                    .labels
+                    .get("phase")
+                    .is_some_and(|value| valid_label(value, 128, true))
+        },
+        _ => true,
+    }
 }
 
 /// Most bytes in a `grid_provider` label a hub keeps, as a routing cluster name is bounded.
@@ -2134,6 +2228,8 @@ fn refusal(observation: &Observation) -> Option<&'static str> {
         .is_none_or(|provider| !valid_provider(provider))
     {
         Some("provider")
+    } else if !canonical_dynamo_labels_valid(observation) {
+        Some("labels")
     } else if !in_range(observation) {
         Some("value")
     } else {
@@ -2501,12 +2597,47 @@ mod tests {
 
     /// A peer observation of `metric` for `provider` with `value`.
     fn peer_sample(metric: &str, provider: &str, value: f64) -> Observation {
+        let mut labels = BTreeMap::from([
+            (SITE_LABEL.to_owned(), "retail".to_owned()),
+            (PROVIDER_LABEL.to_owned(), provider.to_owned()),
+        ]);
+        if [
+            grid_signals::provider_observation::DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+            grid_signals::provider_observation::DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC,
+            grid_signals::provider_observation::DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC,
+        ]
+        .contains(&metric)
+        {
+            labels.extend([
+                (
+                    grid_signals::provider_observation::ADAPTER_KIND_LABEL.to_owned(),
+                    "dynamo/frontend".to_owned(),
+                ),
+                (
+                    grid_signals::provider_observation::ADAPTER_VERSION_LABEL.to_owned(),
+                    "1".to_owned(),
+                ),
+                (
+                    grid_signals::provider_observation::PROVIDER_UID_LABEL.to_owned(),
+                    "uid-dynamo".to_owned(),
+                ),
+                (
+                    grid_signals::provider_observation::PROVIDER_GENERATION_LABEL.to_owned(),
+                    "1".to_owned(),
+                ),
+                (
+                    grid_signals::provider_observation::MODEL_LABEL.to_owned(),
+                    "model-a".to_owned(),
+                ),
+                (
+                    grid_signals::provider_observation::MODEL_SCOPE_LABEL.to_owned(),
+                    "dedicatedSingleModel".to_owned(),
+                ),
+            ]);
+        }
         Observation {
             metric: metric.to_owned(),
-            labels: BTreeMap::from([
-                (SITE_LABEL.to_owned(), "retail".to_owned()),
-                (PROVIDER_LABEL.to_owned(), provider.to_owned()),
-            ]),
+            labels,
             value,
             timestamp_ms: None,
             age: Duration::ZERO,
@@ -4621,6 +4752,54 @@ q{pool=\"d\"} 0.35
                 "{name} is a share the gateway refuses above one, but a hub accepts any value"
             );
         }
+    }
+
+    #[test]
+    fn canonical_dynamo_peer_signals_are_versioned_and_label_bounded() {
+        use grid_signals::provider_observation::{
+            DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, DYNAMO_FRONTEND_V1_MODEL_READY_METRIC,
+            DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC,
+        };
+
+        let ready = peer_sample(DYNAMO_FRONTEND_V1_MODEL_READY_METRIC, "pool-a", 1.0);
+        let active = peer_sample(DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, "pool-a", 4.0);
+        let mut stage = peer_sample(DYNAMO_FRONTEND_V1_STAGE_REQUESTS_METRIC, "pool-a", 3.0);
+        stage.labels.insert("stage".to_owned(), "dispatch".to_owned());
+        stage.labels.insert("phase".to_owned(), "aggregated".to_owned());
+        for sample in [&ready, &active, &stage] {
+            assert!(PEER_SIGNAL_NAMES.contains(&sample.metric.as_str()));
+            assert_eq!(refusal(sample), None, "valid canonical sample is relayed: {sample:?}");
+        }
+
+        let invalid_readiness = peer_sample(DYNAMO_FRONTEND_V1_MODEL_READY_METRIC, "pool-a", 0.5);
+        assert_eq!(refusal(&invalid_readiness), Some("labels"), "readiness is a strict bit");
+        let fractional_active = peer_sample(DYNAMO_FRONTEND_V1_ACTIVE_REQUESTS_METRIC, "pool-a", 1.5);
+        assert_eq!(
+            refusal(&fractional_active),
+            Some("labels"),
+            "request counts are exact integers"
+        );
+        let mut extra = active;
+        extra.labels.insert("model".to_owned(), "unexpected".to_owned());
+        assert_eq!(
+            refusal(&extra),
+            Some("labels"),
+            "unknown model labels cannot be folded away"
+        );
+        let mut long_stage = stage;
+        long_stage.labels.insert("stage".to_owned(), "x".repeat(129));
+        assert_eq!(
+            refusal(&long_stage),
+            Some("labels"),
+            "stage cardinality labels are bounded"
+        );
+        let duplicate = format!(
+            "{DYNAMO_FRONTEND_V1_MODEL_READY_METRIC}{{grid_site=\"retail\",grid_provider=\"pool-a\",grid_adapter_kind=\"dynamo/frontend\",grid_adapter_version=\"1\",grid_provider_uid=\"uid-dynamo\",grid_provider_generation=\"1\",grid_model=\"model-a\",grid_model=\"other\",grid_model_scope=\"dedicatedSingleModel\"}} 1 1000"
+        );
+        assert!(
+            parse(&duplicate).is_empty(),
+            "duplicate labels cannot be hidden by map insertion"
+        );
     }
 
     #[test]

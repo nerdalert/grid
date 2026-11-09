@@ -8,6 +8,12 @@
 
 pub mod exposition;
 
+/// Canonical provider and model observations shared by the operator and gateway.
+pub mod provider_observation;
+
+/// Strict parser for the version-pinned Dynamo Frontend metrics contract.
+pub mod dynamo_frontend;
+
 /// Gateway ingest feedback wire vocabulary.
 pub mod feedback;
 

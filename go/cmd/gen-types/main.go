@@ -9,7 +9,6 @@
 //
 //   - zz_generated_types.go   -  struct/enum type definitions
 //   - zz_generated_deepcopy.go  -  DeepCopyInto / DeepCopy / DeepCopyObject
-//
 package main
 
 import (
@@ -82,7 +81,6 @@ type goDef struct {
 	IsEnum     bool
 	EnumValues []string
 }
-
 
 // ---------------------------------------------------------------------------
 // Registry
@@ -579,7 +577,6 @@ func isMapType(goType string) bool {
 	return strings.HasPrefix(goType, "map[")
 }
 
-
 func derefType(goType string) string {
 	return strings.TrimPrefix(goType, "*")
 }
@@ -766,7 +763,7 @@ func wellKnownEnumName(schema schemaNode, proposedName string) string {
 		return "SignalMode"
 	case "geographyFirst,scoreFirst":
 		return "RoutingPolicy"
-	case "kvCachePressure,noMetrics,queueDepth":
+	case "dynamoRequestPressure,kvCachePressure,noMetrics,queueDepth":
 		return "ScoringStrategy"
 	case "pin,spiffe":
 		return "PeerTrustMode"
@@ -958,10 +955,11 @@ func emitEnum(b *bytes.Buffer, d goDef) {
 }
 
 // enumConstSuffix converts an enum value to a Go constant suffix.
-// snake_case segments that match a known acronym are fully uppercased.
-// e.g., "api_key" -> "APIKey", "bearer_token" -> "BearerToken"
+// Snake-case, hyphenated, and slash-separated segments that match a known
+// acronym are fully uppercased. For example, "api_key" becomes "APIKey" and
+// "dynamo/frontend-v1" becomes "DynamoFrontendV1".
 func enumConstSuffix(v string) string {
-	parts := strings.FieldsFunc(v, func(r rune) bool { return r == '_' || r == '-' })
+	parts := strings.FieldsFunc(v, func(r rune) bool { return r == '_' || r == '-' || r == '/' })
 	var sb strings.Builder
 	for _, p := range parts {
 		if len(p) == 0 {

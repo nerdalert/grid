@@ -1286,6 +1286,7 @@ fn the_peer_catalog_keys_clusters_by_the_site_the_record_names() {
         access_policy: crdt::ProviderAccessPolicy::default(),
         revision: 1,
         writer_id: site.to_owned(),
+        adapter_contract: None,
     };
     let records = [record("site-b", "x"), record("site-b", "y"), record("site-c", "x")];
     assert_eq!(

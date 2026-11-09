@@ -98,6 +98,16 @@ tests:
       - notExists:
           path: spec.scoringPolicy
 
+  - it: renders the Dynamo request pressure scoring policy
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.scoringPolicy.strategy: dynamoRequestPressure
+    asserts:
+      - equal:
+          path: spec.scoringPolicy.strategy
+          value: dynamoRequestPressure
+
   - it: renders budgetPolicy.tenants verbatim when set
     set:
       gridNetwork.name: prod-grid

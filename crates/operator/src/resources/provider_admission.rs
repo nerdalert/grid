@@ -49,7 +49,7 @@ impl From<ScoringStrategy> for PressureSignal {
         match strategy {
             ScoringStrategy::QueueDepth => Self::QueueDepth,
             ScoringStrategy::KvCachePressure => Self::KvCachePressure,
-            ScoringStrategy::NoMetrics => Self::None,
+            ScoringStrategy::NoMetrics | ScoringStrategy::DynamoRequestPressure => Self::None,
         }
     }
 }

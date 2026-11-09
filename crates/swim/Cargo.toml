@@ -20,6 +20,7 @@ fips = ["dep:openssl"]
 aes-gcm = { workspace = true, optional = true }
 bincode = { workspace = true }
 crdt = { path = "../crdt" }
+grid-signals = { path = "../signals" }
 foca = { workspace = true }
 # foca 1.x uses rand 0.9's RNG traits, which are incompatible with rand 0.10.
 rand09 = { workspace = true }

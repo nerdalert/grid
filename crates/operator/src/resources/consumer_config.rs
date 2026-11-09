@@ -1842,6 +1842,7 @@ mod tests {
             quiet_local: &none,
             zones,
             inject_local_credentials: true,
+            supports_provider_adapter_contract: false,
         };
         crate::resources::serving_config::to_text(&crate::resources::serving_config::render(overlay, &inputs))
             .expect("serving text")
@@ -1903,6 +1904,7 @@ mod tests {
             quiet_local: &none,
             zones: &BTreeMap::new(),
             inject_local_credentials: false,
+            supports_provider_adapter_contract: false,
         };
         let serving = crate::resources::serving_config::render(overlay, &inputs);
         crate::resources::serving_config::to_text(&crate::resources::serving_config::render_dials(&serving, &dials))
@@ -2385,6 +2387,7 @@ mod tests {
             fresh,
             expires_at: None,
             credential: None,
+            adapter_contract: None,
             stable_id: None,
             admission_state: None,
             selection_tier: None,
@@ -2421,6 +2424,7 @@ mod tests {
                     key: secret_key.to_owned(),
                 },
             }),
+            adapter_contract: None,
             stable_id: None,
             admission_state: None,
             selection_tier: None,

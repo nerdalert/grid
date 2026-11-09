@@ -230,6 +230,7 @@ fn config(spec: &SiteSpec) -> CandidateConfig {
         admission: AdmissionState::NewAndExisting,
         cluster: format!("pool-{}", spec.site),
         credential: None,
+        adapter_contract: None,
         fresh: true,
         kind: CapabilityKind::InferenceModel,
         name: MODEL.to_owned(),
@@ -1470,7 +1471,6 @@ mod tests {
              taught: {large:?} against {small:?}"
         );
     }
-
 
     /// The same growth for a site that publishes no fullness, so it is read by learned bounds:
     /// a hard bound the two-unit pool taught from a sustained backlog must not hold the

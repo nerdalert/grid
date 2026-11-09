@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 serde = { workspace = true }
+grid-signals = { path = "../signals" }
 
 [dev-dependencies]
 bincode = { workspace = true }

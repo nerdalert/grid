@@ -756,6 +756,10 @@ func (in *GridNetworkConsumerGatewaysItem) DeepCopyInto(out *GridNetworkConsumer
 		out.PraxisConfig = new(GridNetworkConsumerGatewaysItemPraxisConfig)
 		in.PraxisConfig.DeepCopyInto(out.PraxisConfig)
 	}
+	if in.ProviderAdapterContractVersion != nil {
+		x := *in.ProviderAdapterContractVersion
+		out.ProviderAdapterContractVersion = &x
+	}
 	if in.ProviderHopEndpoints != nil {
 		out.ProviderHopEndpoints = make([]GridNetworkConsumerGatewaysItemProviderHopEndpointsItem, len(in.ProviderHopEndpoints))
 		for i := range in.ProviderHopEndpoints {
@@ -1331,6 +1335,40 @@ func (in *HealthCheckConfig) DeepCopy() *HealthCheckConfig {
 	return out
 }
 
+func (in *InferenceProviderMetricsConfigAdapterConcurrency) DeepCopyInto(out *InferenceProviderMetricsConfigAdapterConcurrency) {
+	*out = *in
+}
+
+func (in *InferenceProviderMetricsConfigAdapterConcurrency) DeepCopy() *InferenceProviderMetricsConfigAdapterConcurrency {
+	if in == nil {
+		return nil
+	}
+	out := new(InferenceProviderMetricsConfigAdapterConcurrency)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *InferenceProviderMetricsConfigAdapter) DeepCopyInto(out *InferenceProviderMetricsConfigAdapter) {
+	*out = *in
+	if in.Concurrency != nil {
+		out.Concurrency = new(InferenceProviderMetricsConfigAdapterConcurrency)
+		in.Concurrency.DeepCopyInto(out.Concurrency)
+	}
+	if in.ModelAliases != nil {
+		out.ModelAliases = make([]string, len(in.ModelAliases))
+		copy(out.ModelAliases, in.ModelAliases)
+	}
+}
+
+func (in *InferenceProviderMetricsConfigAdapter) DeepCopy() *InferenceProviderMetricsConfigAdapter {
+	if in == nil {
+		return nil
+	}
+	out := new(InferenceProviderMetricsConfigAdapter)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *MetricsAuth) DeepCopyInto(out *MetricsAuth) {
 	*out = *in
 	if in.AllowPlaintext != nil {
@@ -1391,6 +1429,10 @@ func (in *MetricSignalNames) DeepCopy() *MetricSignalNames {
 
 func (in *MetricsConfig) DeepCopyInto(out *MetricsConfig) {
 	*out = *in
+	if in.Adapter != nil {
+		out.Adapter = new(InferenceProviderMetricsConfigAdapter)
+		in.Adapter.DeepCopyInto(out.Adapter)
+	}
 	if in.Auth != nil {
 		out.Auth = new(MetricsAuth)
 		in.Auth.DeepCopyInto(out.Auth)

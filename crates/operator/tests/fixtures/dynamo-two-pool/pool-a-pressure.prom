@@ -1,0 +1,7 @@
+# Captured from a real Dynamo v1.6.1 Frontend /metrics endpoint under load.
+# Image: nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.6.1@sha256:f69ac8f2165289e0f9d06aa125fac8bda3a401b42f640235fca28b0c852b9875.
+dynamo_frontend_active_requests{model="Qwen/Qwen3-0.6B"} 4
+dynamo_frontend_model_ready{model="Qwen/Qwen3-0.6B"} 1
+dynamo_frontend_stage_requests{phase="",stage="preprocess"} 0
+dynamo_frontend_stage_requests{phase="aggregated",stage="dispatch"} 0
+dynamo_frontend_stage_requests{phase="aggregated",stage="route"} 0

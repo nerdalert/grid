@@ -182,13 +182,11 @@ pub struct TrafficPolicy {
 
 /// Prometheus metrics scraping configuration for an `InferenceProvider`.
 ///
-/// The operator scrapes `{spec.endpoint}{path}` (or `{endpoint}{path}`
-/// when set) and parses the Prometheus text using the `signal_names` mapping.
-/// Signals without a configured name receive the neutral default (`0.5`) in
-/// scoring. Plaintext scrape failures retain neutral-scoring compatibility
-/// behavior. When TLS is configured, a failed scrape uses a successful cached
-/// sample only within `stale_metrics_seconds`; after that the provider is
-/// marked unhealthy and excluded from routing.
+/// The operator scrapes the configured metrics URL. When `adapter` is absent,
+/// it parses using the legacy `signal_names` mapping and preserves the
+/// configured neutral-scoring and scrape-failure behavior. When an adapter is
+/// present, the versioned adapter owns model scope, units, readiness, and
+/// missing-data semantics.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[schemars(transform = add_metrics_config_legacy_fields)]
 #[serde(rename_all = "camelCase")]
@@ -218,6 +216,14 @@ pub struct MetricsConfig {
     /// values fall back to the default.
     #[serde(default = "default_metrics_timeout")]
     pub timeout: String,
+
+    /// Optional typed, versioned interpretation of the scraped metrics.
+    ///
+    /// Omission preserves the legacy signalNames parser and its llm-d
+    /// compatibility behavior. An adapter defines its own model scope,
+    /// readiness, units, and missing-data semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<MetricsAdapterConfig>,
 
     /// Mapping from scoring signal names to Prometheus metric names.
     ///
@@ -295,6 +301,62 @@ pub struct MetricsConfig {
     /// credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<MetricsAuth>,
+}
+
+/// Typed metrics adapter configuration for one provider pool.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MetricsAdapterConfig {
+    /// Versioned adapter contract.
+    pub kind: MetricsAdapterKind,
+
+    /// Required scope declaration for the adapter.
+    pub scope: MetricsAdapterScope,
+
+    /// Primary model name represented by the provider and its canonical observation.
+    #[schemars(length(min = 1, max = 253))]
+    pub primary_model: String,
+
+    /// Explicit metric-label aliases that map to primaryModel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_aliases: Vec<String>,
+
+    /// Optional, independently declared effective concurrency denominator.
+    ///
+    /// A matching profile and capacity are required before Dynamo request
+    /// pressure can be compared with another provider. The declaration is not
+    /// inferred from readiness, worker count, or queue metrics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<MetricsConcurrencyConfig>,
+}
+
+/// Supported versioned metrics adapter contracts.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum MetricsAdapterKind {
+    /// Dynamo Frontend version 1 model readiness and request gauges.
+    #[serde(rename = "dynamo/frontend-v1")]
+    DynamoFrontendV1,
+}
+
+/// Provider scope required by a metrics adapter.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MetricsAdapterScope {
+    /// A dedicated Dynamo Frontend serves exactly one primary model.
+    DedicatedSingleModel,
+}
+
+/// Independently declared effective concurrent-request capacity.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MetricsConcurrencyConfig {
+    /// Identifier for the shared request-accounting profile.
+    #[schemars(length(min = 1, max = 64))]
+    pub profile: String,
+
+    /// Effective concurrent requests for this pool under the named profile.
+    #[schemars(range(min = 1, max = 1_000_000))]
+    pub capacity: u32,
 }
 
 /// Credential the scraper presents on each metrics request.
@@ -1250,6 +1312,55 @@ mod tests {
             mc.signal_names.queue_depth.is_none(),
             "signal_names must default to all-None"
         );
+        assert!(mc.adapter.is_none(), "adapter must remain opt-in");
+    }
+
+    #[test]
+    fn dynamo_frontend_adapter_round_trips_without_changing_legacy_defaults() {
+        let json = serde_json::json!({
+            "path": "/metrics",
+            "timeout": "2s",
+            "signalNames": {},
+            "adapter": {
+                "kind": "dynamo/frontend-v1",
+                "scope": "dedicatedSingleModel",
+                "primaryModel": "Qwen/Qwen3-0.6B",
+                "modelAliases": ["qwen3"],
+                "concurrency": {
+                    "profile": "mock-concurrency-v1",
+                    "capacity": 4
+                }
+            }
+        });
+        let config: MetricsConfig = serde_json::from_value(json.clone()).unwrap_or_else(|_| std::process::abort());
+        let adapter = config.adapter.as_ref().unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            adapter.kind,
+            MetricsAdapterKind::DynamoFrontendV1,
+            "adapter kind is typed"
+        );
+        assert_eq!(adapter.primary_model, "Qwen/Qwen3-0.6B", "primary model is explicit");
+        assert_eq!(adapter.model_aliases, vec!["qwen3"], "label aliases are explicit");
+        assert_eq!(
+            adapter.concurrency.as_ref().map(|value| value.capacity),
+            Some(4),
+            "capacity is independently declared"
+        );
+        assert_eq!(
+            serde_json::to_value(config).unwrap_or_else(|_| std::process::abort()),
+            json,
+            "adapter configuration round-trips"
+        );
+    }
+
+    #[test]
+    fn unsupported_adapter_version_is_rejected() {
+        let result = serde_json::from_value::<MetricsAdapterConfig>(serde_json::json!({
+            "kind": "dynamo/frontend-v2",
+            "scope": "dedicatedSingleModel",
+            "primaryModel": "model-a"
+        }));
+        assert!(result.is_err(), "unknown adapter versions must be rejected");
     }
 
     #[test]
@@ -1296,6 +1407,7 @@ mod tests {
             timeout: "2s".to_owned(),
             signal_names: MetricSignalNames::default(),
             stale_metrics_seconds: None,
+            adapter: None,
             endpoint: None,
             pool_name: None,
             queue_capacity: None,
@@ -1307,6 +1419,7 @@ mod tests {
             serialised.get("staleMetricsSeconds").is_none(),
             "absent staleMetricsSeconds must not appear in serialised output"
         );
+        assert!(serialised.get("adapter").is_none(), "omitted adapter remains omitted");
     }
 
     // -----------------------------------------------------------------------

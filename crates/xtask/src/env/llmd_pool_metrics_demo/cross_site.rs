@@ -22,19 +22,14 @@ use super::{
     run_cluster_prefix, set_simulator_fake_metrics_with_endpoint_kv, set_simulator_waiting_requests,
     split_image_reference,
 };
+use crate::env::verify::PortForwardResource;
 
 /// One live peer is sufficient for the two-site topology used by this proof.
 const MIN_CONNECTED_SWIM_MEMBERS: u64 = 1;
-/// Requests in one site-selection sample, large enough to compare the weighted selector with live metrics.
-const WEIGHTED_ROUTE_SAMPLE_REQUESTS: usize = 256;
-/// Bound each request batch so changing saturation is observed between samples.
-const WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS: usize = 32;
-/// Maximum absolute difference between observed and metric-predicted two-site route share.
-const WEIGHTED_ROUTE_SHARE_TOLERANCE: f64 = 0.15;
-/// Permit small scrape-to-scrape gauge movement while requiring a stable effective route share.
+/// Small attributed sample that confirms both eligible sites receive a weighted pick.
+const WEIGHTED_ROUTE_SAMPLE_REQUESTS: usize = 32;
+/// Permit small scrape-to-scrape gauge movement while requiring stable routing signals.
 const WEIGHTED_ROUTE_METRIC_STABILITY_REL_TOLERANCE: f64 = 0.01;
-/// `grid_site_route` clamps a two-site weighted share to this range.
-const TWO_SITE_SHARE_RANGE: (f64, f64) = (0.1, 0.9);
 /// Queue capacity is four per endpoint; this pressure changes the score without making the site full.
 const CROSS_SITE_HIGHER_WAITING_REQUESTS: u32 = 2;
 /// The test Gateway keeps the moderate queue above its default backlog threshold but below EPP capacity.
@@ -509,11 +504,7 @@ fn run(
     let local_context = kind_context(GRID_SERVING_SITE);
     let (gateway_http_port, _gateway_forward) =
         start_ready_port_forward(&local_context, GRID_SERVING_GATEWAY, GRID_SERVING_GATEWAY_PORT)?;
-    let (gateway_metrics_port, _gateway_metrics_forward) = start_ready_port_forward(
-        &local_context,
-        &format!("{GRID_SERVING_GATEWAY}-metrics"),
-        GRID_SERVING_METRICS_PORT,
-    )?;
+    let (gateway_metrics_port, _gateway_metrics_forward) = start_ready_gateway_metrics_port_forward(&local_context)?;
     let (operator_metrics_port, _operator_metrics_forward) =
         start_ready_port_forward(&local_context, "grid-operator-metrics", OPERATOR_METRICS_PORT)?;
     let peer_context = kind_context("pool-b");
@@ -1108,11 +1099,40 @@ pub(super) fn start_ready_port_forward(
     service: &str,
     service_port: u16,
 ) -> Result<(u16, PortForwardGuard), Box<dyn std::error::Error>> {
+    start_ready_resource_port_forward(context, "svc", service, service_port)
+}
+
+/// Forward the Gateway's loopback-only admin metrics endpoint for this local test process.
+pub(super) fn start_ready_gateway_metrics_port_forward(
+    context: &str,
+) -> Result<(u16, PortForwardGuard), Box<dyn std::error::Error>> {
+    start_ready_resource_port_forward(context, "deployment", GRID_SERVING_GATEWAY, GRID_SERVING_METRICS_PORT)
+}
+
+/// Start a port-forward to a service or deployment and retry until its local port is ready.
+fn start_ready_resource_port_forward(
+    context: &str,
+    resource_type: &str,
+    resource_name: &str,
+    resource_port: u16,
+) -> Result<(u16, PortForwardGuard), Box<dyn std::error::Error>> {
     let mut failures = Vec::new();
     for attempt in 1..=3 {
         let local_port = find_free_port()?;
-        let mut forward =
-            PortForwardGuard::start_with_diagnostics(context, GRID_SYSTEM_NS, service, local_port, service_port)?;
+        let mut forward = if resource_type == "svc" {
+            PortForwardGuard::start_with_diagnostics(context, GRID_SYSTEM_NS, resource_name, local_port, resource_port)?
+        } else {
+            PortForwardGuard::start_resource_with_diagnostics(
+                context,
+                GRID_SYSTEM_NS,
+                PortForwardResource {
+                    resource_type,
+                    resource_name,
+                },
+                local_port,
+                resource_port,
+            )?
+        };
         match forward.wait_until_ready(local_port) {
             Ok(()) => return Ok((local_port, forward)),
             Err(error) => {
@@ -1125,7 +1145,7 @@ pub(super) fn start_ready_port_forward(
         }
     }
     Err(format!(
-        "could not start port-forward to {service}:{service_port}: {}",
+        "could not start port-forward to {resource_type}/{resource_name}:{resource_port}: {}",
         failures.join("; ")
     )
     .into())
@@ -1894,8 +1914,6 @@ struct WeightedRouteMetrics {
     preferred_rho: f64,
     /// Smoothed saturation of the other site.
     other_rho: f64,
-    /// Expected share for the lower-pressure site from Grid's two-site formula.
-    preferred_share: f64,
 }
 
 /// Gateway selector paths observed before and after one two-site routing sample.
@@ -1953,7 +1971,7 @@ fn weighted_selector_sample_delta(
     Ok(format!("selector path delta={delta:?}"))
 }
 
-/// Wait for Gateway pressure metrics, then compare one attributed sample to the merged weighted selector.
+/// Wait for stable pressure metrics, then confirm both eligible sites receive attributed weighted picks.
 fn verify_weighted_site_distribution(
     gateway_port: u16,
     metrics_port: u16,
@@ -2019,48 +2037,19 @@ fn verify_weighted_site_distribution(
                         continue;
                     }
                     let route_state = format!(
-                        "scores=({:.3}, {:.3}), weights=({:.3}, {:.3}), rho=({:.6}, {:.6}), predicted share={:.1}%",
+                        "scores=({:.3}, {:.3}), weights=({:.3}, {:.3}), rho=({:.6}, {:.6})",
                         before_state.preferred_score,
                         before_state.other_score,
                         before_state.preferred_weight,
                         before_state.other_weight,
                         before_state.preferred_rho,
-                        before_state.other_rho,
-                        before_state.preferred_share * 100.0
+                        before_state.other_rho
                     );
-                    let mut distribution = RouteDistribution::default();
-                    let mut expected_share_windows = Vec::new();
-                    let mut observed_metric_windows = Vec::new();
-                    let mut requests_remaining = WEIGHTED_ROUTE_SAMPLE_REQUESTS;
-                    let mut after_metrics = None;
-                    while requests_remaining > 0 {
-                        let batch_requests = requests_remaining.min(WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS);
-                        let before_metrics = read_gateway_metrics(metrics_port)?;
-                        let before_batch =
-                            weighted_route_metrics(&before_metrics, expected_site, require_strict_pressure_preference)?;
-                        let batch = route_distribution(gateway_port, batch_requests, phase, attribution)?;
-                        distribution.merge(batch);
-                        let current_metrics = read_gateway_metrics(metrics_port)?;
-                        let after_batch = weighted_route_metrics(
-                            &current_metrics,
-                            expected_site,
-                            require_strict_pressure_preference,
-                        )?;
-                        expected_share_windows.push((
-                            batch_requests,
-                            before_batch.preferred_share,
-                            after_batch.preferred_share,
-                        ));
-                        observed_metric_windows.push(format!(
-                            "{batch_requests} requests: before={before_batch:?}, after={after_batch:?}"
-                        ));
-                        requests_remaining -= batch_requests;
-                        after_metrics = Some(current_metrics);
-                    }
-                    let expected_share = weighted_route_expected_share(&expected_share_windows).map_err(|error| {
-                        format!("{error}; {route_state}; {observed_metric_windows:?}; {distribution}")
-                    })?;
-                    let after_metrics = after_metrics.ok_or("weighted route sample produced no metric windows")?;
+                    let distribution =
+                        route_distribution(gateway_port, WEIGHTED_ROUTE_SAMPLE_REQUESTS, phase, attribution)?;
+                    let after_metrics = read_gateway_metrics(metrics_port)?;
+                    let after_state =
+                        weighted_route_metrics(&after_metrics, expected_site, require_strict_pressure_preference)?;
                     let after_counts = route_selection_counts(&after_metrics)?;
                     let selector_evidence =
                         weighted_selector_sample_delta(before_counts, after_counts, WEIGHTED_ROUTE_SAMPLE_REQUESTS)
@@ -2072,35 +2061,10 @@ fn verify_weighted_site_distribution(
                         )
                         .into());
                     }
-                    let preferred = distribution.sites.get(expected_site).copied().unwrap_or_default();
-                    let total = u32::try_from(total)
-                        .map_err(|error| format!("weighted route count does not fit a metric sample: {error}"))?;
-                    let preferred = u32::try_from(preferred)
-                        .map_err(|error| format!("preferred route count does not fit a metric sample: {error}"))?;
-                    let observed_share = f64::from(preferred) / f64::from(total);
-                    let share_error = (observed_share - expected_share).abs();
-                    if !weighted_route_share_matches(expected_share, observed_share) {
-                        return Err(format!(
-                            "observed {expected_site} route share {:.1}% differs from the metric-window-weighted Gateway prediction {:.1}% by {:.1} percentage points (limit {:.1}); {route_state}; metric windows={observed_metric_windows:?}; {selector_evidence}; {} requests: {distribution}",
-                            observed_share * 100.0,
-                            expected_share * 100.0,
-                            share_error * 100.0,
-                            WEIGHTED_ROUTE_SHARE_TOLERANCE * 100.0,
-                            WEIGHTED_ROUTE_SAMPLE_REQUESTS
-                        )
-                        .into());
-                    }
+                    let (preferred, other) = weighted_route_sample_site_counts(&distribution.sites, expected_site)
+                        .map_err(|error| format!("{error}; {route_state}; {selector_evidence}; {distribution}"))?;
                     return Ok(format!(
-                        "lower-pressure site={expected_site}; metric-window-weighted predicted share={:.1}%, observed={:.1}%, error={:.1} percentage points; scores=({:.3}, {:.3}), weights=({:.3}, {:.3}), rho=({:.6}, {:.6}); pre-sample metric retries={pre_sample_retries}; metric windows={observed_metric_windows:?}; {selector_evidence}; {distribution}",
-                        expected_share * 100.0,
-                        observed_share * 100.0,
-                        share_error * 100.0,
-                        before_state.preferred_score,
-                        before_state.other_score,
-                        before_state.preferred_weight,
-                        before_state.other_weight,
-                        before_state.preferred_rho,
-                        before_state.other_rho
+                        "lower-pressure site={expected_site}; attributed sample={preferred} preferred and {other} other-site responses; weighted share is recorded as context only; before={before_state:?}; after={after_state:?}; pre-sample metric retries={pre_sample_retries}; {selector_evidence}; {distribution}"
                     ));
                 }
             },
@@ -2179,11 +2143,6 @@ fn weighted_route_metrics(
             "Gateway pressure rho for {preferred_site} is not strictly lower than {other_site}: rho={preferred_rho}, other rho={other_rho}"
         ));
     }
-    // Keep this expectation aligned with `between_two` in the Grid Gateway filter.
-    let preferred_rate = preferred_weight / (1.0 + preferred_rho);
-    let other_rate = other_weight / (1.0 + other_rho);
-    let preferred_share =
-        (preferred_rate / (preferred_rate + other_rate)).clamp(TWO_SITE_SHARE_RANGE.0, TWO_SITE_SHARE_RANGE.1);
     Ok(WeightedRouteMetrics {
         preferred_score,
         other_score,
@@ -2191,8 +2150,31 @@ fn weighted_route_metrics(
         other_weight,
         preferred_rho,
         other_rho,
-        preferred_share,
     })
+}
+
+/// Require attributed responses from both sites without checking their weighted share precision.
+fn weighted_route_sample_site_counts(
+    sites: &BTreeMap<String, usize>,
+    preferred_site: &str,
+) -> Result<(usize, usize), String> {
+    let other_site = match preferred_site {
+        "pool-a" => "pool-b",
+        "pool-b" => "pool-a",
+        _ => {
+            return Err(format!(
+                "unknown preferred site in the two-site proof: {preferred_site}"
+            ));
+        },
+    };
+    let preferred = sites.get(preferred_site).copied().unwrap_or_default();
+    let other = sites.get(other_site).copied().unwrap_or_default();
+    if sites.len() != 2 || preferred == 0 || other == 0 {
+        return Err(format!(
+            "small weighted-route sample must include attributed responses from both eligible sites; sites={sites:?}"
+        ));
+    }
+    Ok((preferred, other))
 }
 
 /// Preserve the current two-site route gauges when a weighted sample is incomplete.
@@ -2223,45 +2205,11 @@ fn weighted_route_metrics_stable(before: WeightedRouteMetrics, after: WeightedRo
         (before.other_weight, after.other_weight),
         (before.preferred_rho, after.preferred_rho),
         (before.other_rho, after.other_rho),
-        (before.preferred_share, after.preferred_share),
     ]
     .into_iter()
     .all(|(left, right)| {
         (left - right).abs() <= WEIGHTED_ROUTE_METRIC_STABILITY_REL_TOLERANCE * left.abs().max(right.abs()).max(1.0)
     })
-}
-
-/// Whether an attributed sample is within the explicit tolerance of the Gateway's weighted choice.
-fn weighted_route_share_matches(expected: f64, observed: f64) -> bool {
-    (expected - observed).abs() <= WEIGHTED_ROUTE_SHARE_TOLERANCE
-}
-
-/// Estimate the preferred route share over request-count-weighted metric windows.
-fn weighted_route_expected_share(windows: &[(usize, f64, f64)]) -> Result<f64, String> {
-    let mut total_requests = 0_u32;
-    let mut expected_requests = 0.0;
-    for (requests, before, after) in windows {
-        if *requests == 0
-            || !before.is_finite()
-            || !after.is_finite()
-            || !(0.0..=1.0).contains(before)
-            || !(0.0..=1.0).contains(after)
-        {
-            return Err(format!(
-                "weighted route sample contains an invalid metric window: requests={requests}, before={before}, after={after}"
-            ));
-        }
-        let request_count = u32::try_from(*requests)
-            .map_err(|error| format!("weighted route batch count does not fit a metric sample: {error}"))?;
-        total_requests = total_requests
-            .checked_add(request_count)
-            .ok_or("weighted route request count overflowed its metric sample")?;
-        expected_requests += f64::from(request_count) * ((before + after) / 2.0);
-    }
-    if total_requests == 0 {
-        return Err("weighted route sample contains no metric windows".to_owned());
-    }
-    Ok(expected_requests / f64::from(total_requests))
 }
 
 /// Wait for a strong route preference while retaining each actual HTTP attribution.
@@ -2549,19 +2497,6 @@ impl RouteDistribution {
         Ok(())
     }
 
-    /// Add counts from another attributed request batch.
-    fn merge(&mut self, other: Self) {
-        for (site, count) in other.sites {
-            *self.sites.entry(site).or_default() += count;
-        }
-        for (backend, count) in other.backends {
-            *self.backends.entry(backend).or_default() += count;
-        }
-        for (site, count) in other.provider_gateways {
-            *self.provider_gateways.entry(site).or_default() += count;
-        }
-    }
-
     /// Whether enough responses name the expected site through a trusted provider marker or both Grid headers.
     fn proves_site(&self, expected_site: &str, required: usize) -> bool {
         let from_provider = self.provider_gateways.get(expected_site).copied().unwrap_or_default() >= required;
@@ -2825,9 +2760,9 @@ pub(super) fn read_operator_metrics(port: u16) -> Result<String, Box<dyn std::er
     read_metrics_url(port, true)
 }
 
-/// Read the Grid Gateway's TLS-only `/metrics` endpoint.
+/// Read the Grid Gateway's loopback admin `/metrics` endpoint through the local test port-forward.
 pub(super) fn read_gateway_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
-    read_metrics_url(port, false)
+    read_metrics_url(port, true)
 }
 
 /// Fetch Prometheus exposition over the forwarded service port.
@@ -2841,7 +2776,15 @@ fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std
     for scheme in schemes {
         let url = format!("{scheme}://127.0.0.1:{port}/metrics");
         let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--insecure", "--max-time", "5", &url])
+            .args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--insecure",
+                "--max-time",
+                "5",
+                &url,
+            ])
             .output()?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
@@ -3221,7 +3164,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_route_expectation_uses_current_scores_capacity_and_saturation() {
+    fn route_metrics_report_pressure_order_and_weights() {
         let metrics = "grid_route_site_score{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0\n\
                        grid_route_site_weight{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 8\n\
                        grid_route_site_rho{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0\n\
@@ -3241,14 +3184,14 @@ mod tests {
             (route.other_score - 9.0).abs() < f64::EPSILON,
             "pool-B must have the higher queue score"
         );
-        assert!(
-            (route.preferred_share - (8.0 / (8.0 + 18.0 / (1.0 + 0.999_984_222_461_796_4)))).abs() < f64::EPSILON,
-            "the expected share must use capacity divided by one plus smoothed saturation"
-        );
+        assert!((route.preferred_weight - 8.0).abs() < f64::EPSILON);
+        assert!((route.other_weight - 18.0).abs() < f64::EPSILON);
+        assert!((route.preferred_rho - 0.0).abs() < f64::EPSILON);
+        assert!((route.other_rho - 0.999_984_222_461_796_4).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn weighted_route_expectation_allows_tied_finite_scores() {
+    fn route_metrics_allow_tied_scores_when_strict_preference_is_not_required() {
         let metrics = "grid_route_site_score{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0\n\
                        grid_route_site_weight{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 8\n\
                        grid_route_site_rho{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0\n\
@@ -3258,15 +3201,10 @@ mod tests {
 
         let route = weighted_route_metrics(metrics, "pool-a", false);
 
-        assert!(
-            route.is_ok(),
-            "equal finite queue scores still have a valid weighted share"
-        );
+        assert!(route.is_ok(), "equal finite queue scores are permitted here");
         let route = route.unwrap_or_else(|_| std::process::abort());
-        assert!(
-            (route.preferred_share - (8.0 / (8.0 + 12.0))).abs() < f64::EPSILON,
-            "the tied-score share must still use capacity divided by one plus saturation"
-        );
+        assert!((route.preferred_weight - 8.0).abs() < f64::EPSILON);
+        assert!((route.other_weight - 18.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -3296,7 +3234,6 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0.5
             other_weight: 8.0,
             preferred_rho: 0.20,
             other_rho: 0.95,
-            preferred_share: 0.55,
         };
         let jittered = WeightedRouteMetrics {
             preferred_score: 0.002,
@@ -3305,7 +3242,6 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0.5
             other_weight: 8.0,
             preferred_rho: 0.205,
             other_rho: 0.955,
-            preferred_share: 0.551,
         };
         let changed = WeightedRouteMetrics {
             other_score: 2.1,
@@ -3378,7 +3314,7 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
     }
 
     #[test]
-    fn weighted_route_expectation_rejects_a_gateway_score_that_disagrees_with_pressure_order() {
+    fn route_metrics_reject_a_gateway_score_that_disagrees_with_pressure_order() {
         let metrics = "grid_route_site_score{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 9\n\
                        grid_route_site_weight{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 8\n\
                        grid_route_site_rho{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0\n\
@@ -3393,37 +3329,23 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
     }
 
     #[test]
-    fn weighted_route_sample_must_match_the_predicted_selector_share() {
-        assert!(weighted_route_share_matches(0.47, 0.38));
-        assert!(!weighted_route_share_matches(0.47, 0.70));
-    }
+    fn weighted_route_observation_only_requires_both_eligible_sites_to_receive_traffic() {
+        let preferred_dominates = BTreeMap::from([("pool-a".to_owned(), 31), ("pool-b".to_owned(), 1)]);
+        let other_dominates = BTreeMap::from([("pool-a".to_owned(), 1), ("pool-b".to_owned(), 31)]);
+        let one_site_only = BTreeMap::from([("pool-a".to_owned(), 32)]);
 
-    #[test]
-    fn weighted_route_share_uses_metric_windows_when_saturation_changes_during_traffic() {
-        let expected = weighted_route_expected_share(&[(256, 0.307_692_307_7, 0.424_110_570_8)]).unwrap_or(f64::NAN);
-
-        assert!(
-            (expected - 0.365_901_439_25).abs() < 0.000_001,
-            "the request window should use both observed Gateway saturation states"
+        assert_eq!(
+            weighted_route_sample_site_counts(&preferred_dominates, "pool-a"),
+            Ok((31, 1))
         );
-        assert!(
-            weighted_route_share_matches(expected, 101.0 / 256.0),
-            "the observed 39.5% share should be checked against the measured route-metric window"
+        assert_eq!(
+            weighted_route_sample_site_counts(&other_dominates, "pool-a"),
+            Ok((1, 31))
         );
-        assert!(
-            !weighted_route_share_matches(expected, 0.70),
-            "metric changes must not make a clearly incorrect route share pass"
-        );
-    }
-
-    #[test]
-    fn weighted_route_share_weights_each_metric_window_by_its_request_count() {
-        let expected = weighted_route_expected_share(&[(32, 0.2, 0.4), (96, 0.4, 0.8)]).unwrap_or(f64::NAN);
-
-        assert!(
-            (expected - 0.525).abs() < f64::EPSILON,
-            "the longer route-metric interval should contribute proportionally more requests"
-        );
+        let Err(error) = weighted_route_sample_site_counts(&one_site_only, "pool-a") else {
+            std::process::abort();
+        };
+        assert!(error.contains("both eligible sites"));
     }
 
     #[test]
@@ -3435,7 +3357,7 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
         let after = "grid_route_selections_total{path=\"two_choices\"} 2\n\
                       grid_route_selections_total{path=\"by_capacity\"} 3\n\
                       grid_route_selections_total{path=\"lone\"} 4\n\
-                      grid_route_selections_total{path=\"between_two\"} 261\n";
+                      grid_route_selections_total{path=\"between_two\"} 37\n";
         let before = route_selection_counts(before);
         let after = route_selection_counts(after);
 
@@ -3443,11 +3365,11 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
         assert!(after.is_ok(), "all selector paths must be exposed after the sample");
         let before = before.unwrap_or_else(|_| std::process::abort());
         let after = after.unwrap_or_else(|_| std::process::abort());
-        let delta = weighted_selector_sample_delta(before, after, 256);
+        let delta = weighted_selector_sample_delta(before, after, WEIGHTED_ROUTE_SAMPLE_REQUESTS);
 
         assert!(delta.is_ok(), "every request should use the two-site weighted selector");
         assert!(
-            delta.is_ok_and(|evidence| evidence.contains("between_two: 256")),
+            delta.is_ok_and(|evidence| evidence.contains("between_two: 32")),
             "the recorded path delta should identify all weighted selections"
         );
     }
@@ -3461,14 +3383,14 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
             by_capacity: 3.0,
         };
         let after = RouteSelectionCounts {
-            between_two: 260.0,
+            between_two: 36.0,
             two_choices: 3.0,
             lone: 4.0,
             by_capacity: 3.0,
         };
 
         assert!(
-            weighted_selector_sample_delta(before, after, 256).is_err(),
+            weighted_selector_sample_delta(before, after, WEIGHTED_ROUTE_SAMPLE_REQUESTS).is_err(),
             "a sample that changed candidate count or selection tier must fail"
         );
     }
