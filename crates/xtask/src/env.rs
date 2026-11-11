@@ -1073,6 +1073,32 @@ pub(crate) enum Action {
         options: GlbDemoOptions,
     },
 
+    /// Create a persistent three-site llm-d signals environment for performance testing.
+    StartGridCombinedSiteSignals {
+        /// Path to the source Forge environment config file.
+        #[arg(long, default_value = "tests/e2e/topologies/grid-signals-combined-site/forge.yaml")]
+        forge_config: PathBuf,
+        /// Optional suffix for a fresh run-owned cluster set. It must not already exist.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Evidence root. The command creates one unique run directory beneath it.
+        #[arg(long, default_value = "evidence/grid-signals-combined-site")]
+        evidence_root: PathBuf,
+        /// Deploy a persistent environment without running signal pressure/recovery qualification.
+        #[arg(long)]
+        infra_only: bool,
+        /// Backend workload for this persistent environment.
+        #[arg(long, value_enum, default_value_t = combined_site_demo::SignalsWorkload::LlmdSim)]
+        workload: combined_site_demo::SignalsWorkload,
+    },
+
+    /// Clean only a signals environment described by its run-owned manifest.
+    CleanGridCombinedSiteSignals {
+        /// `run-manifest.json` written by `start-grid-combined-site-signals`.
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+
     /// Run the llm-d pool-metrics routing demo with two clusters.
     RunGridLlmdPoolMetricsDemo {
         /// Path to the source Forge environment config file.
@@ -1367,6 +1393,20 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             membership,
             options,
         } => combined_site_demo::run(forge_config, *membership, options),
+        Action::StartGridCombinedSiteSignals {
+            forge_config,
+            run_id,
+            evidence_root,
+            infra_only,
+            workload,
+        } => combined_site_demo::run_signals_environment(
+            forge_config,
+            run_id.as_deref(),
+            evidence_root,
+            *infra_only,
+            *workload,
+        ),
+        Action::CleanGridCombinedSiteSignals { manifest } => combined_site_demo::clean_signals_environment(manifest),
         Action::RunGridLlmdPoolMetricsDemo {
             forge_config,
             options,
