@@ -1073,32 +1073,6 @@ pub(crate) enum Action {
         options: GlbDemoOptions,
     },
 
-    /// Create a persistent three-site llm-d signals environment for performance testing.
-    StartGridCombinedSiteSignals {
-        /// Path to the source Forge environment config file.
-        #[arg(long, default_value = "tests/e2e/topologies/grid-signals-combined-site/forge.yaml")]
-        forge_config: PathBuf,
-        /// Optional suffix for a fresh run-owned cluster set. It must not already exist.
-        #[arg(long)]
-        run_id: Option<String>,
-        /// Evidence root. The command creates one unique run directory beneath it.
-        #[arg(long, default_value = "evidence/grid-signals-combined-site")]
-        evidence_root: PathBuf,
-        /// Deploy a persistent environment without running signal pressure/recovery qualification.
-        #[arg(long)]
-        infra_only: bool,
-        /// Backend workload for this persistent environment.
-        #[arg(long, value_enum, default_value_t = combined_site_demo::SignalsWorkload::LlmdSim)]
-        workload: combined_site_demo::SignalsWorkload,
-    },
-
-    /// Clean only a signals environment described by its run-owned manifest.
-    CleanGridCombinedSiteSignals {
-        /// `run-manifest.json` written by `start-grid-combined-site-signals`.
-        #[arg(long)]
-        manifest: PathBuf,
-    },
-
     /// Run the llm-d pool-metrics routing demo with two clusters.
     RunGridLlmdPoolMetricsDemo {
         /// Path to the source Forge environment config file.
@@ -1115,6 +1089,13 @@ pub(crate) enum Action {
         /// of the default queue-depth signal.
         #[arg(long)]
         kv_cache: bool,
+        /// Backend workload. llm-d-sim remains the deterministic default; vllm-vcr exposes request-driven metrics.
+        #[arg(long, value_enum, default_value_t = llmd_pool_metrics_demo::PoolMetricsWorkload::LlmdSim)]
+        workload: llmd_pool_metrics_demo::PoolMetricsWorkload,
+        /// Keep a VCR environment running after verifying readiness, live metrics, scoring, overlay, and Gateway
+        /// attribution.
+        #[arg(long)]
+        infra_only: bool,
     },
 
     /// Qualify the provider-gateway traffic topology, proving equal
@@ -1200,13 +1181,12 @@ mod llmd_pool_metrics_demo_cli_tests {
     use super::Action;
     use crate::{Cli, Command};
 
-    /// Parses `env run-grid-llmd-pool-metrics-demo` with the given extra args
-    /// and returns its `kv_cache` flag value.
+    /// Parses `env run-grid-llmd-pool-metrics-demo` with the given extra args.
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "catch-all panic for unexpected Action variants"
     )]
-    fn parsed_kv_cache_flag(extra_args: &[&str]) -> bool {
+    fn parsed_pool_metrics_action(extra_args: &[&str]) -> (bool, bool, bool) {
         let mut args = vec!["xtask", "env", "run-grid-llmd-pool-metrics-demo"];
         args.extend_from_slice(extra_args);
         let cli = Cli::try_parse_from(args).expect("valid CLI invocation must parse");
@@ -1214,19 +1194,39 @@ mod llmd_pool_metrics_demo_cli_tests {
             panic!("expected the env subcommand");
         };
         match action {
-            Action::RunGridLlmdPoolMetricsDemo { kv_cache, .. } => kv_cache,
+            Action::RunGridLlmdPoolMetricsDemo {
+                kv_cache,
+                workload,
+                infra_only,
+                ..
+            } => (
+                kv_cache,
+                workload == crate::env::llmd_pool_metrics_demo::PoolMetricsWorkload::VllmVcr,
+                infra_only,
+            ),
             other => panic!("expected RunGridLlmdPoolMetricsDemo, got {other:?}"),
         }
     }
 
     #[test]
     fn kv_cache_flag_defaults_to_false() {
-        assert!(!parsed_kv_cache_flag(&[]));
+        assert_eq!(parsed_pool_metrics_action(&[]), (false, false, false));
     }
 
     #[test]
     fn kv_cache_flag_parses_when_passed() {
-        assert!(parsed_kv_cache_flag(&["--kv-cache"]));
+        assert_eq!(parsed_pool_metrics_action(&["--kv-cache"]), (true, false, false));
+    }
+
+    #[test]
+    fn workload_defaults_to_simulator_and_vcr_is_opt_in() {
+        assert!(!parsed_pool_metrics_action(&[]).1);
+        assert!(parsed_pool_metrics_action(&["--workload", "vllm-vcr"]).1);
+    }
+
+    #[test]
+    fn infrastructure_mode_is_explicit() {
+        assert!(parsed_pool_metrics_action(&["--workload", "vllm-vcr", "--infra-only"]).2);
     }
 }
 
@@ -1393,26 +1393,23 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             membership,
             options,
         } => combined_site_demo::run(forge_config, *membership, options),
-        Action::StartGridCombinedSiteSignals {
-            forge_config,
-            run_id,
-            evidence_root,
-            infra_only,
-            workload,
-        } => combined_site_demo::run_signals_environment(
-            forge_config,
-            run_id.as_deref(),
-            evidence_root,
-            *infra_only,
-            *workload,
-        ),
-        Action::CleanGridCombinedSiteSignals { manifest } => combined_site_demo::clean_signals_environment(manifest),
         Action::RunGridLlmdPoolMetricsDemo {
             forge_config,
             options,
             metrics_mtls,
             kv_cache,
-        } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
+            workload,
+            infra_only,
+        } => llmd_pool_metrics_demo::run(
+            forge_config,
+            options,
+            llmd_pool_metrics_demo::PoolMetricsRunOptions {
+                metrics_mtls: *metrics_mtls,
+                kv_cache: *kv_cache,
+                workload: *workload,
+                infra_only: *infra_only,
+            },
+        ),
         Action::RunGridProviderTrafficQualification { forge_config, options } => {
             provider_traffic_qualification::run(forge_config, options)
         },

@@ -9,8 +9,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    io::Write as _,
+    process::{Command, Stdio},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -45,6 +49,10 @@ const CROSS_SITE_HIGHER_KV_CACHE: f64 = 0.6;
 const WRONG_PIN_LOCAL_WAITING_REQUESTS: u32 = 1;
 /// Provider identity retained while pool-a's EPP signal expires.
 const POOL_A_PROVIDER: &str = "llmd-pool-a-provider";
+/// Kubernetes service account allowed to scrape the Grid Gateway metrics listener.
+const GRID_GATEWAY_METRICS_SCRAPER: &str = "grid-serving-gateway-metrics-scraper";
+/// Keep the short-lived metrics token out of child arguments and evidence.
+static GRID_GATEWAY_METRICS_TOKEN: OnceLock<String> = OnceLock::new();
 /// Gateway gauges that a measured refresh owns and must clear when its reading disappears.
 const MEASURED_SITE_GAUGES: [&str; 8] = [
     "grid_route_site_ceiling",
@@ -2822,16 +2830,21 @@ fn parse_site_route_response(raw: &str) -> SiteRouteResponse {
 
 /// Read an operator's `/metrics` through the run-owned Service.
 pub(super) fn read_operator_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
-    read_metrics_url(port, true)
+    read_metrics_url(port, true, None)
 }
 
 /// Read the Grid Gateway's TLS-only `/metrics` endpoint.
 pub(super) fn read_gateway_metrics(port: u16) -> Result<String, Box<dyn std::error::Error>> {
-    read_metrics_url(port, false)
+    let token = gateway_metrics_token()?;
+    read_metrics_url(port, false, Some(token))
 }
 
 /// Fetch Prometheus exposition over the forwarded service port.
-fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std::error::Error>> {
+fn read_metrics_url(
+    port: u16,
+    tls_fallback: bool,
+    bearer_token: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let schemes = if tls_fallback {
         ["https", "http"]
     } else {
@@ -2840,9 +2853,22 @@ fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std
     let mut last_error = String::from("no HTTP response");
     for scheme in schemes {
         let url = format!("{scheme}://127.0.0.1:{port}/metrics");
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--insecure", "--max-time", "5", &url])
-            .output()?;
+        let mut command = Command::new("curl");
+        command.args(["--silent", "--show-error", "--fail", "--insecure", "--max-time", "5"]);
+        if bearer_token.is_some() {
+            // `--config -` keeps the token out of curl's process arguments and shell history.
+            command.args(["--config", "-"]).stdin(Stdio::piped());
+        }
+        let output = if let Some(token) = bearer_token {
+            command.arg(&url);
+            let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                writeln!(stdin, "header = \"Authorization: Bearer {token}\"")?;
+            }
+            child.wait_with_output()?
+        } else {
+            command.arg(&url).output()?
+        };
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
@@ -2851,6 +2877,45 @@ fn read_metrics_url(port: u16, tls_fallback: bool) -> Result<String, Box<dyn std
             .clone_into(&mut last_error);
     }
     Err(format!("could not read metrics service: {last_error}").into())
+}
+
+/// Mint one run-scoped token for the Gateway's Kubernetes-authorized metrics listener.
+fn gateway_metrics_token() -> Result<&'static str, Box<dyn std::error::Error>> {
+    if let Some(token) = GRID_GATEWAY_METRICS_TOKEN.get() {
+        return Ok(token);
+    }
+    let context = kind_context(GRID_SERVING_SITE);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "token",
+            GRID_GATEWAY_METRICS_SCRAPER,
+            "--duration=1h",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not mint a token for service account {GRID_GATEWAY_METRICS_SCRAPER}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let token = String::from_utf8(output.stdout)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("kubectl returned an empty Gateway metrics scraper token".into());
+    }
+    if GRID_GATEWAY_METRICS_TOKEN.set(token.to_owned()).is_err() {
+        // Another caller installed the same run-scoped service-account credential first.
+    }
+    GRID_GATEWAY_METRICS_TOKEN
+        .get()
+        .map(String::as_str)
+        .ok_or_else(|| "Gateway metrics scraper token was not cached".into())
 }
 
 /// Return the counter value matching a metric name and its required labels.

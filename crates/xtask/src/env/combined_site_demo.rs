@@ -17,9 +17,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Write as _,
-    net::{Ipv4Addr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Command,
     sync::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -27,8 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use serde::Serialize;
 
 use super::{
     DemoMode, GlbDemoOptions, Membership, certs,
@@ -46,33 +44,8 @@ const CERTS_DIR: &str = "tests/env/certs";
 /// Default published Praxis AI gateway image used by this qualification.
 const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.7.0";
 
-/// Released VCR image used by the persistent three-site signals stack.
-/// The immutable v0.2.5/vLLM 0.31 release tag resolves to this OCI index digest.
-const DEFAULT_SIGNALS_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:0.2.5-vllm0.31";
-/// OCI index digest qualified for the default VCR release image.
-const DEFAULT_SIGNALS_VCR_DIGEST: &str = "sha256:f9f8523a00f2cb9ca8d273a28730a86655be60871e6864554971cb2e9757f0de";
-
 /// Ordered cluster names in the combined-site scenario environment.
 const CLUSTERS: &[&str] = &["west", "central", "east"];
-
-/// Prefix selected for one persistent signals environment.
-static SIGNAL_RUN_PREFIX: OnceLock<String> = OnceLock::new();
-
-/// Evidence location used while materializing one persistent signals environment.
-static SIGNAL_EVIDENCE_DIR: OnceLock<PathBuf> = OnceLock::new();
-
-/// Isolated certificates for the persistent signals environment.
-static SIGNAL_CERTS_DIR: OnceLock<PathBuf> = OnceLock::new();
-
-/// Backend used by a persistent signals setup. The VCR option currently
-/// supports infrastructure setup only; its request-driven signals need proof.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
-pub(crate) enum SignalsWorkload {
-    LlmdSim,
-    VllmVcr,
-}
-
-static SIGNAL_WORKLOAD: OnceLock<SignalsWorkload> = OnceLock::new();
 
 /// The run's membership, set once by [`run`]. The assertions are plain `fn()` and read it here.
 static MEMBERSHIP: OnceLock<Membership> = OnceLock::new();
@@ -164,8 +137,7 @@ fn unique_client_name(prefix: &str) -> String {
     let sanitized = sanitized.trim_matches('-');
     let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let client_prefix = if sanitized.is_empty() { "client" } else { sanitized };
-    let shortened_prefix = client_prefix.chars().take(40).collect::<String>();
-    format!("{shortened_prefix}-{sequence}")
+    format!("{}-{}", &client_prefix[..client_prefix.len().min(40)], sequence)
 }
 
 // -----------------------------------------------------------------------------
@@ -190,215 +162,6 @@ struct CombinedSiteContext {
     /// Path to the external provider key file (kept separate from the descriptor
     /// so the descriptor never carries the filesystem path after validation).
     external_key_file: Option<PathBuf>,
-}
-
-/// Ownership record consumed by the safe, separate cleanup command.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SignalsRunManifest {
-    /// Version of the cleanup manifest contract.
-    schema_version: String,
-    /// Unique run identifier.
-    run_id: String,
-    /// Run-specific Forge cluster prefix.
-    cluster_prefix: String,
-    /// Exact cluster names created for this run.
-    cluster_names: Vec<String>,
-    /// Run-owned Docker network preallocated to avoid exhausted default pools.
-    #[serde(default)]
-    network: Option<SignalsNetworkIdentity>,
-    /// Evidence directory that owns the manifest and resolved config.
-    evidence_dir: PathBuf,
-    /// Resolved Forge config for this run.
-    resolved_forge_config: PathBuf,
-    /// Forge state directory for this run.
-    forge_state_dir: PathBuf,
-    /// Pinned Forge executable used by the run.
-    forge_bin: PathBuf,
-    /// Lifecycle state: starting, ready, failed-retained, or cleaned.
-    lifecycle: String,
-}
-
-/// Immutable identity of the cross-cluster Docker network owned by this run.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SignalsNetworkIdentity {
-    /// Exact network name referenced by the resolved Forge config.
-    name: String,
-    /// Docker network ID captured immediately after creation.
-    id: String,
-    /// Explicit non-overlapping IPv4 subnet assigned at creation.
-    subnet: String,
-    /// Forge creation marker used to verify ownership before cleanup.
-    creation_label: String,
-}
-
-/// One runtime image identity captured from a running cluster.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SignalRuntimeImage {
-    /// Site running the image.
-    site: String,
-    /// Workload component.
-    component: String,
-    /// Kubernetes namespace.
-    namespace: String,
-    /// Pod selector used for later identity checks.
-    selector: String,
-    /// Container name.
-    container: String,
-    /// Declared image reference.
-    reference: String,
-    /// Runtime immutable image identity.
-    image_id: String,
-    /// OCI source revision when present.
-    source_revision: Option<String>,
-}
-
-/// Image resolved on the host before Forge creates the run-owned clusters.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SignalsImageLockEntry {
-    /// Role consumed by the topology.
-    role: String,
-    /// Exact image reference used by Forge.
-    reference: String,
-    /// Host container-runtime image configuration ID.
-    image_id: String,
-    /// OS and CPU architecture of the selected image platform.
-    platform: String,
-    /// Registry digests, when the image came from a registry.
-    repo_digests: Vec<String>,
-    /// OCI source revision label, when provided by the image.
-    source_revision: Option<String>,
-}
-
-/// Runtime details passed to Gridzilla without embedding credentials.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SignalsHandoffSite {
-    /// Site name.
-    name: String,
-    /// Exact Kind cluster name.
-    cluster_name: String,
-    /// Run that owns the cluster.
-    owner_run_id: String,
-    /// Exported run-owned kubeconfig path.
-    kubeconfig: PathBuf,
-    /// Kubernetes context.
-    context: String,
-    /// Grid resource namespace.
-    namespace: String,
-    /// Workloads Gridzilla checks before each phase.
-    readiness_targets: serde_json::Value,
-    /// Provider and pool identity.
-    provider: serde_json::Value,
-    /// Authenticated EPP metrics access.
-    epp: serde_json::Value,
-    /// Runtime simulator control.
-    simulator: serde_json::Value,
-    /// Published overlay identity.
-    overlay: serde_json::Value,
-    /// Gateway and consumed-revision location.
-    gateway: serde_json::Value,
-}
-
-/// Versioned run contract consumed by Gridzilla without copying secret values.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SignalsHandoff {
-    /// Handoff contract version.
-    schema_version: String,
-    /// Unique environment owner.
-    run_id: String,
-    /// Creation time in UTC.
-    created_at: String,
-    /// Source and dirty-tree identity used to create this environment.
-    source: serde_json::Value,
-    /// Immutable identities reported by running pods.
-    runtime_images: Vec<SignalRuntimeImage>,
-    /// Host image lock captured before the clusters were created.
-    image_lock: PathBuf,
-    /// Request contract and client vantage point.
-    client: serde_json::Value,
-    /// Clearly labeled direct backend reference path.
-    backend_reference: serde_json::Value,
-    /// Stable request parameters for probes and benchmark profiles.
-    request: serde_json::Value,
-    /// llm-d pool intentionally pressured by the qualification probe.
-    pressure_target_pool: String,
-    /// Per-site credentials, signals, providers, Gateway, and simulator targets.
-    sites: Vec<SignalsHandoffSite>,
-}
-
-/// One simulator pod and its independent supported admin endpoint.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SimulatorTarget {
-    /// Namespace containing this pod.
-    namespace: String,
-    /// Exact pod name to port-forward and revalidate.
-    pod_name: String,
-    /// Pod identity to reject a replacement between doctor and mutation.
-    pod_uid: String,
-    /// Deployment generation when captured.
-    config_generation: i64,
-    /// Local admin URL after creating the indicated port-forward.
-    admin_url: String,
-    /// How Gridzilla should create the per-pod port-forward.
-    port_forward: serde_json::Value,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-/// Snapshot of one site’s published provider candidates and revision.
-struct SignalOverlaySnapshot {
-    /// Site whose consumer Gateway reads this overlay.
-    site: String,
-    /// Kubernetes ConfigMap resource version.
-    resource_version: String,
-    /// Digest of the effective published overlay contents.
-    semantic_revision: String,
-    /// Site treated as local by the overlay renderer.
-    local_site: String,
-    /// Ordered, scored provider candidates.
-    candidates: Vec<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-/// Response and attribution captured from a Gateway probe.
-struct SignalHttpObservation {
-    /// Unique ID sent with the client request.
-    request_id: String,
-    /// Client-observed UTC timestamp.
-    timestamp: String,
-    /// Gateway URL that received the request.
-    url: String,
-    /// HTTP status returned to the client.
-    status: u16,
-    /// Provider site attributed by the response.
-    provider_site: String,
-    /// Selected upstream cluster attributed by the response.
-    backend_cluster: String,
-    /// Simulator Pod that returned the response.
-    backend_pod: String,
-    /// Request ID independently echoed by the simulator.
-    backend_request_id: String,
-    /// Client-observed request duration in milliseconds.
-    elapsed_ms: u128,
-    /// Number of response body bytes.
-    body_bytes: usize,
-}
-
-/// Owns a child `kubectl port-forward` process and stops it on drop.
-struct PortForwardGuard(Child);
-
-impl Drop for PortForwardGuard {
-    fn drop(&mut self) {
-        drop(self.0.kill());
-        drop(self.0.wait());
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1179,7 +942,7 @@ fn primary_response_is_trusted(output: &[u8]) -> bool {
 fn wait_for_environment_ready() -> Result<String, Box<dyn std::error::Error>> {
     // Wait for Grid operators to converge
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
         eprintln!("  [WAIT] {cluster}: Grid operator convergence");
 
         // Wait for deployment to be ready
@@ -1206,7 +969,7 @@ fn assert_cluster_health() -> AssertionResult {
     let mut cluster_health = Vec::new();
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         // Check API server responsiveness
         let api_start = Instant::now();
@@ -1283,7 +1046,7 @@ fn assert_component_deployment() -> AssertionResult {
     let static_components = ["grid-operator", "consumer-gateway", "provider-gateway"];
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
         let mock_name = format!("vcr-inference-{cluster}");
         let cluster_components: Vec<&str> = static_components
             .iter()
@@ -1375,7 +1138,7 @@ fn assert_swim_convergence() -> AssertionResult {
     let mut all_converged = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
         let status = poll_until(
             || {
                 let output = Command::new("kubectl")
@@ -1448,7 +1211,7 @@ fn assert_site_auto_discovery() -> AssertionResult {
     let mut all_ok = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         let result = poll_until(
             || {
@@ -1536,7 +1299,7 @@ fn assert_local_membership() -> AssertionResult {
     let mut all_ok = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
         let network = poll_until(
             || {
                 let output = Command::new("kubectl")
@@ -1597,9 +1360,9 @@ fn assert_local_declared_peers() -> AssertionResult {
     let signals_suffix = format!(":{SIGNALS_PORT}");
 
     for local in CLUSTERS {
-        let context = combined_kubectl_context(local);
+        let context = format!("kind-grid-combined-{local}");
         for remote in CLUSTERS.iter().filter(|remote| *remote != local) {
-            let expected_pin = combined_site_certificate_fingerprint(remote)?;
+            let expected_pin = certs::site_certificate_fingerprint(remote)?;
             let output = Command::new("kubectl")
                 .args([
                     "get",
@@ -1673,7 +1436,7 @@ fn assert_overlay_acceptance() -> AssertionResult {
     let mut all_accepted = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         // Step 1: Overlay ConfigMap exists
         let overlay_output = Command::new("kubectl")
@@ -1968,7 +1731,7 @@ fn assert_response_attribution() -> AssertionResult {
     let mut all_attributed = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         // Send test request and verify response includes all required attribution
         let test_output = run_curl_probe(
@@ -2049,7 +1812,7 @@ fn assert_tls_certificate_validation() -> AssertionResult {
     let mut all_rejections_correct = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         // Test 1: No client certificate should fail (TLS rejection)
         let no_cert_output = run_curl_probe(
@@ -2214,9 +1977,9 @@ fn run_pod_to_completion(
     // Apply the pod
     let mut apply = Command::new("kubectl")
         .args(["apply", "--context", context, "-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
 
     if let Some(ref mut stdin) = apply.stdin {
@@ -2289,7 +2052,7 @@ fn assert_authorization_replacement() -> AssertionResult {
     let mut all_replacement_correct = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         // Send request with specific authorization header
         let auth_test_output = run_curl_probe(
@@ -2384,7 +2147,7 @@ fn assert_credential_isolation() -> AssertionResult {
     let mut all_isolated = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         // Test 1: Consumer gateway should not have provider credentials mounted
         let consumer_volumes_output = Command::new("kubectl")
@@ -2516,7 +2279,7 @@ fn assert_backend_access_denial() -> AssertionResult {
     let mut all_denied = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         // First, positive control: verify provider gateway can reach backend
         let provider_control_output = run_curl_probe_with_flags(
@@ -3177,7 +2940,7 @@ fn assert_rollout_convergence() -> AssertionResult {
     let mut all_sites_converged = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
         let overlay = read_cluster_overlay(cluster)?;
         let rendered = overlay.semantic_revision != "unknown" && !overlay.semantic_revision.is_empty();
         let distributed = !overlay.candidates.is_empty();
@@ -3291,7 +3054,7 @@ fn assert_operator_restart_recovery() -> AssertionResult {
     let mut all_recovered = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         // Verify operator is ready before restart
         let initial_output = Command::new("kubectl")
@@ -3528,7 +3291,7 @@ fn assert_post_recovery_soak() -> AssertionResult {
 
         // Check all clusters are healthy
         for cluster in CLUSTERS {
-            let context = combined_kubectl_context(cluster);
+            let context = format!("kind-grid-combined-{cluster}");
 
             // Check operator health
             let operator_output = Command::new("kubectl")
@@ -3652,7 +3415,7 @@ fn assert_negative_routing() -> AssertionResult {
     let mut all_correct = true;
 
     let cluster = "central";
-    let context = combined_kubectl_context(cluster);
+    let context = format!("kind-grid-combined-{cluster}");
     // Reuse an already-attached pod so fast negative responses cannot exit
     // before `kubectl run -i` captures the curl output.
     let client = StableCurlClient::create(&context, "negative-routing-client")?;
@@ -3794,7 +3557,7 @@ fn assert_external_provider_absence() -> AssertionResult {
     let mut external_resources_found = false;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         // Check for external InferenceProvider resources
         let provider_output = Command::new("kubectl")
@@ -3978,7 +3741,7 @@ fn assert_external_provider_isolation(selected_site: &str) -> AssertionResult {
     let mut isolation_correct = true;
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
         let is_selected = *cluster == selected_site;
 
         let secret_output = Command::new("kubectl")
@@ -4094,7 +3857,7 @@ fn assert_external_provider_isolation(selected_site: &str) -> AssertionResult {
 fn assert_external_provider_gateway_config(selected_site: &str, ext: &ExternalProviderDescriptor) -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
-    let context = combined_kubectl_context(selected_site);
+    let context = format!("kind-grid-combined-{selected_site}");
 
     let output = Command::new("kubectl")
         .args([
@@ -4166,7 +3929,7 @@ fn assert_external_provider_gateway_config(selected_site: &str, ext: &ExternalPr
         if *other == selected_site {
             continue;
         }
-        let other_ctx = combined_kubectl_context(other);
+        let other_ctx = format!("kind-grid-combined-{other}");
         let other_output = Command::new("kubectl")
             .args([
                 "get",
@@ -4238,10 +4001,10 @@ fn assert_external_provider_gateway_config(selected_site: &str, ext: &ExternalPr
 
 /// Verify a local Docker image exists; fail with a clear message if absent.
 fn require_local_image(image: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new(kind_container_engine())
+    let status = Command::new("docker")
         .args(["image", "inspect", image])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()?;
     if status.success() {
         return Ok(());
@@ -4253,11 +4016,6 @@ fn require_local_image(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     .into())
 }
 
-/// Return the container daemon used by Kind's Docker provider.
-fn kind_container_engine() -> &'static str {
-    "docker"
-}
-
 /// Load local container images into all Kind clusters.
 ///
 /// Reads image references from the `GRID_XTASK_*_IMAGE` environment variables
@@ -4265,26 +4023,6 @@ fn kind_container_engine() -> &'static str {
 /// `Never`, this is a no-op.
 fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
-    if SIGNAL_RUN_PREFIX.get().is_some() {
-        if pull_policy != "Never" {
-            return Err(format!(
-                "signals setup requires imagePullPolicy Never after preloading verified images, got {pull_policy:?}"
-            )
-            .into());
-        }
-        let images = signals_image_references();
-        for (_, image) in &images {
-            require_local_image(image)?;
-        }
-        for cluster in CLUSTERS {
-            for (_, image) in &images {
-                eprintln!("  loading {image} into {cluster}...");
-                load_signals_image_archive(image, cluster)?;
-            }
-            eprintln!("  [OK] {cluster}: all pinned and source-built images loaded");
-        }
-        return Ok(());
-    }
     if pull_policy != "Never" {
         eprintln!("  skipping Kind image loading (pull policy is {pull_policy})");
         return Ok(());
@@ -4322,64 +4060,16 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
     Ok(())
 }
 
-/// Export a single-platform OCI archive so Kind does not try to import missing
-/// non-host manifests from a multi-platform Docker index.
-fn load_signals_image_archive(image: &str, site: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let platform = kind_image_platform()?;
-    let archive = tempfile::Builder::new()
-        .prefix("grid-signals-image-")
-        .suffix(".tar")
-        .tempfile()?;
-    let output = Command::new(kind_container_engine())
-        .args(["image", "save", "--platform", platform, "--output"])
-        .arg(archive.path())
-        .arg(image)
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "failed to export {image} for {platform}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    let cluster = combined_kind_cluster_name(site);
-    let loaded = Command::new("kind")
-        .args(["load", "image-archive", "--name", &cluster])
-        .arg(archive.path())
-        .output()?;
-    if !loaded.status.success() {
-        return Err(format!(
-            "failed to load {image} ({platform}) into Kind cluster {cluster}: {}{}",
-            String::from_utf8_lossy(&loaded.stdout).trim(),
-            String::from_utf8_lossy(&loaded.stderr).trim()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Select the host platform shared by Docker and the local Kind node images.
-fn kind_image_platform() -> Result<&'static str, Box<dyn std::error::Error>> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok("linux/amd64"),
-        "aarch64" => Ok("linux/arm64"),
-        architecture => {
-            Err(format!("signals Kind image loading does not support host architecture {architecture}").into())
-        },
-    }
-}
-
 /// Generate TLS certificates for all combined-site identities.
 ///
 /// Must be called BEFORE `forge up` so the certificates exist on the host
 /// when `install_provider_boundary` creates the Kubernetes Secrets.
 fn stage_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
     let identities: Vec<String> = CLUSTERS.iter().map(|c| (*c).to_owned()).collect();
-    let cert_dir = combined_certs_dir();
-    certs::generate_all_in_dir(&identities, &cert_dir)?;
+    certs::generate_all(&identities)?;
 
     let wrong_ca = ::certs::generate_ca("Combined Site untrusted test CA")?;
-    fs::write(cert_dir.join("untrusted-ca.pem"), wrong_ca.cert_pem)?;
+    fs::write(Path::new(CERTS_DIR).join("untrusted-ca.pem"), wrong_ca.cert_pem)?;
 
     eprintln!("  [OK] TLS certificates generated for west, central, east");
     Ok(())
@@ -4390,33 +4080,19 @@ fn stage_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
 /// Must be called AFTER `forge up` since the clusters must exist.  Gateway
 /// deployments are restarted so pods pick up the new volume mounts.
 fn install_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
-    let certs_dir = combined_certs_dir();
+    let certs_dir = Path::new(CERTS_DIR);
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
-        apply_tls_secret(&context, cluster, CONSUMER_TLS_SECRET, &certs_dir)?;
-        apply_tls_secret(&context, cluster, PROVIDER_TLS_SECRET, &certs_dir)?;
-        apply_tls_secret(&context, "wrong-org-client", WRONG_ORG_TLS_SECRET, &certs_dir)?;
+        apply_tls_secret(&context, cluster, CONSUMER_TLS_SECRET, certs_dir)?;
+        apply_tls_secret(&context, cluster, PROVIDER_TLS_SECRET, certs_dir)?;
+        apply_tls_secret(&context, "wrong-org-client", WRONG_ORG_TLS_SECRET, certs_dir)?;
 
         eprintln!("  [OK] {cluster}: TLS secrets installed");
     }
 
     Ok(())
-}
-
-/// Certificate directory for the active combined-site run. Persistent signals
-/// environments keep their private material under their own evidence directory.
-fn combined_certs_dir() -> PathBuf {
-    SIGNAL_CERTS_DIR
-        .get()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from(CERTS_DIR))
-}
-
-/// Fingerprint the certificate for a combined-site identity in the active run.
-fn combined_site_certificate_fingerprint(site: &str) -> Result<String, Box<dyn std::error::Error>> {
-    certs::site_certificate_fingerprint_in_dir(site, &combined_certs_dir())
 }
 
 /// Create a TLS secret from the generated cert, key, and CA files.
@@ -4805,7 +4481,7 @@ fn collect_overlay_diagnostics() {
     eprintln!("  [DIAG] Collecting overlay failure diagnostics...\n");
 
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
         eprintln!("  ======== {cluster} ========");
 
         eprintln!("  [DIAG] {cluster}: 1. Operator deployment SWIM env vars");
@@ -4968,12 +4644,12 @@ fn collect_overlay_diagnostics() {
 
     eprintln!("  [DIAG] 10. Cross-cluster SWIM connectivity check");
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
         for target in CLUSTERS {
             if *target == *cluster {
                 continue;
             }
-            let target_context = combined_kubectl_context(target);
+            let target_context = format!("kind-grid-combined-{target}");
             if let Ok(output) = Command::new("kubectl")
                 .args([
                     "--context",
@@ -5068,7 +4744,7 @@ fn materialize_provider_config(
             );
         }
 
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
 
         let create = Command::new("kubectl")
             .args([
@@ -5109,61 +4785,15 @@ fn materialize_config(
     run_id: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source)?;
-    let source_parent = source.parent().ok_or("source config must have parent directory")?;
-    let output = SIGNAL_EVIDENCE_DIR.get().map_or_else(
-        || source_parent.join(format!(".forge.resolved-{run_id}.yaml")),
-        |dir| dir.join("forge-resolved.yaml"),
-    );
+    let parent = source.parent().ok_or("source config must have parent directory")?;
+    let output = parent.join(format!(".forge.resolved-{run_id}.yaml"));
     let state_dir = super::forge_config::state_dir_for_config(&output)?;
-    let rendered_config = render_config(&content, external_provider, external_site)?;
-    let mut config: serde_yaml::Value = serde_yaml::from_str(&rendered_config)?;
-    if let Some(prefix) = SIGNAL_RUN_PREFIX.get() {
-        apply_signals_run_scope(&mut config, prefix)?;
-        let evidence_dir = SIGNAL_EVIDENCE_DIR
-            .get()
-            .ok_or("signals run is missing its evidence directory")?;
-        stage_signals_forge_assets(source_parent, evidence_dir)?;
-    }
+    let mut config: serde_yaml::Value =
+        serde_yaml::from_str(&render_config(&content, external_provider, external_site)?)?;
     super::forge_config::rewrite_exec_runtime_paths(&mut config, &state_dir);
-    let serialized_config = serde_yaml::to_string(&config)?;
-    if let Some(output_parent) = output.parent() {
-        fs::create_dir_all(output_parent)?;
-    }
-    fs::write(&output, serialized_config)?;
+    let rendered = serde_yaml::to_string(&config)?;
+    fs::write(&output, rendered)?;
     Ok(output)
-}
-
-/// Stage the topology's input assets beside the run-owned Forge config, preserving relative paths.
-fn stage_signals_forge_assets(topology_root: &Path, evidence_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    for name in ["resources", "configs"] {
-        let source = topology_root.join(name).canonicalize()?;
-        let destination = evidence_dir.join(name);
-        copy_signals_asset_tree(&source, &destination)?;
-    }
-    Ok(())
-}
-
-/// Copy a regular directory tree while rejecting symlinks and unsupported file types.
-fn copy_signals_asset_tree(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let metadata = fs::symlink_metadata(source)?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!("refusing to stage symlinked Forge asset {}", source.display()).into());
-    }
-    if metadata.is_dir() {
-        fs::create_dir_all(destination)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            copy_signals_asset_tree(&entry.path(), &destination.join(entry.file_name()))?;
-        }
-    } else if metadata.is_file() {
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(source, destination)?;
-    } else {
-        return Err(format!("unsupported Forge asset type at {}", source.display()).into());
-    }
-    Ok(())
 }
 
 /// Render image overrides and optional external-provider stack cloning into one Forge configuration.
@@ -5174,9 +4804,6 @@ fn render_config(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut config: serde_yaml::Value = serde_yaml::from_str(content)?;
     apply_image_overrides(&mut config)?;
-    if SIGNAL_RUN_PREFIX.get().is_some() {
-        apply_signals_topology_defaults(&mut config)?;
-    }
     if membership() == Membership::Local {
         apply_local_membership(&mut config)?;
     }
@@ -5188,428 +4815,6 @@ fn render_config(
         _ => {},
     }
     Ok(serde_yaml::to_string(&config)?)
-}
-
-/// Use the llm-d signal images and runtime tuning for this topology only.
-fn apply_signals_topology_defaults(config: &mut serde_yaml::Value) -> Result<(), Box<dyn std::error::Error>> {
-    const DEFAULT_SIMULATOR: &str = "ghcr.io/llm-d/llm-d-inference-sim:v0.10.2";
-    const DEFAULT_EPP: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0";
-    const DEFAULT_OPERATOR: &str = "grid-operator:signals-local";
-    const DEFAULT_OVERLAY_SYNC: &str = "grid-overlay-sync:signals-local";
-
-    let workload = SIGNAL_WORKLOAD.get().copied().unwrap_or(SignalsWorkload::LlmdSim);
-    let default_backend = if workload == SignalsWorkload::VllmVcr {
-        DEFAULT_SIGNALS_VCR_IMAGE
-    } else {
-        DEFAULT_SIMULATOR
-    };
-    let simulator = std::env::var("GRID_XTASK_SIM_IMAGE").unwrap_or_else(|_| default_backend.to_owned());
-    let epp = std::env::var("GRID_XTASK_EPP_IMAGE").unwrap_or_else(|_| DEFAULT_EPP.to_owned());
-    let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| DEFAULT_OPERATOR.to_owned());
-    let overlay_sync =
-        std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_OVERLAY_SYNC.to_owned());
-    let pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
-    let clusters = config
-        .get_mut("spec")
-        .and_then(|spec| spec.get_mut("clusters"))
-        .and_then(serde_yaml::Value::as_sequence_mut)
-        .ok_or("signals Forge config is missing spec.clusters")?;
-
-    for cluster in clusters {
-        let name = cluster
-            .get("name")
-            .and_then(serde_yaml::Value::as_str)
-            .ok_or("signals Forge cluster is missing name")?
-            .to_owned();
-        let properties = cluster
-            .get_mut("properties")
-            .and_then(serde_yaml::Value::as_mapping_mut)
-            .ok_or_else(|| format!("signals Forge cluster {name} is missing properties"))?;
-        set_forge_string(properties, "vcrImage", &simulator);
-        set_forge_string(properties, "eppImage", &epp);
-        set_forge_string(properties, "operatorImage", &operator);
-        set_forge_string(properties, "overlaySyncImage", &overlay_sync);
-        set_forge_string(properties, "imagePullPolicy", &pull_policy);
-        set_forge_image_repo_tag(properties, "vcrImage", &simulator);
-        set_forge_image_repo_tag(properties, "eppImage", &epp);
-        set_forge_image_repo_tag(properties, "operatorImage", &operator);
-        set_forge_image_repo_tag(properties, "overlaySyncImage", &overlay_sync);
-        let pool_name = epp_pool_name_for_site(&name)
-            .ok_or_else(|| format!("signals Forge config contains unknown site {name}"))?;
-        set_forge_string(properties, "poolName", pool_name);
-    }
-    if workload == SignalsWorkload::VllmVcr {
-        configure_vcr_signals_backend(config)?;
-    }
-    Ok(())
-}
-
-fn configure_vcr_signals_backend(config: &mut serde_yaml::Value) -> Result<(), Box<dyn std::error::Error>> {
-    set_signals_provider_kind(config);
-    let steps = config
-        .get_mut("spec")
-        .and_then(|spec| spec.get_mut("stacks"))
-        .and_then(|stacks| stacks.get_mut("llmd-backend"))
-        .and_then(|stack| stack.get_mut("steps"))
-        .and_then(serde_yaml::Value::as_sequence_mut)
-        .ok_or("signals Forge config has no llmd-backend steps")?;
-    let mut replaced = false;
-    for step in steps {
-        if step.get("path").and_then(serde_yaml::Value::as_str) == Some("resources/common/llmd-sim.yaml") {
-            step["path"] = serde_yaml::Value::String("resources/common/vllm-vcr.yaml".to_owned());
-            replaced = true;
-        }
-    }
-    if !replaced {
-        return Err("signals Forge config has no llm-d simulator manifest to replace".into());
-    }
-    Ok(())
-}
-
-fn set_signals_provider_kind(value: &mut serde_yaml::Value) {
-    match value {
-        serde_yaml::Value::Mapping(map) => {
-            let key = serde_yaml::Value::String("providerKind".to_owned());
-            if map.get(&key).and_then(serde_yaml::Value::as_str) == Some("llm-d-inference-sim") {
-                map.insert(key, serde_yaml::Value::String("vllm-vcr".to_owned()));
-            }
-            for child in map.values_mut() {
-                set_signals_provider_kind(child);
-            }
-        },
-        serde_yaml::Value::Sequence(items) => {
-            for child in items {
-                set_signals_provider_kind(child);
-            }
-        },
-        _ => {},
-    }
-}
-
-/// Map the west, central, and east sites to the benchmark’s Pool A/B/C identities.
-fn epp_pool_name_for_site(site: &str) -> Option<&'static str> {
-    match site {
-        "west" => Some("pool-a"),
-        "central" => Some("pool-b"),
-        "east" => Some("pool-c"),
-        _ => None,
-    }
-}
-
-/// Return the images that must be present in every signals Kind node.
-fn signals_image_references() -> Vec<(&'static str, String)> {
-    const DEFAULT_GATEWAY: &str = "ghcr.io/praxis-proxy/ai:0.7.0";
-    let default_backend = if SIGNAL_WORKLOAD.get() == Some(&SignalsWorkload::VllmVcr) {
-        DEFAULT_SIGNALS_VCR_IMAGE
-    } else {
-        "ghcr.io/llm-d/llm-d-inference-sim:v0.10.2"
-    };
-    const DEFAULT_EPP: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0";
-    const DEFAULT_OPERATOR: &str = "grid-operator:signals-local";
-    const DEFAULT_OVERLAY_SYNC: &str = "grid-overlay-sync:signals-local";
-    vec![
-        (
-            "gateway",
-            std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY.to_owned()),
-        ),
-        (
-            "operator",
-            std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| DEFAULT_OPERATOR.to_owned()),
-        ),
-        (
-            "overlay-sync",
-            std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_OVERLAY_SYNC.to_owned()),
-        ),
-        (
-            "simulator",
-            std::env::var("GRID_XTASK_SIM_IMAGE").unwrap_or_else(|_| default_backend.to_owned()),
-        ),
-        (
-            "epp",
-            std::env::var("GRID_XTASK_EPP_IMAGE").unwrap_or_else(|_| DEFAULT_EPP.to_owned()),
-        ),
-    ]
-}
-
-/// Build Grid runtime images from this checkout and pull immutable dependencies before cluster creation.
-fn prepare_signals_images(evidence_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let refs = signals_image_references();
-    let operator = refs
-        .iter()
-        .find(|(role, _)| *role == "operator")
-        .map(|(_, image)| image.as_str())
-        .ok_or("operator image missing")?;
-    let overlay_sync = refs
-        .iter()
-        .find(|(role, _)| *role == "overlay-sync")
-        .map(|(_, image)| image.as_str())
-        .ok_or("overlay-sync image missing")?;
-    let head = git_output(&["rev-parse", "HEAD"])?.trim().to_owned();
-    let tree_status = git_output_bytes(&["status", "--porcelain"])?;
-    let tree_state = if tree_status.is_empty() { "clean" } else { "dirty" };
-    // Kind's `load docker-image` reads from the Docker daemon. Build and pull in
-    // that same image store even when Podman is also installed on the host.
-    let engine = kind_container_engine();
-
-    for (role, image, containerfile) in [
-        ("operator", operator, "deploy/operator/Containerfile"),
-        ("overlay-sync", overlay_sync, "crates/overlay-sync/Containerfile"),
-    ] {
-        if signals_local_image_matches(engine, role, image, &head)? {
-            eprintln!("reusing verified local {role} image {image} for Grid {head}");
-            continue;
-        }
-        eprintln!("building {role} image {image} from Grid {head} ({tree_state})");
-        let status = Command::new(engine)
-            .args([
-                "build",
-                "--build-arg",
-                &format!("GRID_GIT_COMMIT={head}"),
-                "--build-arg",
-                &format!("GRID_GIT_TREE_STATE={tree_state}"),
-                "--build-arg",
-                "GRID_GIT_VERSION=signals-kind-local",
-                "-f",
-                containerfile,
-                "-t",
-                image,
-                ".",
-            ])
-            .status()?;
-        if !status.success() {
-            return Err(format!("{engine} build failed for {role} image {image}").into());
-        }
-    }
-
-    for (role, image) in &refs {
-        if *role == "operator" || *role == "overlay-sync" {
-            continue;
-        }
-        eprintln!("pulling pinned {role} image {image}");
-        let status = Command::new(engine).args(["pull", image]).status()?;
-        if !status.success() {
-            return Err(format!("{engine} pull failed for {role} image {image}").into());
-        }
-    }
-
-    let lock = refs
-        .iter()
-        .map(|(role, image)| inspect_signals_image(engine, role, image))
-        .collect::<Result<Vec<_>, _>>()?;
-    if let Some(simulator) = lock.iter().find(|image| image.role == "simulator") {
-        verify_default_signals_vcr_digest(simulator)?;
-    }
-    write_json_file(
-        &evidence_dir.join("image-lock.json"),
-        &serde_json::json!({
-            "schemaVersion": "1",
-            "source": signals_source_identity()?,
-            "images": lock,
-            "imagePullPolicy": "Never",
-        }),
-    )?;
-    Ok(())
-}
-
-/// Ensure the versioned default VCR tag still resolves to the tested release digest.
-fn verify_default_signals_vcr_digest(image: &SignalsImageLockEntry) -> Result<(), Box<dyn std::error::Error>> {
-    if image.reference != DEFAULT_SIGNALS_VCR_IMAGE {
-        return Ok(());
-    }
-    let expected_digest = format!("ghcr.io/neuralmagic/vllm-vcr@{DEFAULT_SIGNALS_VCR_DIGEST}");
-    if image.repo_digests.iter().any(|digest| digest == &expected_digest) {
-        return Ok(());
-    }
-    Err(format!(
-        "default VCR image {} resolved to {:?}, expected OCI digest {}",
-        image.reference, image.repo_digests, DEFAULT_SIGNALS_VCR_DIGEST
-    )
-    .into())
-}
-
-/// Reuse an existing local Grid image only when OCI labels identify this source and build contract.
-fn signals_local_image_matches(
-    engine: &str,
-    role: &str,
-    image: &str,
-    expected_revision: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let output = Command::new(engine)
-        .args(["image", "inspect", "--format", "{{json .}}", image])
-        .output()?;
-    if !output.status.success() {
-        let listing = Command::new(engine).args(["image", "ls", "-q", image]).output()?;
-        if !listing.status.success() {
-            return Err(format!(
-                "{engine} could not determine whether local {role} image {image} exists: {}",
-                String::from_utf8_lossy(&listing.stderr).trim()
-            )
-            .into());
-        }
-        if String::from_utf8_lossy(&listing.stdout).trim().is_empty() {
-            return Ok(false);
-        }
-        return Err(format!("local {role} image tag {image} exists but cannot be inspected").into());
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let labels = value.pointer("/Config/Labels");
-    let revision = labels
-        .and_then(|labels| labels.get("org.opencontainers.image.revision"))
-        .and_then(serde_json::Value::as_str);
-    let source = labels
-        .and_then(|labels| labels.get("org.opencontainers.image.source"))
-        .and_then(serde_json::Value::as_str);
-    let version = labels
-        .and_then(|labels| labels.get("org.opencontainers.image.version"))
-        .and_then(serde_json::Value::as_str);
-    if revision != Some(expected_revision)
-        || source != Some("https://github.com/praxis-proxy/grid")
-        || version != Some("signals-kind-local")
-    {
-        return Err(format!(
-            "local {role} image {image} has mismatched source labels (revision={revision:?}, source={source:?}, version={version:?}); refusing reuse"
-        )
-        .into());
-    }
-    Ok(true)
-}
-
-/// Capture an image reference’s immutable host ID, registry digests, and source revision.
-fn inspect_signals_image(
-    engine: &str,
-    role: &str,
-    image: &str,
-) -> Result<SignalsImageLockEntry, Box<dyn std::error::Error>> {
-    let output = Command::new(engine)
-        .args(["image", "inspect", "--format", "{{json .}}", image])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "unable to inspect {role} image {image}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let image_id = value.get("Id").and_then(serde_json::Value::as_str).unwrap_or_default();
-    if image_id.is_empty() {
-        return Err(format!("{role} image {image} has no immutable host image ID").into());
-    }
-    let os = value.get("Os").and_then(serde_json::Value::as_str).unwrap_or_default();
-    let architecture = value
-        .get("Architecture")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let platform = format!("{os}/{architecture}");
-    if platform != kind_image_platform()? {
-        return Err(format!(
-            "{role} image {image} uses {platform}, but Kind host platform is {}",
-            kind_image_platform()?
-        )
-        .into());
-    }
-    let repo_digests = value
-        .get("RepoDigests")
-        .and_then(serde_json::Value::as_array)
-        .map(|digests| {
-            digests
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    let source_revision = value
-        .pointer("/Config/Labels/org.opencontainers.image.revision")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    Ok(SignalsImageLockEntry {
-        role: role.to_owned(),
-        reference: image.to_owned(),
-        image_id: image_id.to_owned(),
-        platform,
-        repo_digests,
-        source_revision,
-    })
-}
-
-/// Scope cluster and Forge environment identities to this run.
-fn apply_signals_run_scope(config: &mut serde_yaml::Value, prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
-    set_forge_path_string(config, &["metadata", "name"], prefix)?;
-    set_forge_path_string(config, &["spec", "runtime", "clusterPrefix"], prefix)?;
-    set_forge_path_string(config, &["spec", "network", "dnsZone"], &format!("{prefix}.test"))?;
-    replace_forge_string_values(config, "kind-grid-signals-", &format!("kind-{prefix}-"));
-    replace_forge_string_values(config, "kind-grid-combined-", &format!("kind-{prefix}-"));
-    Ok(())
-}
-
-/// Set one string property in a Forge YAML mapping.
-fn set_forge_string(mapping: &mut serde_yaml::Mapping, key: &str, value: &str) {
-    mapping.insert(key.to_owned().into(), serde_yaml::Value::String(value.to_owned()));
-}
-
-/// Split an image reference into the Forge repository, tag, and digest properties.
-fn set_forge_image_repo_tag(mapping: &mut serde_yaml::Mapping, key: &str, image: &str) {
-    let (repository, tag, digest) = if let Some((repository, digest)) = image.split_once('@') {
-        (repository, "latest", digest)
-    } else {
-        let slash = image.rfind('/').unwrap_or(0);
-        match image.rfind(':') {
-            Some(colon) if colon > slash => (&image[..colon], &image[colon + 1..], ""),
-            _ => (image, "latest", ""),
-        }
-    };
-    set_forge_string(mapping, &format!("{key}Repo"), repository);
-    set_forge_string(mapping, &format!("{key}Tag"), tag);
-    set_forge_string(mapping, &format!("{key}Digest"), digest);
-}
-
-/// Set a string at a nested Forge YAML path, failing if its parent path is absent.
-fn set_forge_path_string(
-    value: &mut serde_yaml::Value,
-    path: &[&str],
-    replacement: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut current = value;
-    for part in path.iter().take(path.len().saturating_sub(1)) {
-        current = current
-            .get_mut(*part)
-            .ok_or_else(|| format!("signals Forge config is missing {part}"))?;
-    }
-    let last = path.last().ok_or("empty Forge value path")?;
-    let mapping = current
-        .as_mapping_mut()
-        .ok_or("signals Forge path parent is not a mapping")?;
-    mapping.insert(
-        (*last).to_owned().into(),
-        serde_yaml::Value::String(replacement.to_owned()),
-    );
-    Ok(())
-}
-
-/// Recursively replace occurrences in string values of a Forge configuration.
-fn replace_forge_string_values(value: &mut serde_yaml::Value, needle: &str, replacement: &str) {
-    match value {
-        serde_yaml::Value::String(text) => {
-            if text.contains(needle) {
-                *text = text.replace(needle, replacement);
-            }
-        },
-        serde_yaml::Value::Sequence(sequence) => {
-            for item in sequence {
-                replace_forge_string_values(item, needle, replacement);
-            }
-        },
-        serde_yaml::Value::Mapping(mapping) => {
-            for item in mapping.values_mut() {
-                replace_forge_string_values(item, needle, replacement);
-            }
-        },
-        serde_yaml::Value::Null
-        | serde_yaml::Value::Bool(_)
-        | serde_yaml::Value::Number(_)
-        | serde_yaml::Value::Tagged(_) => {},
-    }
 }
 
 /// Rewrite each site's operator and grid-site stacks for Local membership.
@@ -5914,7 +5119,7 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_all_discovered_sites(GRID_NETWORK, TRUST_TIMEOUT)?;
 
     for local in CLUSTERS {
-        let context = combined_kubectl_context(local);
+        let context = format!("kind-grid-combined-{local}");
         eprintln!();
         eprintln!("  {local}: authorizing remote provider sites");
         for remote in CLUSTERS {
@@ -5923,7 +5128,7 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
             }
             let site_name = format!("{GRID_NETWORK}-{remote}");
             operator::wait_for_auto_gridsite(&context, &site_name, GRID_NETWORK, TRUST_TIMEOUT)?;
-            let canonical_fp = combined_site_certificate_fingerprint(remote)?;
+            let canonical_fp = certs::site_certificate_fingerprint(remote)?;
             operator::wait_for_expected_site_certificate(&context, &site_name, &canonical_fp, TRUST_TIMEOUT)?;
             let server_name = format!("{remote}.grid.internal");
             operator::patch_gridsite_identity_trust(&context, &site_name, &canonical_fp, &server_name)?;
@@ -5944,7 +5149,7 @@ fn wait_for_all_discovered_sites(network: &str, timeout: Duration) -> Result<(),
     loop {
         let mut missing = Vec::new();
         for local in CLUSTERS {
-            let context = combined_kubectl_context(local);
+            let context = format!("kind-grid-combined-{local}");
             for remote in CLUSTERS {
                 if local == remote {
                     continue;
@@ -6094,21 +5299,16 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
     eprintln!("[SETUP {}/{}] Verifying Grid operators are ready", next(), total_phases);
 
     for cluster in CLUSTERS {
-        let ctx = combined_kubectl_context(cluster);
+        let ctx = format!("kind-grid-combined-{cluster}");
         wait_for_deployment("grid-operator", GRID_SYSTEM_NS, &ctx)?;
         eprintln!("  [OK] {cluster}: Grid operator ready");
     }
 
     eprintln!();
-    eprintln!(
-        "[SETUP {}/{}] Deploying llm-d simulator, EPP, and backend access",
-        next(),
-        total_phases
-    );
+    eprintln!("[SETUP {}/{}] Deploying VCR backends", next(), total_phases);
 
     for cluster in CLUSTERS {
-        apply_stack(&context.forge_bin, &context.resolved_config, cluster, "llmd-backend")?;
-        let ctx = combined_kubectl_context(cluster);
+        let ctx = format!("kind-grid-combined-{cluster}");
         let credential = generate_provider_credential();
         apply_credential_secret(&ctx, VCR_INFERENCE_CREDENTIAL, &credential)?;
         eprintln!("  [OK] {cluster}: vcr-inference-credential created");
@@ -6591,7 +5791,7 @@ fn configure_swim_peers(_forge_bin: &Path, _resolved_config: &Path) -> Result<()
     }
 
     for cluster in CLUSTERS {
-        let ctx = combined_kubectl_context(cluster);
+        let ctx = format!("kind-grid-combined-{cluster}");
         wait_for_deployment("grid-operator", GRID_SYSTEM_NS, &ctx)?;
         eprintln!("  [OK] {cluster}: operator restarted with SWIM config");
     }
@@ -6651,7 +5851,7 @@ fn declare_local_peers() -> Result<(), Box<dyn std::error::Error>> {
                 (*remote).to_owned(),
                 serde_json::json!({
                     "address": format!("{gateway}:{PROVIDER_GATEWAY_PORT}"),
-                    "digest": combined_site_certificate_fingerprint(remote)?,
+                    "digest": certs::site_certificate_fingerprint(remote)?,
                     "signalsEndpoint": {
                         "address": format!("{signals}:{SIGNALS_PORT}"),
                         "serverName": format!("{remote}.grid.internal"),
@@ -6659,7 +5859,7 @@ fn declare_local_peers() -> Result<(), Box<dyn std::error::Error>> {
                 }),
             );
         }
-        let context = combined_kubectl_context(local);
+        let context = format!("kind-grid-combined-{local}");
         let output = Command::new("helm")
             .args([
                 "upgrade",
@@ -6687,7 +5887,7 @@ fn declare_local_peers() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for local in CLUSTERS {
-        let context = combined_kubectl_context(local);
+        let context = format!("kind-grid-combined-{local}");
         for remote in CLUSTERS.iter().filter(|remote| *remote != local) {
             operator::wait_for_gridsite_phase(&context, remote, "Active", PEER_TIMEOUT)?;
         }
@@ -6703,7 +5903,7 @@ fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> 
 
 /// Read the ingress IP of LoadBalancer `service` in a cluster.
 fn read_lb_ip(cluster: &str, service: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(cluster);
+    let context = format!("kind-grid-combined-{cluster}");
     let output = Command::new("kubectl")
         .args([
             "--context",
@@ -6740,7 +5940,7 @@ fn update_operator_swim_config(
     advertise_ip: &str,
     seeds: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(cluster);
+    let context = format!("kind-grid-combined-{cluster}");
 
     let operator_image =
         std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:combined-site-demo".to_owned());
@@ -6849,7 +6049,7 @@ fn configure_external_provider(
     site: &str,
     key_file: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(site);
+    let context = format!("kind-grid-combined-{site}");
 
     create_external_provider_secret(external_provider, site, &context, key_file)?;
     create_external_inference_provider(external_provider, site, &context)?;
@@ -6972,7 +6172,7 @@ fn create_external_inference_provider(
     reason = "Inline YAML manifests for Deployment, Service, InferenceProvider"
 )]
 fn deploy_secondary_mock_provider(site: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(site);
+    let context = format!("kind-grid-combined-{site}");
     let vcr_image = crate::env::image_overrides::sim_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
     let deploy_name = format!("vcr-inference-{site}-secondary");
@@ -7139,7 +6339,7 @@ spec:
 
 /// Remove the secondary VCR provider from the specified site.
 fn remove_secondary_mock_provider(site: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(site);
+    let context = format!("kind-grid-combined-{site}");
     let deploy_name = format!("vcr-inference-{site}-secondary");
     let provider_name = format!("vcr-{site}-provider-secondary");
 
@@ -7301,7 +6501,7 @@ fn append_secondary_consumer_config(config: &str) -> Result<String, Box<dyn std:
 /// each consumer rollout before issuing requests against the new candidate.
 fn rematerialize_consumers_for_secondary() -> Result<(), Box<dyn std::error::Error>> {
     for site in CLUSTERS {
-        let context = combined_kubectl_context(site);
+        let context = format!("kind-grid-combined-{site}");
         let current = kubectl::get_configmap_yaml(&context, GRID_SYSTEM_NS, "consumer-gateway-config")?;
         let document: serde_yaml::Value = serde_yaml::from_str(&current)?;
         let config = document
@@ -7346,7 +6546,7 @@ fn capture_consumer_configs() -> Result<BTreeMap<String, String>, Box<dyn std::e
     CLUSTERS
         .iter()
         .map(|site| {
-            let context = combined_kubectl_context(site);
+            let context = format!("kind-grid-combined-{site}");
             let current = kubectl::get_configmap_yaml(&context, GRID_SYSTEM_NS, "consumer-gateway-config")?;
             let document: serde_yaml::Value = serde_yaml::from_str(&current)?;
             let config = document
@@ -7363,7 +6563,7 @@ fn capture_consumer_configs() -> Result<BTreeMap<String, String>, Box<dyn std::e
 fn restore_consumer_configs(snapshots: &BTreeMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
     for site in CLUSTERS {
         let Some(original) = snapshots.get(*site) else { continue };
-        let context = combined_kubectl_context(site);
+        let context = format!("kind-grid-combined-{site}");
         let current = kubectl::get_configmap_yaml(&context, GRID_SYSTEM_NS, "consumer-gateway-config")?;
         let document: serde_yaml::Value = serde_yaml::from_str(&current)?;
         let current_config = document
@@ -7449,7 +6649,7 @@ fn rematerialize_site_provider_config(
         rendered = append_secondary_mock_config(&rendered, site, &secondary_id)?;
     }
 
-    let context = combined_kubectl_context(site);
+    let context = format!("kind-grid-combined-{site}");
     let dry_run = Command::new("kubectl")
         .args([
             "--context",
@@ -7696,7 +6896,7 @@ fn wait_for_site_model_absent_all_sites(
 fn record_gateway_deployment_state() -> BTreeMap<String, (String, i64)> {
     let mut state = BTreeMap::new();
     for cluster in CLUSTERS {
-        let context = combined_kubectl_context(cluster);
+        let context = format!("kind-grid-combined-{cluster}");
         for deployment in ["provider-gateway", "consumer-gateway", "grid-operator"] {
             let key = format!("{cluster}/{deployment}");
             let output = Command::new("kubectl")
@@ -7743,7 +6943,7 @@ fn apply_provider_gateway_stack(
     if !status.success() {
         return Err(format!("failed to apply {stack} to {site}").into());
     }
-    let context = combined_kubectl_context(site);
+    let context = format!("kind-grid-combined-{site}");
     restart_provider_gateway(&context)?;
     let rollout = Command::new("kubectl")
         .args([
@@ -7812,7 +7012,7 @@ fn probe_secondary_model_with_retry(
     expected_backend_cluster: &str,
     timeout: Duration,
 ) -> Result<BTreeMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(from_cluster);
+    let context = format!("kind-grid-combined-{from_cluster}");
     let interval = Duration::from_secs(5);
     let start = Instant::now();
     let mut last_observation = "no successful curl execution".to_owned();
@@ -7934,7 +7134,7 @@ fn lifecycle_add_provider(
         probe_secondary_model_with_retry(site, site, "vcr-backend-secondary", COMBINED_SITE_DATA_PLANE_WAIT)?;
     facts.extend(probe_facts);
 
-    let primary_ctx = combined_kubectl_context(site);
+    let primary_ctx = format!("kind-grid-combined-{site}");
     let primary_output = run_curl_probe(
         &primary_ctx,
         &format!("lifecycle-pri-{site}"),
@@ -8026,7 +7226,7 @@ fn lifecycle_remove_provider(
     apply_provider_gateway_stack(forge_bin, resolved_config, site, external_site)?;
 
     for cluster in CLUSTERS {
-        let ctx = combined_kubectl_context(cluster);
+        let ctx = format!("kind-grid-combined-{cluster}");
         let output = run_curl_probe(
             &ctx,
             &format!("lifecycle-rm-{cluster}"),
@@ -8070,7 +7270,7 @@ fn lifecycle_assert_removed_candidate_not_selected() -> AssertionResult {
     let mut facts = BTreeMap::new();
 
     for cluster in CLUSTERS {
-        let ctx = combined_kubectl_context(cluster);
+        let ctx = format!("kind-grid-combined-{cluster}");
         let body = format!(
             r#"{{"model": "{SECONDARY_MODEL}", "messages": [{{"role":"user","content":"hello"}}], "max_tokens": 16}}"#
         );
@@ -8152,7 +7352,7 @@ fn lifecycle_cleanup(
         apply_provider_gateway_stack(forge_bin, resolved_config, site, external_site)?;
         restore_consumer_configs(consumer_snapshots)?;
 
-        let ctx = combined_kubectl_context(site);
+        let ctx = format!("kind-grid-combined-{site}");
         let output = run_curl_probe(
             &ctx,
             "lifecycle-cleanup-verify",
@@ -8588,2531 +7788,9 @@ fn teardown_environment(context: &CombinedSiteContext) -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Create a run-owned, persistent signals environment and stop after a small
-/// pressure/recovery proof. Setup failures deliberately retain all resources.
-pub(crate) fn run_signals_environment(
-    forge_config: &Path,
-    requested_run_id: Option<&str>,
-    evidence_root: &Path,
-    infra_only: bool,
-    workload: SignalsWorkload,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if workload == SignalsWorkload::VllmVcr && !infra_only {
-        return Err("vllm-vcr requires --infra-only until request-driven signal qualification is implemented".into());
-    }
-    if infra_only && workload != SignalsWorkload::VllmVcr {
-        return Err("--infra-only currently requires --workload vllm-vcr".into());
-    }
-    let run_id = requested_run_id
-        .map(str::to_owned)
-        .or_else(|| std::env::var("GRID_SIGNALS_INTERNAL_RUN_ID").ok())
-        .unwrap_or_else(default_signals_run_id);
-    validate_signals_run_id(&run_id)?;
-    if std::env::var("GRID_SIGNALS_INTERNAL_CHILD").as_deref() != Ok("1") {
-        fs::create_dir_all(evidence_root)?;
-        let evidence_root = evidence_root.canonicalize()?;
-        let kubeconfig = evidence_root.join(&run_id).join("kubeconfig");
-        let operator_image =
-            std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| format!("grid-operator:signals-{run_id}"));
-        let overlay_sync_image = std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE")
-            .unwrap_or_else(|_| format!("grid-overlay-sync:signals-{run_id}"));
-        let executable = std::env::current_exe()?;
-        let mut command = Command::new(executable);
-        command
-            .args(std::env::args_os().skip(1))
-            .env("GRID_SIGNALS_INTERNAL_CHILD", "1")
-            .env("GRID_SIGNALS_INTERNAL_RUN_ID", &run_id)
-            .env("GRID_XTASK_IMAGE_PULL_POLICY", "Never")
-            .env("KUBECONFIG", kubeconfig);
-        if std::env::var_os("GRID_XTASK_OPERATOR_IMAGE").is_none() {
-            command.env("GRID_XTASK_OPERATOR_IMAGE", operator_image);
-        }
-        if std::env::var_os("GRID_XTASK_OVERLAY_SYNC_IMAGE").is_none() {
-            command.env("GRID_XTASK_OVERLAY_SYNC_IMAGE", overlay_sync_image);
-        }
-        let status = command.status()?;
-        if !status.success() {
-            return Err(format!("persistent signals setup subprocess exited with {status}").into());
-        }
-        return Ok(());
-    }
-    let prefix = format!("grid-signals-{run_id}");
-    let evidence_dir = evidence_root.join(&run_id);
-    fs::create_dir_all(evidence_root)?;
-    fs::create_dir(&evidence_dir).map_err(|error| {
-        format!(
-            "refusing to reuse signals evidence directory {}: {error}",
-            evidence_dir.display()
-        )
-    })?;
-    let evidence_dir = evidence_dir.canonicalize()?;
-    let cert_dir = evidence_dir.join("certs");
-    let kubeconfig = evidence_dir.join("kubeconfig");
-    fs::create_dir_all(&cert_dir)?;
-    fs::write(&kubeconfig, "")?;
-    set_private_file_permissions(&kubeconfig)?;
-
-    SIGNAL_RUN_PREFIX
-        .set(prefix.clone())
-        .map_err(|held| format!("signals environment prefix was already set to {held}"))?;
-    SIGNAL_EVIDENCE_DIR.set(evidence_dir.clone()).map_err(|held| {
-        format!(
-            "signals evidence directory was already initialized at {}",
-            held.display()
-        )
-    })?;
-    SIGNAL_CERTS_DIR.set(cert_dir).map_err(|held| {
-        format!(
-            "signals certificate directory was already initialized at {}",
-            held.display()
-        )
-    })?;
-    SIGNAL_WORKLOAD
-        .set(workload)
-        .map_err(|_| "signals workload was already initialized")?;
-    MEMBERSHIP
-        .set(Membership::Swim)
-        .map_err(|held| format!("combined-site membership was already set to {held:?}"))?;
-    if std::env::var_os("KUBECONFIG").as_deref() != Some(kubeconfig.as_os_str()) {
-        return Err("setup subprocess did not inherit the isolated KUBECONFIG path".into());
-    }
-
-    let cluster_names = CLUSTERS
-        .iter()
-        .map(|site| format!("{prefix}-{site}"))
-        .collect::<Vec<_>>();
-    ensure_signals_resources_absent(&prefix, &cluster_names)?;
-    let forge_bin = glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?;
-    let resolved_config = evidence_dir.join("forge-resolved.yaml");
-    let forge_state_dir = super::forge_config::state_dir_for_config(&resolved_config)?;
-    fs::create_dir_all(&forge_state_dir)?;
-
-    let mut manifest = SignalsRunManifest {
-        schema_version: "1".to_owned(),
-        run_id: run_id.clone(),
-        cluster_prefix: prefix,
-        cluster_names,
-        evidence_dir: evidence_dir.clone(),
-        resolved_forge_config: resolved_config,
-        forge_state_dir,
-        forge_bin: forge_bin.into(),
-        lifecycle: "starting".to_owned(),
-        network: None,
-    };
-    write_signals_manifest(&evidence_dir, &manifest)?;
-    record_signals_event(
-        &evidence_dir,
-        &serde_json::json!({
-            "event": "start",
-            "timestamp": format_utc_iso(),
-            "runId": run_id,
-            "source": signals_source_identity()?,
-            "requestedForgeConfig": forge_config,
-            "resolvedForgeConfig": manifest.resolved_forge_config,
-            "kubeconfig": kubeconfig,
-            "clusterNames": manifest.cluster_names,
-        }),
-    )?;
-
-    let result = (|| {
-        prepare_signals_images(&evidence_dir)?;
-        let context = prepare_setup(forge_config, None, None, None, &run_id)?;
-        if context.resolved_config != manifest.resolved_forge_config {
-            return Err("resolved Forge config escaped the run-owned evidence directory".into());
-        }
-        fs::write(
-            evidence_dir.join("forge-state-dir.txt"),
-            format!("{}\n", context.forge_state_dir.display()),
-        )?;
-        record_signals_event(
-            &evidence_dir,
-            &serde_json::json!({
-                "event": "provision-start",
-                "timestamp": format_utc_iso(),
-                "forgeConfig": context.resolved_config,
-            }),
-        )?;
-
-        provision_signals_network(&mut manifest)?;
-        let overlay_state = deploy_setup(&context)?;
-        write_json_file(&evidence_dir.join("initial-overlay-state.json"), &overlay_state)?;
-        record_signals_event(
-            &evidence_dir,
-            &serde_json::json!({
-                "event": "provision-ready",
-                "timestamp": format_utc_iso(),
-                "overlayState": overlay_state,
-            }),
-        )?;
-
-        if infra_only {
-            write_signals_infra_handoff(&evidence_dir, &run_id, workload, &manifest)?;
-            "infra-ready".clone_into(&mut manifest.lifecycle);
-        } else {
-            let handoff = qualify_signals_environment(&evidence_dir, &run_id)?;
-            write_json_file(&evidence_dir.join("handoff.json"), &handoff)?;
-            "ready".clone_into(&mut manifest.lifecycle);
-        }
-        write_signals_manifest(&evidence_dir, &manifest)?;
-        record_signals_event(
-            &evidence_dir,
-            &serde_json::json!({
-                "event": "environment-ready",
-                "timestamp": format_utc_iso(),
-                "handoff": if infra_only { evidence_dir.join("infra-handoff.json") } else { evidence_dir.join("handoff.json") },
-                "qualification": if infra_only { "NOT_RUN" } else { "PASS" },
-            }),
-        )?;
-        eprintln!("\nPersistent signals environment is ready.");
-        eprintln!(
-            "  handoff: {}",
-            evidence_dir
-                .join(if infra_only {
-                    "infra-handoff.json"
-                } else {
-                    "handoff.json"
-                })
-                .display()
-        );
-        eprintln!(
-            "  cleanup: cargo xtask env clean-grid-combined-site-signals --manifest {}",
-            evidence_dir.join("run-manifest.json").display()
-        );
-        Ok::<(), Box<dyn std::error::Error>>(())
-    })();
-
-    if let Err(error) = result {
-        "failed-retained".clone_into(&mut manifest.lifecycle);
-        if let Err(capture_error) = write_signals_manifest(&evidence_dir, &manifest) {
-            eprintln!("[WARN] unable to update retained-failure manifest: {capture_error}");
-        }
-        if let Err(capture_error) = capture_signals_diagnostics(&evidence_dir, &manifest.cluster_names) {
-            eprintln!("[WARN] unable to capture setup failure diagnostics: {capture_error}");
-        }
-        if let Err(capture_error) = record_signals_event(
-            &evidence_dir,
-            &serde_json::json!({
-                "event": "setup-failed-retained",
-                "timestamp": format_utc_iso(),
-                "error": error.to_string(),
-            }),
-        ) {
-            eprintln!("[WARN] unable to append setup failure event: {capture_error}");
-        }
-        return Err(format!(
-            "signals setup failed; run-owned resources and evidence were retained at {}: {error}",
-            evidence_dir.display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Export an honest setup-only handoff. Gridzilla can use the endpoint config
-/// for HTTP traffic, while its Grid signal scenario requires a qualified handoff.
-fn write_signals_infra_handoff(
-    evidence_dir: &Path,
-    run_id: &str,
-    workload: SignalsWorkload,
-    manifest: &SignalsRunManifest,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for site in CLUSTERS {
-        let context = combined_kubectl_context(site);
-        for deployment in ["grid-operator", "llmd-epp", "provider-gateway", "consumer-gateway"] {
-            wait_for_deployment(deployment, GRID_SYSTEM_NS, &context)?;
-        }
-        wait_for_deployment(&format!("vcr-inference-{site}"), GRID_SYSTEM_NS, &context)?;
-    }
-    let gateway_ip = read_lb_ip("west", "consumer-gateway")?;
-    let credentials_dir = evidence_dir.join("credentials");
-    fs::create_dir_all(&credentials_dir)?;
-    let credential_file = credentials_dir.join("gateway-client.token");
-    fs::write(&credential_file, "consumer-token\n")?;
-    set_private_file_permissions(&credential_file)?;
-    let endpoint_dir = evidence_dir.join("endpoints");
-    fs::create_dir_all(&endpoint_dir)?;
-    let endpoint_config = endpoint_dir.join("gridzilla-vcr.json");
-    write_json_file(
-        &endpoint_config,
-        &serde_json::json!({
-            "id": "grid-signals-vcr",
-            "name": "Grid signals VCR gateway",
-            "url": format!("http://{gateway_ip}:8080/v1/chat/completions"),
-            "requestTemplate": {
-                "model": "Qwen/Qwen3-0.6B",
-                "messages": [{"role": "user", "content": "Gridzilla VCR benchmark"}],
-                "max_tokens": 8
-            },
-            "padJsonPointer": "/messages/0/content",
-            "credentialFile": credential_file,
-            "expectedStatuses": [200],
-        }),
-    )?;
-    write_json_file(
-        &evidence_dir.join("infra-handoff.json"),
-        &serde_json::json!({
-            "schemaVersion": "grid-signals-infra/v1alpha1",
-            "runId": run_id,
-            "workload": match workload {
-                SignalsWorkload::LlmdSim => "llm-d-sim",
-                SignalsWorkload::VllmVcr => "vllm-vcr",
-            },
-            "status": "INFRA_READY",
-            "qualification": "NOT_RUN",
-            "createdAtUtc": format_utc_iso(),
-            "source": signals_source_identity()?,
-            "imageLock": evidence_dir.join("image-lock.json"),
-            "clusterNames": manifest.cluster_names,
-            "kubeconfig": evidence_dir.join("kubeconfig"),
-            "endpointConfig": endpoint_config,
-            "cleanupManifest": evidence_dir.join("run-manifest.json"),
-        }),
-    )?;
-    Ok(())
-}
-
-/// Clean up only exact cluster names described by a validated run manifest.
-pub(crate) fn clean_signals_environment(manifest_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest_path = manifest_path.canonicalize()?;
-    let mut manifest: SignalsRunManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-    validate_signals_manifest(&manifest, &manifest_path)?;
-    let existing = kind_clusters()?;
-    for cluster in &manifest.cluster_names {
-        if !existing.contains(cluster) {
-            continue;
-        }
-        let output = Command::new("timeout")
-            .args(["120s", "kind", "delete", "cluster", "--name", cluster])
-            .env("KUBECONFIG", manifest.evidence_dir.join("kubeconfig"))
-            .output()?;
-        if !output.status.success() && kind_cluster_exists(cluster)? {
-            return Err(format!(
-                "failed to remove run-owned cluster {cluster}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        if kind_cluster_exists(cluster)? {
-            return Err(format!("run-owned Kind cluster {cluster} remains after deletion").into());
-        }
-    }
-    let down = super::forge_config::command(&manifest.forge_bin, &manifest.resolved_forge_config)?
-        .args(["down", "--config"])
-        .arg(&manifest.resolved_forge_config)
-        .env("KUBECONFIG", manifest.evidence_dir.join("kubeconfig"))
-        .output()?;
-    if !down.status.success() {
-        return Err(format!(
-            "Forge cleanup failed for owned config {}: {}",
-            manifest.resolved_forge_config.display(),
-            String::from_utf8_lossy(&down.stderr).trim()
-        )
-        .into());
-    }
-    remove_signals_network(&manifest)?;
-    let remaining = kind_clusters()?;
-    let owned_remaining = manifest
-        .cluster_names
-        .iter()
-        .filter(|cluster| remaining.contains(*cluster))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !owned_remaining.is_empty() {
-        return Err(format!("cleanup left run-owned Kind clusters: {}", owned_remaining.join(", ")).into());
-    }
-    "cleaned".clone_into(&mut manifest.lifecycle);
-    write_signals_manifest(&manifest.evidence_dir, &manifest)?;
-    record_signals_event(
-        &manifest.evidence_dir,
-        &serde_json::json!({
-            "event": "cleanup-complete",
-            "timestamp": format_utc_iso(),
-            "removedClusters": manifest.cluster_names,
-            "unrelatedClustersPreserved": true,
-        }),
-    )?;
-    eprintln!("Removed only clusters owned by run {}.", manifest.run_id);
-    Ok(())
-}
-
-/// Prove authenticated metrics, ready providers, baseline routing, signal-driven route change, and recovery.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the bounded setup process assembles the three-site evidence handoff in one phase"
-)]
-fn qualify_signals_environment(
-    evidence_dir: &Path,
-    run_id: &str,
-) -> Result<SignalsHandoff, Box<dyn std::error::Error>> {
-    const QUEUE_METRIC: &str = "llm_d_epp_average_queue_size";
-    const EPP_METRICS_TIMEOUT: Duration = Duration::from_secs(180);
-    const OVERLAY_TIMEOUT: Duration = Duration::from_secs(180);
-    const PROVIDER_READY_TIMEOUT: Duration = Duration::from_secs(180);
-    let credentials_dir = evidence_dir.join("credentials");
-    fs::create_dir_all(&credentials_dir)?;
-    let client_credential = credentials_dir.join("gateway-client.token");
-    fs::write(&client_credential, "consumer-token\n")?;
-    set_private_file_permissions(&client_credential)?;
-
-    let mut metrics_tokens = BTreeMap::new();
-    let mut simulator_targets = BTreeMap::<String, Vec<SimulatorTarget>>::new();
-    let mut simulator_snapshots = BTreeMap::<String, Vec<serde_json::Value>>::new();
-    let mut runtime_images = Vec::new();
-    let mut epp_evidence = BTreeMap::new();
-
-    for site in CLUSTERS {
-        let context_name = combined_kubectl_context(site);
-        wait_for_deployment("llmd-epp", GRID_SYSTEM_NS, &context_name)?;
-        wait_for_deployment(&format!("vcr-inference-{site}"), GRID_SYSTEM_NS, &context_name)?;
-        wait_for_provider_available(site, PROVIDER_READY_TIMEOUT)?;
-
-        let token = mint_epp_metrics_token(site)?;
-        let token_file = credentials_dir.join(format!("{site}-epp-metrics.token"));
-        fs::write(&token_file, format!("{token}\n"))?;
-        set_private_file_permissions(&token_file)?;
-        metrics_tokens.insert((*site).to_owned(), token.clone());
-
-        let unauthenticated = scrape_epp_metrics(site, None)?;
-        if unauthenticated.status != 401 && unauthenticated.status != 403 {
-            return Err(format!(
-                "{site}: unauthenticated EPP metrics request was not denied (HTTP {})",
-                unauthenticated.status
-            )
-            .into());
-        }
-        let pool_name = epp_pool_name_for_site(site).ok_or_else(|| format!("unknown signals EPP site {site}"))?;
-        let metrics = wait_for_fresh_epp_metric(site, &token, QUEUE_METRIC, EPP_METRICS_TIMEOUT)?;
-        let value = epp_metric_for_pool(&metrics.body, QUEUE_METRIC, pool_name)?;
-        fs::write(evidence_dir.join(format!("epp-metrics-{site}.txt")), &metrics.body)?;
-        epp_evidence.insert(
-            (*site).to_owned(),
-            serde_json::json!({
-                "unauthenticatedStatus": unauthenticated.status,
-                "authenticatedStatus": metrics.status,
-                "capturedAt": format_utc_iso(),
-                "metric": QUEUE_METRIC,
-                "pool": site,
-                "value": value,
-                "service": "llmd-epp-metrics.grid-system.svc.cluster.local:9090",
-                "tokenFile": token_file,
-                "responseSha256": hex::encode(Sha256::digest(metrics.body.as_bytes())),
-            }),
-        );
-
-        let targets = read_simulator_targets(site)?;
-        if targets.is_empty() {
-            return Err(format!("{site}: no ready llm-d-sim pods found").into());
-        }
-        let mut snapshots = Vec::new();
-        for target in &targets {
-            let config = simulator_admin_request(target, "GET", None)?;
-            let fake = fake_metrics_from_config(&config)?;
-            snapshots.push(serde_json::json!({
-                "target": target,
-                "capturedAt": format_utc_iso(),
-                "config": config,
-                "fakeMetrics": fake,
-            }));
-        }
-        simulator_targets.insert((*site).to_owned(), targets);
-        simulator_snapshots.insert((*site).to_owned(), snapshots);
-        runtime_images.extend(read_runtime_images(site)?);
-    }
-    validate_signals_runtime_images(&runtime_images)?;
-    write_json_file(&evidence_dir.join("epp-metrics-baseline.json"), &epp_evidence)?;
-    write_json_file(
-        &evidence_dir.join("simulator-original-configs.json"),
-        &simulator_snapshots,
-    )?;
-    write_json_file(&evidence_dir.join("runtime-images.json"), &runtime_images)?;
-
-    let baseline_overlays = wait_for_signal_overlays(OVERLAY_TIMEOUT)?;
-    verify_mounted_overlay_revisions(&baseline_overlays, OVERLAY_TIMEOUT)?;
-    let west_baseline_overlay = baseline_overlays
-        .get("west")
-        .ok_or("baseline overlay inventory omitted Pool A site west")?;
-    record_signals_event(
-        evidence_dir,
-        &serde_json::json!({
-            "event":"gateway-mounted-baseline-revisions-verified",
-            "timestamp":format_utc_iso(),
-            "sites":baseline_overlays.keys().collect::<Vec<_>>(),
-            "revisions":baseline_overlays.iter().map(|(site, overlay)| (site.clone(), overlay.semantic_revision.clone())).collect::<BTreeMap<_, _>>(),
-        }),
-    )?;
-    write_json_file(&evidence_dir.join("baseline-overlays.json"), &baseline_overlays)?;
-
-    let west_ip = read_lb_ip("west", "consumer-gateway")?;
-    let gateway_url = format!("http://{west_ip}:8080/v1/chat/completions");
-    let request_id = format!("gridzilla-{run_id}-baseline");
-    let baseline = send_signals_probe(&gateway_url, &client_credential, &request_id)?;
-    let expected_initial_site = overlay_first_candidate(west_baseline_overlay)?;
-    if baseline.provider_site != expected_initial_site {
-        return Err(format!(
-            "baseline request selected provider {}, while the current west Gateway overlay ranks {} first",
-            baseline.provider_site, expected_initial_site
-        )
-        .into());
-    }
-    if baseline.provider_site != "west" {
-        return Err(format!(
-            "Pool A pressure is gated on west being the baseline rank-0 provider; the authenticated request selected {}",
-            baseline.provider_site
-        )
-        .into());
-    }
-    write_json_file(&evidence_dir.join("baseline-probe.json"), &baseline)?;
-    record_signals_event(
-        evidence_dir,
-        &serde_json::json!({
-            "event": "baseline-attributed-request",
-            "timestamp": baseline.timestamp,
-            "requestId": baseline.request_id,
-            "status": baseline.status,
-            "providerSite": baseline.provider_site,
-            "backendCluster": baseline.backend_cluster,
-            "overlayRevision": west_baseline_overlay.semantic_revision,
-        }),
-    )?;
-
-    // Pressure the winner selected by the actual current overlay. This makes the
-    // probe independent of deterministic tie-breaking among initially equal sites.
-    let pressured_site = "west".to_owned();
-    let pressured_pool = epp_pool_name_for_site(&pressured_site).ok_or("Pool A site west has no EPP pool identity")?;
-    let pressured_token = metrics_tokens
-        .get(&pressured_site)
-        .ok_or("Pool A metrics token was not minted")?;
-    let pressured_targets = simulator_targets
-        .get(&pressured_site)
-        .ok_or_else(|| format!("baseline selected {pressured_site}, which has no simulator target"))?;
-    let original_snapshot = simulator_snapshots
-        .get(&pressured_site)
-        .and_then(|snapshots| snapshots.first())
-        .ok_or_else(|| format!("{pressured_site}: simulator snapshot missing"))?;
-    let original_fake_metrics = original_snapshot
-        .get("fakeMetrics")
-        .cloned()
-        .ok_or("simulator snapshot omitted fakeMetrics")?;
-    let pressure_waiting = queue_capacity_for_site(&pressured_site)?.saturating_add(5).max(9);
-    let pressure_result = (|| {
-        for target in pressured_targets {
-            post_simulator_fake_metrics(target, &serde_json::json!({"waiting-requests": pressure_waiting}))?;
-            let current = simulator_admin_request(target, "GET", None)?;
-            let waiting = fake_metrics_from_config(&current)?
-                .get("waiting-requests")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or("simulator did not report numeric waiting-requests after pressure update")?;
-            if waiting != u64::from(pressure_waiting) {
-                return Err(format!(
-                    "{}: simulator pressure readback was {waiting}, expected {pressure_waiting}",
-                    target.pod_name
-                )
-                .into());
-            }
-        }
-        record_signals_event(
-            evidence_dir,
-            &serde_json::json!({
-                "event": "simulator-pressure-applied",
-                "timestamp": format_utc_iso(),
-                "site": pressured_site,
-                "waitingRequests": pressure_waiting,
-                "targets": pressured_targets,
-            }),
-        )?;
-        let epp = wait_for_epp_queue_value(
-            &pressured_site,
-            pressured_token,
-            QUEUE_METRIC,
-            f64::from(pressure_waiting),
-            EPP_METRICS_TIMEOUT,
-        )?;
-        let queue = epp_metric_for_pool(&epp.body, QUEUE_METRIC, pressured_pool)?;
-        fs::write(evidence_dir.join("pressure-epp-metrics.txt"), &epp.body)?;
-        write_json_file(
-            &evidence_dir.join("pressure-epp-metrics.json"),
-            &serde_json::json!({"capturedAt": format_utc_iso(), "status": epp.status, "metric": QUEUE_METRIC, "pool": pressured_site, "value": queue}),
-        )?;
-
-        let pressure_overlays = wait_for_pressure_overlay_change(&baseline_overlays, &pressured_site, OVERLAY_TIMEOUT)?;
-        verify_mounted_overlay_revisions(&pressure_overlays, OVERLAY_TIMEOUT)?;
-        record_signals_event(
-            evidence_dir,
-            &serde_json::json!({
-                "event":"gateway-mounted-pressure-revisions-verified",
-                "timestamp":format_utc_iso(),
-                "sites":pressure_overlays.keys().collect::<Vec<_>>(),
-                "revisions":pressure_overlays.iter().map(|(site, overlay)| (site.clone(), overlay.semantic_revision.clone())).collect::<BTreeMap<_, _>>(),
-            }),
-        )?;
-        write_json_file(&evidence_dir.join("pressure-overlays.json"), &pressure_overlays)?;
-        let pressure_probe = send_signals_probe(
-            &gateway_url,
-            &client_credential,
-            &format!("gridzilla-{run_id}-pressure"),
-        )?;
-        let west_pressure_overlay = pressure_overlays
-            .get("west")
-            .ok_or("pressure overlay inventory omitted Pool A site west")?;
-        let expected_pressure_site = overlay_first_candidate(west_pressure_overlay)?;
-        if expected_pressure_site == pressured_site || pressure_probe.provider_site != expected_pressure_site {
-            return Err(format!(
-                "pressure did not change the selected provider as expected: baseline={pressured_site}, pressure rank-0={expected_pressure_site}, request={}",
-                pressure_probe.provider_site
-            )
-            .into());
-        }
-        write_json_file(&evidence_dir.join("pressure-probe.json"), &pressure_probe)?;
-        record_signals_event(
-            evidence_dir,
-            &serde_json::json!({
-                "event": "pressure-routing-shift-proved",
-                "timestamp": pressure_probe.timestamp,
-                "requestId": pressure_probe.request_id,
-                "status": pressure_probe.status,
-                "pressuredSite": pressured_site,
-                "providerSite": pressure_probe.provider_site,
-                "backendCluster": pressure_probe.backend_cluster,
-                "baselineRevision": west_baseline_overlay.semantic_revision,
-                "pressureRevision": west_pressure_overlay.semantic_revision,
-            }),
-        )?;
-        Ok::<BTreeMap<String, SignalOverlaySnapshot>, Box<dyn std::error::Error>>(pressure_overlays)
-    })();
-
-    let restoration = restore_simulator_targets(pressured_targets, &original_fake_metrics, evidence_dir);
-    let pressure_overlays = match (pressure_result, restoration) {
-        (Ok(overlays), Ok(())) => overlays,
-        (Err(primary), Ok(())) => return Err(primary),
-        (Ok(_), Err(restore_error)) => {
-            return Err(format!("pressure probe passed but simulator restoration failed: {restore_error}").into());
-        },
-        (Err(primary), Err(restore_error)) => {
-            return Err(format!(
-                "pressure probe failed: {primary}; simulator restoration also failed: {restore_error}"
-            )
-            .into());
-        },
-    };
-
-    let restored_epp = wait_for_epp_queue_value(
-        &pressured_site,
-        pressured_token,
-        QUEUE_METRIC,
-        fake_metric_number(&original_fake_metrics, "waiting-requests")?,
-        EPP_METRICS_TIMEOUT,
-    )?;
-    let restored_queue = epp_metric_for_pool(&restored_epp.body, QUEUE_METRIC, pressured_pool)?;
-    fs::write(evidence_dir.join("recovery-epp-metrics.txt"), &restored_epp.body)?;
-    let restored_overlays = wait_for_restored_overlay(&baseline_overlays, OVERLAY_TIMEOUT)?;
-    verify_mounted_overlay_revisions(&restored_overlays, OVERLAY_TIMEOUT)?;
-    record_signals_event(
-        evidence_dir,
-        &serde_json::json!({
-            "event":"gateway-mounted-recovery-revisions-verified",
-            "timestamp":format_utc_iso(),
-            "sites":restored_overlays.keys().collect::<Vec<_>>(),
-            "revisions":restored_overlays.iter().map(|(site, overlay)| (site.clone(), overlay.semantic_revision.clone())).collect::<BTreeMap<_, _>>(),
-        }),
-    )?;
-    let restored_probe = send_signals_probe(
-        &gateway_url,
-        &client_credential,
-        &format!("gridzilla-{run_id}-recovery"),
-    )?;
-    if restored_probe.provider_site != baseline.provider_site {
-        return Err(format!(
-            "recovery request selected {}, expected baseline provider {}",
-            restored_probe.provider_site, baseline.provider_site
-        )
-        .into());
-    }
-    write_json_file(&evidence_dir.join("recovery-overlays.json"), &restored_overlays)?;
-    write_json_file(&evidence_dir.join("recovery-probe.json"), &restored_probe)?;
-    record_signals_event(
-        evidence_dir,
-        &serde_json::json!({
-            "event": "simulator-restored-and-route-recovered",
-            "timestamp": restored_probe.timestamp,
-            "requestId": restored_probe.request_id,
-            "status": restored_probe.status,
-            "restoredQueueMetric": restored_queue,
-            "providerSite": restored_probe.provider_site,
-            "baselineProviderSite": baseline.provider_site,
-            "overlayRevision": restored_overlays
-                .get("west")
-                .ok_or("recovery overlay inventory omitted Pool A site west")?
-                .semantic_revision,
-            "pressureRevision": pressure_overlays
-                .get("west")
-                .ok_or("pressure overlay inventory omitted Pool A site west")?
-                .semantic_revision,
-        }),
-    )?;
-
-    let source = signals_source_identity()?;
-    let client = serde_json::json!({
-        "location": "host running this xtask",
-        "gatewayUrl": gateway_url,
-        "kubeconfig": evidence_dir.join("kubeconfig"),
-        "context": combined_kubectl_context("west"),
-        "credentialFile": client_credential,
-        "authorizationScheme": "Bearer",
-        "model": "Qwen/Qwen3-0.6B",
-        "requestPath": "/v1/chat/completions",
-        "attributionHeaders": ["x-grid-combined-provider-gateway", "x-ai-demo-provider-gateway", "x-ai-inference-provider", "x-request-id", "x-inference-pod"],
-        "receipt": {
-            "available": true,
-            "type": "response_headers",
-            "requestIdHeader": "x-request-id",
-            "backendPodHeader": "x-inference-pod",
-            "backendPodPrefixBySite": {
-                "west": "vcr-inference-west-",
-                "central": "vcr-inference-central-",
-                "east": "vcr-inference-east-"
-            }
-        }
-    });
-    let backend_reference = serde_json::json!({
-        "kind": "direct simulator reference path; not an equivalent security or routing path",
-        "site": "west",
-        "namespace": GRID_SYSTEM_NS,
-        "service": "vcr-inference-west",
-        "port": 8000,
-        "model": "Qwen/Qwen3-0.6B",
-        "path": "/v1/chat/completions",
-        "requiresGatewayAuthorization": false,
-    });
-    let request = serde_json::json!({
-        "format": "OpenAI chat completions JSON",
-        "model": "Qwen/Qwen3-0.6B",
-        "body": {"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"grid signals qualification"}],"max_tokens":8},
-        "responseMode": "non-streaming",
-    });
-    let mut sites = Vec::new();
-    for site in CLUSTERS {
-        let pool_name = epp_pool_name_for_site(site).ok_or_else(|| format!("unknown signals EPP site {site}"))?;
-        let is_pressure_target = *site == "west";
-        let overlays = restored_overlays
-            .get(*site)
-            .ok_or_else(|| format!("{site}: restored overlay snapshot is missing"))?;
-        let targets = simulator_targets
-            .get(*site)
-            .ok_or("simulator target inventory missing")?;
-        let runtime_images_for_site = runtime_images
-            .iter()
-            .filter(|image| image.site == *site)
-            .cloned()
-            .collect::<Vec<_>>();
-        let queue_capacity = queue_capacity_for_site(site)?;
-        let gateway_ip = read_lb_ip(site, "consumer-gateway")?;
-        sites.push(SignalsHandoffSite {
-            name: (*site).to_owned(),
-            cluster_name: combined_kind_cluster_name(site),
-            owner_run_id: run_id.to_owned(),
-            kubeconfig: evidence_dir.join("kubeconfig"),
-            context: combined_kubectl_context(site),
-            namespace: GRID_SYSTEM_NS.to_owned(),
-            readiness_targets: serde_json::json!([
-                {"kind":"Deployment","name":"grid-operator","namespace":GRID_SYSTEM_NS},
-                {"kind":"Deployment","name":"llmd-epp","namespace":GRID_SYSTEM_NS},
-                {"kind":"Deployment","name":"provider-gateway","namespace":GRID_SYSTEM_NS},
-                {"kind":"Deployment","name":"consumer-gateway","namespace":GRID_SYSTEM_NS},
-                {"kind":"InferenceProvider","name":format!("vcr-{site}-provider"),"namespace":GRID_SYSTEM_NS,"phase":"Available","ready":true}
-            ]),
-            provider: serde_json::json!({
-                "resourceName": format!("vcr-{site}-provider"),
-                "kind": "InferenceProvider",
-                "site": site,
-                "pool": pool_name,
-                "pressureTarget": is_pressure_target,
-                "model": "Qwen/Qwen3-0.6B",
-                "routingCluster": format!("vcr-{site}-provider"),
-                "queueCapacity": queue_capacity,
-                "runtimeImages": runtime_images_for_site,
-            }),
-            epp: serde_json::json!({
-                "service": "llmd-epp-metrics",
-                "namespace": GRID_SYSTEM_NS,
-                "servicePort": 9090,
-                "path": "/metrics",
-                "pool": pool_name,
-                "pressureTarget": is_pressure_target,
-                "metric": QUEUE_METRIC,
-                "baselineQueueDepth": epp_evidence.get(*site).and_then(|evidence| evidence.get("value")).and_then(serde_json::Value::as_f64),
-                "auth": {"type":"serviceAccountToken","tokenFile":credentials_dir.join(format!("{site}-epp-metrics.token")),"serviceAccount":"grid-operator-metrics-scraper"},
-                "portForward": {"resource":"svc/llmd-epp-metrics","localPort":suggested_local_port(site, 9090)?,"remotePort":9090}
-            }),
-            simulator: serde_json::json!({
-                "image": runtime_images.iter().find(|image| image.site == *site && image.component == "llm-d-sim").map_or("unknown", |image| image.reference.as_str()),
-                "poolName": pool_name,
-                "pressureTarget": is_pressure_target,
-                "adminPort": 8000,
-                "adminPath": "/admin/config",
-                "originalConfigFile": evidence_dir.join("simulator-original-configs.json"),
-                "targets": targets,
-                "runtimeImages": runtime_images.iter().filter(|image| image.site == *site && image.component == "llm-d-sim").collect::<Vec<_>>(),
-            }),
-            overlay: serde_json::json!({
-                "configMap": OVERLAY_CONFIGMAP,
-                "namespace": GRID_SYSTEM_NS,
-                "network": "grid-combined-site",
-                "gateway": "consumer-gateway",
-                "resourceVersion": overlays.resource_version,
-                "semanticRevision": overlays.semantic_revision,
-                "candidates": overlays.candidates,
-                "mountedRevisionVerified": true,
-            }),
-            gateway: serde_json::json!({
-                "service": "consumer-gateway",
-                "namespace": GRID_SYSTEM_NS,
-                "loadBalancerAddress": gateway_ip,
-                "port": 8080,
-                "url": format!("http://{gateway_ip}:8080/v1/chat/completions"),
-                "servedRevisionEvidence": "mounted envelope digest plus attributed request selection",
-                "responseHeaders": ["x-grid-combined-provider-gateway", "x-ai-demo-provider-gateway", "x-ai-inference-provider", "x-request-id", "x-inference-pod"],
-            }),
-        });
-    }
-
-    Ok(SignalsHandoff {
-        schema_version: "gridzilla.dev/v1alpha1".to_owned(),
-        run_id: run_id.to_owned(),
-        created_at: format_utc_iso(),
-        source,
-        runtime_images,
-        image_lock: evidence_dir.join("image-lock.json"),
-        client,
-        backend_reference,
-        request,
-        pressure_target_pool: "pool-a".to_owned(),
-        sites,
-    })
-}
-
-/// Wait for an InferenceProvider’s current generation to be Available and Ready.
-fn wait_for_provider_available(site: &str, timeout: Duration) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let name = format!("vcr-{site}-provider");
-    let context = combined_kubectl_context(site);
-    let deadline = Instant::now() + timeout;
-    let mut last: String;
-    loop {
-        match kubectl_json(
-            &context,
-            &["get", "inferenceprovider", &name, "-n", GRID_SYSTEM_NS, "-o", "json"],
-        ) {
-            Ok(provider) => {
-                let generation = provider
-                    .pointer("/metadata/generation")
-                    .and_then(serde_json::Value::as_i64);
-                let observed = provider
-                    .pointer("/status/observedGeneration")
-                    .and_then(serde_json::Value::as_i64);
-                let phase = provider
-                    .pointer("/status/phase")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                let ready = provider
-                    .pointer("/status/conditions")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|conditions| {
-                        conditions.iter().any(|condition| {
-                            condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
-                                && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
-                        })
-                    });
-                if phase == "Available" && ready && generation == observed {
-                    return Ok(provider);
-                }
-                last = format!("phase={phase}, ready={ready}, generation={generation:?}, observed={observed:?}");
-            },
-            Err(error) => last = error.to_string(),
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "{site}: InferenceProvider {name} did not become current-generation Available: {last}"
-            )
-            .into());
-        }
-        std::thread::park_timeout(Duration::from_secs(2));
-    }
-}
-
-/// Run kubectl against an explicit context and parse its JSON response.
-fn kubectl_json(context: &str, args: &[&str]) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let output = Command::new("kubectl")
-        .arg("--context")
-        .arg(context)
-        .args(args)
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "kubectl --context {context} {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
-
-/// Create a short-lived service-account token for authenticated EPP metrics access.
-fn mint_epp_metrics_token(site: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(site);
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            &context,
-            "create",
-            "token",
-            "grid-operator-metrics-scraper",
-            "-n",
-            GRID_SYSTEM_NS,
-            "--duration=24h",
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "{site}: could not mint EPP scrape token: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    let token = String::from_utf8(output.stdout)?.trim().to_owned();
-    if token.split('.').count() != 3 {
-        return Err(format!("{site}: kubectl create token returned an invalid token shape").into());
-    }
-    Ok(token)
-}
-
-/// Fetch EPP metrics with an optional bearer token.
-fn scrape_epp_metrics(site: &str, token: Option<&str>) -> Result<CurlResponse, Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(site);
-    let forward = start_port_forward(&context, "svc/llmd-epp-metrics", 9090)?;
-    let url = format!("http://127.0.0.1:{}/metrics", forward.local_port);
-    curl_request(&url, "GET", token, &[], None)
-}
-
-/// Wait for an authenticated EPP metric sample with a fresh timestamp.
-fn wait_for_fresh_epp_metric(
-    site: &str,
-    token: &str,
-    metric: &str,
-    timeout: Duration,
-) -> Result<CurlResponse, Box<dyn std::error::Error>> {
-    let pool_name = epp_pool_name_for_site(site).ok_or_else(|| format!("unknown signals EPP site {site}"))?;
-    let deadline = Instant::now() + timeout;
-    let mut last: String;
-    loop {
-        match scrape_epp_metrics(site, Some(token)) {
-            Ok(response) if response.status == 200 => {
-                if epp_metric_for_pool(&response.body, metric, pool_name).is_ok() {
-                    return Ok(response);
-                }
-                last = format!("HTTP 200 response lacked {metric} for pool {pool_name}");
-            },
-            Ok(response) => last = format!("EPP metrics returned HTTP {}", response.status),
-            Err(error) => last = error.to_string(),
-        }
-        if Instant::now() >= deadline {
-            return Err(
-                format!("{site}: authenticated EPP metrics did not become fresh within {timeout:?}: {last}").into(),
-            );
-        }
-        std::thread::park_timeout(Duration::from_secs(2));
-    }
-}
-
-/// Read one named metric sample for the requested EPP pool.
-fn epp_metric_for_pool(body: &str, metric: &str, pool: &str) -> Result<f64, Box<dyn std::error::Error>> {
-    for line in body.lines().filter(|line| !line.starts_with('#')) {
-        let mut fields = line.split_whitespace();
-        let Some(name_and_labels) = fields.next() else { continue };
-        let Some(raw_value) = fields.next() else { continue };
-        if !name_and_labels.starts_with(metric) {
-            continue;
-        }
-        let has_pool = name_and_labels.contains(&format!("name=\"{pool}\""))
-            || name_and_labels.contains(&format!("pool=\"{pool}\""))
-            || name_and_labels.contains(&format!("inferencepool=\"{pool}\""));
-        if has_pool {
-            return raw_value
-                .parse::<f64>()
-                .map_err(|error| format!("invalid EPP metric value for {metric}/{pool}: {error}").into());
-        }
-    }
-    Err(format!("EPP metrics do not contain {metric} labeled for pool {pool}").into())
-}
-
-/// Wait until an authenticated EPP queue metric reaches the expected value.
-fn wait_for_epp_queue_value(
-    site: &str,
-    token: &str,
-    metric: &str,
-    expected: f64,
-    timeout: Duration,
-) -> Result<CurlResponse, Box<dyn std::error::Error>> {
-    let pool_name = epp_pool_name_for_site(site).ok_or_else(|| format!("unknown signals EPP site {site}"))?;
-    let deadline = Instant::now() + timeout;
-    let mut last: String;
-    loop {
-        match scrape_epp_metrics(site, Some(token)) {
-            Ok(response) if response.status == 200 => match epp_metric_for_pool(&response.body, metric, pool_name) {
-                Ok(value) if (value - expected).abs() < 0.001 => return Ok(response),
-                Ok(value) => last = format!("observed {value}, expected {expected}"),
-                Err(error) => last = error.to_string(),
-            },
-            Ok(response) => last = format!("HTTP {}", response.status),
-            Err(error) => last = error.to_string(),
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("{site}: EPP queue metric did not recover within {timeout:?}: {last}").into());
-        }
-        std::thread::park_timeout(Duration::from_secs(2));
-    }
-}
-
-/// List ready simulator Pods and capture their run-time control identities.
-fn read_simulator_targets(site: &str) -> Result<Vec<SimulatorTarget>, Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(site);
-    let deployment_name = format!("vcr-inference-{site}");
-    let deployment = kubectl_json(
-        &context,
-        &[
-            "get",
-            "deployment",
-            &deployment_name,
-            "-n",
-            GRID_SYSTEM_NS,
-            "-o",
-            "json",
-        ],
-    )?;
-    let generation = deployment
-        .pointer("/metadata/generation")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or_default();
-    let selector = format!("app.kubernetes.io/name=vllm-vcr,app.kubernetes.io/instance={site}");
-    let pods = kubectl_json(
-        &context,
-        &["get", "pods", "-l", &selector, "-n", GRID_SYSTEM_NS, "-o", "json"],
-    )?;
-    let items = pods
-        .get("items")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("Pod list missing items")?;
-    let mut targets = Vec::new();
-    for pod in items {
-        let ready = pod
-            .pointer("/status/conditions")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|conditions| {
-                conditions.iter().any(|condition| {
-                    condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
-                        && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
-                })
-            });
-        if !ready {
-            continue;
-        }
-        let pod_name = pod
-            .pointer("/metadata/name")
-            .and_then(serde_json::Value::as_str)
-            .ok_or("ready simulator pod has no name")?;
-        let pod_uid = pod
-            .pointer("/metadata/uid")
-            .and_then(serde_json::Value::as_str)
-            .ok_or("ready simulator pod has no UID")?;
-        let local_port = suggested_local_port(site, 8000)?;
-        targets.push(SimulatorTarget {
-            namespace: GRID_SYSTEM_NS.to_owned(),
-            pod_name: pod_name.to_owned(),
-            pod_uid: pod_uid.to_owned(),
-            config_generation: generation,
-            admin_url: format!("http://127.0.0.1:{local_port}/admin/config"),
-            port_forward: serde_json::json!({
-                "resource": format!("pod/{pod_name}"),
-                "localPort": local_port,
-                "remotePort": 8000,
-            }),
-        });
-    }
-    Ok(targets)
-}
-
-/// Choose an available local port for a per-Pod port-forward.
-fn suggested_local_port(site: &str, remote_port: u16) -> Result<u16, Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    record_signals_event(
-        SIGNAL_EVIDENCE_DIR.get().ok_or("signals evidence directory not set")?,
-        &serde_json::json!({"event":"port-forward-port-reserved-as-hint","timestamp":format_utc_iso(),"site":site,"localPort":port,"remotePort":remote_port}),
-    )?;
-    Ok(port)
-}
-
-/// A running simulator port-forward and its selected local port.
-struct ActivePortForward {
-    /// Child process guard that terminates the forwarding process.
-    _guard: PortForwardGuard,
-    /// Local port bound by the forwarding process.
-    local_port: u16,
-}
-
-/// Start a bounded localhost-only port-forward to one simulator Pod.
-fn start_port_forward(
-    context: &str,
-    resource: &str,
-    remote_port: u16,
-) -> Result<ActivePortForward, Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let local_port = listener.local_addr()?.port();
-    drop(listener);
-    let mut child = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            GRID_SYSTEM_NS,
-            "port-forward",
-            "--address",
-            "127.0.0.1",
-            resource,
-        ])
-        .arg(format!("{local_port}:{remote_port}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if TcpStream::connect(("127.0.0.1", local_port)).is_ok() {
-            return Ok(ActivePortForward {
-                _guard: PortForwardGuard(child),
-                local_port,
-            });
-        }
-        if let Some(status) = child.try_wait()? {
-            return Err(format!("kubectl port-forward {resource} exited early: {status}").into());
-        }
-        if Instant::now() >= deadline {
-            drop(child.kill());
-            drop(child.wait());
-            return Err(format!("kubectl port-forward {resource} did not bind localhost:{local_port}").into());
-        }
-        std::thread::park_timeout(Duration::from_millis(100));
-    }
-}
-
-#[derive(Debug)]
-/// HTTP response parsed from a bounded curl invocation.
-struct CurlResponse {
-    /// Parsed HTTP response code.
-    status: u16,
-    /// Response header block.
-    headers: String,
-    /// Response body bytes decoded as UTF-8.
-    body: String,
-}
-
-/// Make a bounded local HTTP request and parse its status, headers, and body.
-fn curl_request(
-    url: &str,
-    method: &str,
-    bearer: Option<&str>,
-    headers: &[String],
-    body: Option<&str>,
-) -> Result<CurlResponse, Box<dyn std::error::Error>> {
-    let mut command = Command::new("curl");
-    command.args([
-        "--silent",
-        "--show-error",
-        "--connect-timeout",
-        "3",
-        "--max-time",
-        "15",
-        "--include",
-        "--write-out",
-        "\n__GRID_SIGNALS_STATUS__:%{http_code}\n",
-        "--request",
-        method,
-        url,
-    ]);
-    for header in headers {
-        command.arg("--header").arg(header);
-    }
-    if let Some(body) = body {
-        command.arg("--data-binary").arg(body);
-    }
-    if bearer.is_some() {
-        command.arg("--config").arg("-").stdin(Stdio::piped());
-    }
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    if let Some(token) = bearer {
-        let config = format!("header = \"Authorization: Bearer {token}\"\n");
-        child
-            .stdin
-            .take()
-            .ok_or("curl config stdin missing")?
-            .write_all(config.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "curl request failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    let raw = String::from_utf8(output.stdout)?;
-    let (response, status_line) = raw
-        .rsplit_once("\n__GRID_SIGNALS_STATUS__:")
-        .ok_or("curl did not return an HTTP status marker")?;
-    let status = status_line.trim().parse::<u16>()?;
-    let (response_headers, response_body) = response.split_once("\r\n\r\n").unwrap_or((response, ""));
-    Ok(CurlResponse {
-        status,
-        headers: response_headers.to_owned(),
-        body: response_body.to_owned(),
-    })
-}
-
-/// Call one simulator Pod’s private admin API through its owned port-forward.
-fn simulator_admin_request(
-    target: &SimulatorTarget,
-    method: &str,
-    body: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    validate_simulator_target(target)?;
-    let context = combined_kubectl_context_for_target(target)?;
-    let resource = format!("pod/{}", target.pod_name);
-    let forward = start_port_forward(&context, &resource, 8000)?;
-    let url = format!("http://127.0.0.1:{}/admin/config", forward.local_port);
-    let json_body = body.map(serde_json::to_string).transpose()?;
-    let content_type = if json_body.is_some() {
-        vec!["Content-Type: application/json".to_owned()]
-    } else {
-        Vec::new()
-    };
-    let response = curl_request(&url, method, None, &content_type, json_body.as_deref())?;
-    if !(200..300).contains(&response.status) {
-        return Err(format!(
-            "{}: llm-d-sim {method} /admin/config returned HTTP {}: {}",
-            target.pod_name,
-            response.status,
-            safe_truncate_str(&response.body, 500)
-        )
-        .into());
-    }
-    if method == "GET" {
-        Ok(serde_json::from_str(&response.body)
-            .map_err(|error| format!("{}: /admin/config was not JSON: {error}", target.pod_name))?)
-    } else {
-        Ok(serde_json::json!({"status":response.status,"body":response.body}))
-    }
-}
-
-/// Resolve the explicit Kind context for a simulator target.
-fn combined_kubectl_context_for_target(target: &SimulatorTarget) -> Result<String, Box<dyn std::error::Error>> {
-    let site = CLUSTERS
-        .iter()
-        .find(|site| target.pod_name.starts_with(&format!("vcr-inference-{site}-")))
-        .ok_or_else(|| format!("simulator target {} does not match a known site", target.pod_name))?;
-    Ok(combined_kubectl_context(site))
-}
-
-/// Reject a stale simulator target whose Pod or Deployment generation changed.
-fn validate_simulator_target(target: &SimulatorTarget) -> Result<(), Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context_for_target(target)?;
-    let pod = kubectl_json(
-        &context,
-        &["get", "pod", &target.pod_name, "-n", &target.namespace, "-o", "json"],
-    )?;
-    let current_uid = pod
-        .pointer("/metadata/uid")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let ready = pod
-        .pointer("/status/conditions")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|conditions| {
-            conditions.iter().any(|condition| {
-                condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
-                    && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
-            })
-        });
-    let site = CLUSTERS
-        .iter()
-        .find(|site| target.pod_name.starts_with(&format!("vcr-inference-{site}-")))
-        .ok_or_else(|| format!("simulator pod {} has no known site prefix", target.pod_name))?;
-    let deployment_name = format!("vcr-inference-{site}");
-    let generation = kubectl_json(
-        &context,
-        &[
-            "get",
-            "deployment",
-            &deployment_name,
-            "-n",
-            &target.namespace,
-            "-o",
-            "json",
-        ],
-    )?
-    .pointer("/metadata/generation")
-    .and_then(serde_json::Value::as_i64)
-    .unwrap_or_default();
-    if current_uid != target.pod_uid || !ready || generation != target.config_generation {
-        return Err(format!(
-            "simulator target {} changed identity, Deployment generation, or readiness; refusing mutation (uid {}->{}, generation {}->{generation}, ready={ready})",
-            target.pod_name, target.pod_uid, current_uid, target.config_generation
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Extract the simulator’s configured fake-metrics object.
-fn fake_metrics_from_config(config: &serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    config
-        .pointer("/fake-metrics")
-        .or_else(|| config.pointer("/config/fake-metrics"))
-        .cloned()
-        .ok_or_else(|| "llm-d-sim /admin/config response does not contain fake-metrics".into())
-}
-
-/// Read a numeric scalar from the simulator fake-metrics object.
-fn fake_metric_number(fake_metrics: &serde_json::Value, key: &str) -> Result<f64, Box<dyn std::error::Error>> {
-    fake_metrics
-        .get(key)
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| format!("saved simulator fake-metrics lacks numeric {key}").into())
-}
-
-/// Apply an atomic partial fake-metrics update to one simulator Pod.
-fn post_simulator_fake_metrics(
-    target: &SimulatorTarget,
-    fake_metrics: &serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    simulator_admin_request(target, "POST", Some(&serde_json::json!({"fake-metrics":fake_metrics})))?;
-    Ok(())
-}
-
-/// Restore and verify the original fake metrics on every targeted simulator Pod.
-fn restore_simulator_targets(
-    targets: &[SimulatorTarget],
-    original_fake_metrics: &serde_json::Value,
-    evidence_dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut errors = Vec::new();
-    for target in targets {
-        match post_simulator_fake_metrics(target, original_fake_metrics) {
-            Ok(()) => match simulator_admin_request(target, "GET", None) {
-                Ok(config) => match fake_metrics_from_config(&config) {
-                    Ok(actual) if fake_metrics_equal(&actual, original_fake_metrics) => {
-                        if let Err(error) = record_signals_event(
-                            evidence_dir,
-                            &serde_json::json!({"event":"simulator-restoration-verified","timestamp":format_utc_iso(),"pod":target.pod_name,"uid":target.pod_uid}),
-                        ) {
-                            errors.push(format!(
-                                "{}: could not record restoration evidence: {error}",
-                                target.pod_name
-                            ));
-                        }
-                    },
-                    Ok(actual) => errors.push(format!("{} restoration readback differs: {actual}", target.pod_name)),
-                    Err(error) => errors.push(format!("{} restoration readback failed: {error}", target.pod_name)),
-                },
-                Err(error) => errors.push(format!("{} restoration readback failed: {error}", target.pod_name)),
-            },
-            Err(error) => errors.push(format!("{} restoration failed: {error}", target.pod_name)),
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; ").into())
-    }
-}
-
-/// Compare the supported simulator fake-metrics values with numeric tolerance.
-fn fake_metrics_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    ["waiting-requests", "running-requests", "kv-cache-usage"]
-        .iter()
-        .all(|key| {
-            match (
-                left.get(key).and_then(serde_json::Value::as_f64),
-                right.get(key).and_then(serde_json::Value::as_f64),
-            ) {
-                (Some(left), Some(right)) => (left - right).abs() < 0.000_001,
-                _ => false,
-            }
-        })
-}
-
-/// Send one authenticated, request-ID-tagged Gateway request and verify trusted attribution.
-fn send_signals_probe(
-    url: &str,
-    credential_file: &Path,
-    request_id: &str,
-) -> Result<SignalHttpObservation, Box<dyn std::error::Error>> {
-    let token = fs::read_to_string(credential_file)?;
-    let token = token.trim();
-    let body = serde_json::json!({
-        "model":"Qwen/Qwen3-0.6B",
-        "messages":[{"role":"user","content":request_id}],
-        "max_tokens":8,
-    });
-    let extra_headers = vec![
-        "Content-Type: application/json".to_owned(),
-        format!("X-Request-Id: {request_id}"),
-        format!("X-Gridzilla-Request-Id: {request_id}"),
-    ];
-    let started = Instant::now();
-    let response = curl_request(
-        url,
-        "POST",
-        Some(token),
-        &extra_headers,
-        Some(&serde_json::to_string(&body)?),
-    )?;
-    let provider_site = header_value(&response.headers, "x-grid-site")
-        .or_else(|| header_value(&response.headers, "x-grid-combined-provider-gateway"))
-        .ok_or("Gateway response lacks provider-site attribution")?;
-    let provider_gateway = header_value(&response.headers, "x-grid-combined-provider-gateway")
-        .ok_or("Gateway response lacks provider-gateway attribution")?;
-    let provider_route = header_value(&response.headers, "x-ai-demo-provider-gateway")
-        .ok_or("Gateway response lacks provider-route attribution")?;
-    let backend_cluster = header_value(&response.headers, "x-ai-inference-provider")
-        .or_else(|| header_value(&response.headers, "x-grid-backend"))
-        .ok_or("Gateway response lacks backend-route attribution")?;
-    let backend_pod =
-        header_value(&response.headers, "x-inference-pod").ok_or("simulator response lacks backend Pod identity")?;
-    let backend_request_id =
-        header_value(&response.headers, "x-request-id").ok_or("simulator response lacks its request-ID receipt")?;
-    if !(200..300).contains(&response.status) {
-        return Err(format!(
-            "request {request_id} returned HTTP {} from provider {provider_site}",
-            response.status
-        )
-        .into());
-    }
-    if provider_site != provider_gateway || provider_site != provider_route {
-        return Err(format!("request {request_id} attribution disagrees: x-grid-site={provider_site}, provider-gateway={provider_gateway}, provider-route={provider_route}").into());
-    }
-    if !CLUSTERS.contains(&provider_site.as_str()) {
-        return Err(format!(
-            "request {request_id} has invalid provider attribution: site={provider_site}, backend={backend_cluster}"
-        )
-        .into());
-    }
-    if backend_cluster != "vcr-backend" {
-        return Err(
-            format!("request {request_id} reached provider route {backend_cluster}, expected vcr-backend").into(),
-        );
-    }
-    let expected_pod_prefix = format!("vcr-inference-{provider_site}-");
-    if !backend_pod.starts_with(&expected_pod_prefix) {
-        return Err(format!(
-            "request {request_id} was attributed to {provider_site} but simulator Pod was {backend_pod}"
-        )
-        .into());
-    }
-    if backend_request_id != request_id {
-        return Err(format!(
-            "request {request_id} reached simulator Pod {backend_pod}, which echoed request ID {backend_request_id}"
-        )
-        .into());
-    }
-    Ok(SignalHttpObservation {
-        request_id: request_id.to_owned(),
-        timestamp: format_utc_iso(),
-        url: url.to_owned(),
-        status: response.status,
-        provider_site,
-        backend_cluster,
-        backend_pod,
-        backend_request_id,
-        elapsed_ms: started.elapsed().as_millis(),
-        body_bytes: response.body.len(),
-    })
-}
-
-/// Read a named response header from captured HTTP headers.
-fn header_value(headers: &str, expected: &str) -> Option<String> {
-    headers.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case(expected).then(|| value.trim().to_owned())
-    })
-}
-
-/// Read a site provider’s configured queue capacity.
-fn queue_capacity_for_site(site: &str) -> Result<u32, Box<dyn std::error::Error>> {
-    let name = format!("vcr-{site}-provider");
-    let provider = kubectl_json(
-        &combined_kubectl_context(site),
-        &["get", "inferenceprovider", &name, "-n", GRID_SYSTEM_NS, "-o", "json"],
-    )?;
-    let capacity = provider
-        .pointer("/spec/metricsConfig/queueCapacity")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| format!("{site}: InferenceProvider has no valid metricsConfig.queueCapacity"))?;
-    Ok(capacity)
-}
-
-/// Read and parse one site’s current Grid routing overlay.
-fn read_signal_overlay(site: &str) -> Result<SignalOverlaySnapshot, Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(site);
-    let cm = kubectl_json(
-        &context,
-        &[
-            "get",
-            "configmap",
-            OVERLAY_CONFIGMAP,
-            "-n",
-            GRID_SYSTEM_NS,
-            "-o",
-            "json",
-        ],
-    )?;
-    let resource_version = cm
-        .pointer("/metadata/resourceVersion")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("overlay ConfigMap has no resourceVersion")?
-        .to_owned();
-    let semantic_revision = cm
-        .pointer("/metadata/annotations/grid.praxis.fast~1overlay-revision")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("overlay ConfigMap has no semantic revision annotation")?
-        .to_owned();
-    let raw = cm
-        .pointer("/data/routing-config.json")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("overlay ConfigMap lacks routing-config.json")?;
-    let payload: serde_json::Value = serde_json::from_str(raw)?;
-    let candidates = payload
-        .get("candidates")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("routing-config has no candidates array")?
-        .clone();
-    let local_site = payload
-        .get("local_site")
-        .or_else(|| payload.get("localSite"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(site)
-        .to_owned();
-    Ok(SignalOverlaySnapshot {
-        site: site.to_owned(),
-        resource_version,
-        semantic_revision,
-        local_site,
-        candidates,
-    })
-}
-
-/// Wait for all three site overlays to become readable.
-fn wait_for_signal_overlays(
-    timeout: Duration,
-) -> Result<BTreeMap<String, SignalOverlaySnapshot>, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + timeout;
-    let mut last = "no overlay sampled".to_owned();
-    loop {
-        let mut result = BTreeMap::new();
-        let mut failure = None;
-        for site in CLUSTERS {
-            match read_signal_overlay(site) {
-                Ok(overlay) => {
-                    let sites = overlay_candidate_sites(&overlay);
-                    let expected_sites = CLUSTERS
-                        .iter()
-                        .map(|candidate_site| (*candidate_site).to_owned())
-                        .collect::<BTreeSet<_>>();
-                    if sites != expected_sites {
-                        failure = Some(format!("{site}: overlay candidates were {sites:?}"));
-                        break;
-                    }
-                    if overlay_first_candidate(&overlay).is_err() {
-                        failure = Some(format!("{site}: overlay has no numeric rank-0 candidate"));
-                        break;
-                    }
-                    result.insert((*site).to_owned(), overlay);
-                },
-                Err(error) => {
-                    failure = Some(error.to_string());
-                    break;
-                },
-            }
-        }
-        if let Some(error) = failure {
-            last = error;
-        } else if result.len() == CLUSTERS.len() {
-            return Ok(result);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("three-site overlays did not converge within {timeout:?}: {last}").into());
-        }
-        std::thread::park_timeout(Duration::from_secs(2));
-    }
-}
-
-/// Collect the unique sites represented by overlay candidates.
-fn overlay_candidate_sites(overlay: &SignalOverlaySnapshot) -> BTreeSet<String> {
-    overlay
-        .candidates
-        .iter()
-        .filter_map(|candidate| {
-            candidate
-                .get("site")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect()
-}
-
-/// Return the candidate with the highest current rank.
-fn overlay_first_candidate(overlay: &SignalOverlaySnapshot) -> Result<String, Box<dyn std::error::Error>> {
-    let candidate = overlay
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.get("rank").and_then(serde_json::Value::as_u64).is_some())
-        .min_by_key(|candidate| {
-            candidate
-                .get("rank")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(u64::MAX)
-        })
-        .ok_or("overlay has no ranked candidate")?;
-    candidate
-        .get("site")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| "ranked overlay candidate has no site".into())
-}
-
-/// Wait for every site’s revision and the pressured candidate’s rank to change.
-fn wait_for_pressure_overlay_change(
-    baseline: &BTreeMap<String, SignalOverlaySnapshot>,
-    pressured_site: &str,
-    timeout: Duration,
-) -> Result<BTreeMap<String, SignalOverlaySnapshot>, Box<dyn std::error::Error>> {
-    let baseline_west = baseline.get("west").ok_or("baseline overlays omitted west")?;
-    let baseline_score = overlay_candidate_score(baseline_west, pressured_site)?;
-    let deadline = Instant::now() + timeout;
-    let mut last: String;
-    loop {
-        match wait_for_signal_overlays(Duration::from_secs(10)) {
-            Ok(current) => {
-                let all_revised = CLUSTERS.iter().all(|site| {
-                    current
-                        .get(*site)
-                        .zip(baseline.get(*site))
-                        .is_some_and(|(now, before)| now.semantic_revision != before.semantic_revision)
-                });
-                let current_west = current.get("west").ok_or("current overlays omitted west")?;
-                let score = overlay_candidate_score(current_west, pressured_site)?;
-                let rank = overlay_candidate_rank(current_west, pressured_site)?;
-                if all_revised && score < baseline_score && rank > 0 {
-                    return Ok(current);
-                }
-                last = format!("revised={all_revised}, score {baseline_score}->{score}, rank={rank}");
-            },
-            Err(error) => last = error.to_string(),
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "provider pressure did not change distributed overlay scoring within {timeout:?}: {last}"
-            )
-            .into());
-        }
-        std::thread::park_timeout(Duration::from_secs(2));
-    }
-}
-
-/// Return one provider candidate’s score in the overlay.
-fn overlay_candidate_score(overlay: &SignalOverlaySnapshot, site: &str) -> Result<f64, Box<dyn std::error::Error>> {
-    overlay
-        .candidates
-        .iter()
-        .find(|candidate| candidate.get("site").and_then(serde_json::Value::as_str) == Some(site))
-        .and_then(|candidate| candidate.get("score"))
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| format!("{} overlay has no numeric score for site {site}", overlay.site).into())
-}
-
-/// Return one provider candidate’s rank in the overlay.
-fn overlay_candidate_rank(overlay: &SignalOverlaySnapshot, site: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    overlay
-        .candidates
-        .iter()
-        .find(|candidate| candidate.get("site").and_then(serde_json::Value::as_str) == Some(site))
-        .and_then(|candidate| candidate.get("rank"))
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| format!("{} overlay has no rank for site {site}", overlay.site).into())
-}
-
-/// Wait until the baseline overlay revisions and route choice return.
-fn wait_for_restored_overlay(
-    baseline: &BTreeMap<String, SignalOverlaySnapshot>,
-    timeout: Duration,
-) -> Result<BTreeMap<String, SignalOverlaySnapshot>, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + timeout;
-    let mut last: String;
-    loop {
-        match wait_for_signal_overlays(Duration::from_secs(10)) {
-            Ok(current) => {
-                let restored = CLUSTERS.iter().all(|site| {
-                    current
-                        .get(*site)
-                        .zip(baseline.get(*site))
-                        .is_some_and(|(now, before)| {
-                            now.semantic_revision == before.semantic_revision
-                                && overlay_first_candidate(now).ok() == overlay_first_candidate(before).ok()
-                        })
-                });
-                if restored {
-                    return Ok(current);
-                }
-                last = CLUSTERS
-                    .iter()
-                    .filter_map(|site| {
-                        let before = baseline.get(*site)?;
-                        let now = current.get(*site)?;
-                        Some(format!(
-                            "{site}: {} -> {}",
-                            before.semantic_revision, now.semantic_revision
-                        ))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-            },
-            Err(error) => last = error.to_string(),
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "simulator metrics restored but original overlays did not converge within {timeout:?}: {last}"
-            )
-            .into());
-        }
-        std::thread::park_timeout(Duration::from_secs(2));
-    }
-}
-
-/// Verify every Gateway-mounted overlay matches its published revision.
-fn verify_mounted_overlay_revisions(
-    expected: &BTreeMap<String, SignalOverlaySnapshot>,
-    timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + timeout;
-    let mut last = "no mounted overlay checked".to_owned();
-    loop {
-        let mut all_match = true;
-        for site in CLUSTERS {
-            let context = combined_kubectl_context(site);
-            let output = Command::new("kubectl")
-                .args([
-                    "--context",
-                    &context,
-                    "-n",
-                    GRID_SYSTEM_NS,
-                    "exec",
-                    "deployment/consumer-gateway",
-                    "-c",
-                    "overlay-sync",
-                    "--",
-                    "cat",
-                    "/etc/praxis/routing/routing-overlay.json",
-                ])
-                .output()?;
-            if !output.status.success() {
-                all_match = false;
-                last = format!(
-                    "{site}: could not read mounted overlay: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                break;
-            }
-            let mounted: serde_json::Value = match serde_json::from_slice(&output.stdout) {
-                Ok(value) => value,
-                Err(error) => {
-                    all_match = false;
-                    last = format!("{site}: mounted overlay is invalid JSON: {error}");
-                    break;
-                },
-            };
-            let revision = mounted
-                .pointer("/revision/value")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let expected_site = expected
-                .get(*site)
-                .ok_or_else(|| format!("expected overlay inventory omitted {site}"))?;
-            if revision != expected_site.semantic_revision {
-                all_match = false;
-                last = format!(
-                    "{site}: mounted revision {revision} differs from ConfigMap revision {}",
-                    expected_site.semantic_revision
-                );
-                break;
-            }
-        }
-        if all_match {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(
-                format!("Gateway overlay sync did not consume current revisions within {timeout:?}: {last}").into(),
-            );
-        }
-        std::thread::park_timeout(Duration::from_secs(2));
-    }
-}
-
-/// Capture declared references and immutable running image IDs for one site.
-fn read_runtime_images(site: &str) -> Result<Vec<SignalRuntimeImage>, Box<dyn std::error::Error>> {
-    let context = combined_kubectl_context(site);
-    let pods = kubectl_json(&context, &["get", "pods", "-n", GRID_SYSTEM_NS, "-o", "json"])?;
-    let items = pods
-        .get("items")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("pod list missing items")?;
-    let mut identities = Vec::new();
-    let engine = kind_container_engine();
-    let mut source_revisions = BTreeMap::new();
-    for pod in items {
-        let pod_name = pod
-            .pointer("/metadata/name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let Some(component) = component_for_pod(pod_name) else {
-            continue;
-        };
-        let spec_containers = pod
-            .pointer("/spec/containers")
-            .and_then(serde_json::Value::as_array)
-            .ok_or("pod has no containers")?;
-        let statuses = pod
-            .pointer("/status/containerStatuses")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for container in spec_containers {
-            let name = container
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let image = container
-                .get("image")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let source_revision = source_revisions
-                .entry(image.to_owned())
-                .or_insert_with(|| inspect_signals_image_source_revision(engine, image))
-                .clone();
-            let status = statuses
-                .iter()
-                .find(|item| item.get("name").and_then(serde_json::Value::as_str) == Some(name));
-            let image_id = status
-                .and_then(|item| item.get("imageID"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if image_id.is_empty() {
-                return Err(format!("{site}/{pod_name}/{name} is missing runtime imageID").into());
-            }
-            identities.push(SignalRuntimeImage {
-                site: site.to_owned(),
-                component: if name == "overlay-sync" {
-                    "overlay-sync".to_owned()
-                } else {
-                    component.to_owned()
-                },
-                namespace: GRID_SYSTEM_NS.to_owned(),
-                selector: format!("pod={pod_name}"),
-                container: name.to_owned(),
-                reference: image.to_owned(),
-                image_id: image_id.to_owned(),
-                source_revision,
-            });
-        }
-    }
-    let components = identities
-        .iter()
-        .map(|identity| identity.component.as_str())
-        .collect::<BTreeSet<_>>();
-    for required in [
-        "grid-operator",
-        "consumer-gateway",
-        "provider-gateway",
-        "llm-d-sim",
-        "llm-d-epp",
-        "overlay-sync",
-    ] {
-        if !components.contains(required) {
-            return Err(format!("{site}: runtime image inventory has no {required} pod").into());
-        }
-    }
-    Ok(identities)
-}
-
-/// Map a signals workload Pod name to its runtime component.
-fn component_for_pod(name: &str) -> Option<&'static str> {
-    if name.starts_with("grid-operator-") {
-        Some("grid-operator")
-    } else if name.starts_with("consumer-gateway-") {
-        Some("consumer-gateway")
-    } else if name.starts_with("provider-gateway-") {
-        Some("provider-gateway")
-    } else if name.starts_with("llmd-epp-") {
-        Some("llm-d-epp")
-    } else if name.starts_with("vcr-inference-") {
-        Some("llm-d-sim")
-    } else {
-        None
-    }
-}
-
-/// Read the OCI source revision label from a local image.
-fn inspect_signals_image_source_revision(engine: &str, image: &str) -> Option<String> {
-    let output = Command::new(engine)
-        .args([
-            "image",
-            "inspect",
-            "--format",
-            "{{index .Config.Labels \"org.opencontainers.image.revision\"}}",
-            image,
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!value.is_empty() && value != "<no value>").then_some(value)
-}
-
-/// Reject Pods whose declared images or source-built image revisions differ from the run lock.
-fn validate_signals_runtime_images(images: &[SignalRuntimeImage]) -> Result<(), Box<dyn std::error::Error>> {
-    let expected = signals_image_references().into_iter().collect::<BTreeMap<_, _>>();
-    let source_head = git_output(&["rev-parse", "HEAD"])?.trim().to_owned();
-    for image in images {
-        let role = match image.component.as_str() {
-            "grid-operator" => "operator",
-            "overlay-sync" => "overlay-sync",
-            "llm-d-sim" => "simulator",
-            "llm-d-epp" => "epp",
-            "consumer-gateway" | "provider-gateway" => "gateway",
-            component => return Err(format!("unexpected runtime component {component:?}").into()),
-        };
-        let expected_reference = expected
-            .get(role)
-            .ok_or_else(|| format!("expected image missing role {role}"))?;
-        if &image.reference != expected_reference {
-            return Err(format!(
-                "{}/{} runs image {}, expected exact run-locked reference {}",
-                image.site, image.container, image.reference, expected_reference
-            )
-            .into());
-        }
-        if (role == "operator" || role == "overlay-sync")
-            && image.source_revision.as_deref() != Some(source_head.as_str())
-        {
-            return Err(format!(
-                "{}/{} source image label {:?} does not match Grid HEAD {source_head}",
-                image.site, image.container, image.source_revision
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-/// Validate that a run ID is lowercase DNS-safe and bounded.
-fn validate_signals_run_id(run_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if run_id.is_empty()
-        || run_id.len() > 32
-        || run_id.starts_with('-')
-        || run_id.ends_with('-')
-        || !run_id
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
-        return Err("--run-id must be 1–32 lowercase ASCII letters, digits, or internal dashes".into());
-    }
-    Ok(())
-}
-
-/// Generate a unique UTC-based run ID.
-fn default_signals_run_id() -> String {
-    format!("{}-{}", format_utc_timestamp().to_ascii_lowercase(), std::process::id()).replace([':', '+'], "-")
-}
-
-/// Restrict an evidence credential or kubeconfig file to its owner.
-fn set_private_file_permissions(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-/// Write structured evidence as indented JSON.
-fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
-    fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))?;
-    Ok(())
-}
-
-/// Persist the lifecycle and ownership manifest for a signals run.
-fn write_signals_manifest(
-    evidence_dir: &Path,
-    manifest: &SignalsRunManifest,
-) -> Result<(), Box<dyn std::error::Error>> {
-    write_json_file(&evidence_dir.join("run-manifest.json"), manifest)
-}
-
-/// Append one timestamped event to the run timeline.
-fn record_signals_event(evidence_dir: &Path, event: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Write as _;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(evidence_dir.join("timeline.jsonl"))?;
-    writeln!(file, "{}", serde_json::to_string(&event)?)?;
-    Ok(())
-}
-
-/// Record the Grid revision, branch, worktree status, and source fingerprint.
-fn signals_source_identity() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let head = git_output(&["rev-parse", "HEAD"])?;
-    let branch = git_output(&["branch", "--show-current"])?;
-    let status = git_output(&["status", "--porcelain"])?;
-    let diff = git_output_bytes(&["diff", "--binary", "HEAD"])?;
-    let mut digest = Sha256::new();
-    digest.update(&diff);
-    hash_directory(
-        &mut digest,
-        Path::new("tests/e2e/topologies/grid-signals-combined-site"),
-    )?;
-    Ok(serde_json::json!({
-        "repository": "praxis-proxy/grid",
-        "branch": branch,
-        "commit": head,
-        "worktreeStatus": status,
-        "sourceFingerprintSha256": hex::encode(digest.finalize()),
-    }))
-}
-
-/// Add all file paths and bytes in a directory to a stable digest.
-fn hash_directory(digest: &mut Sha256, directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(fs::DirEntry::path);
-    for entry in entries {
-        let path = entry.path();
-        digest.update(path.to_string_lossy().as_bytes());
-        if path.is_dir() {
-            hash_directory(digest, &path)?;
-        } else if path.is_file() {
-            digest.update(fs::read(path)?);
-        }
-    }
-    Ok(())
-}
-
-/// Run git and return validated UTF-8 output.
-fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
-    String::from_utf8(git_output_bytes(args)?).map_err(Into::into)
-}
-
-/// Run git and return its raw stdout bytes.
-fn git_output_bytes(args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let output = Command::new("git").args(args).output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    Ok(output.stdout)
-}
-
-/// List the current Kind cluster names using a bounded command.
-fn kind_clusters() -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
-    let output = Command::new("timeout")
-        .args(["30s", "kind", "get", "clusters"])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("kind get clusters failed: {}", String::from_utf8_lossy(&output.stderr)).into());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
-
-/// Refuse to provision when this run’s cluster or network names already exist.
-fn ensure_signals_resources_absent(prefix: &str, clusters: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let existing = kind_clusters()?;
-    let collisions = clusters
-        .iter()
-        .filter(|name| existing.contains(*name))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !collisions.is_empty() {
-        return Err(format!("refusing to reuse existing Kind clusters: {}", collisions.join(", ")).into());
-    }
-    let networks = Command::new("docker")
-        .args(["network", "ls", "--format", "{{.Name}}"])
-        .output()?;
-    if !networks.status.success() {
-        return Err(format!(
-            "docker network inventory failed: {}",
-            String::from_utf8_lossy(&networks.stderr)
-        )
-        .into());
-    }
-    let network_names = String::from_utf8_lossy(&networks.stdout).into_owned();
-    let expected_forge_network = format!("{prefix}-net");
-    let network_collisions = network_names
-        .lines()
-        .map(str::trim)
-        .filter(|name| {
-            *name == expected_forge_network
-                || *name == format!("kind-{prefix}")
-                || name.starts_with(&format!("kind-{prefix}-"))
-        })
-        .collect::<Vec<_>>();
-    if !network_collisions.is_empty() {
-        return Err(format!(
-            "refusing to reuse Docker networks with this run prefix: {}",
-            network_collisions.join(", ")
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Create Forge's run network on a free RFC1918 /24 and persist its ownership
-/// identity before cluster provisioning can attach any endpoints.
-fn provision_signals_network(manifest: &mut SignalsRunManifest) -> Result<(), Box<dyn std::error::Error>> {
-    let name = format!("{}-net", manifest.cluster_prefix);
-    if inspect_docker_network(&name)?.is_some() {
-        return Err(format!("refusing to reuse pre-existing Docker network {name}").into());
-    }
-
-    let mut used_subnets = docker_network_subnets()?;
-    used_subnets.extend(host_ipv4_subnets()?);
-    let subnet = choose_signals_network_subnet(&used_subnets)?;
-    let creation_label = format!("grid.praxis.dev/signals-run={}", manifest.run_id);
-    let output = Command::new("docker")
-        .args([
-            "network",
-            "create",
-            "--driver",
-            "bridge",
-            "--subnet",
-            &subnet,
-            "--label",
-            "forge.managed=true",
-            "--label",
-            &format!("forge.environment={}", manifest.cluster_prefix),
-            "--label",
-            &creation_label,
-            &name,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "failed to create run-owned Docker network {name} ({subnet}): {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    let id = String::from_utf8(output.stdout)?.trim().to_owned();
-    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("Docker returned an invalid ID for network {name}: {id:?}").into());
-    }
-
-    manifest.network = Some(SignalsNetworkIdentity {
-        name: name.clone(),
-        id,
-        subnet: subnet.clone(),
-        creation_label: creation_label.clone(),
-    });
-    write_signals_manifest(&manifest.evidence_dir, manifest)?;
-    record_signals_event(
-        &manifest.evidence_dir,
-        &serde_json::json!({
-            "event": "network-created",
-            "timestamp": format_utc_iso(),
-            "name": name,
-            "id": manifest.network.as_ref().map(|network| &network.id),
-            "subnet": subnet,
-            "creationLabel": creation_label,
-        }),
-    )?;
-    verify_signals_network(manifest.network.as_ref().ok_or("network identity was not recorded")?)?;
-    Ok(())
-}
-
-/// Verify all ownership fields before any run-owned Docker network is removed.
-fn remove_signals_network(manifest: &SignalsRunManifest) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(identity) = &manifest.network else {
-        return Ok(());
-    };
-    let Some(network) = inspect_docker_network(&identity.name)? else {
-        record_signals_event(
-            &manifest.evidence_dir,
-            &serde_json::json!({
-                "event": "network-already-removed",
-                "timestamp": format_utc_iso(),
-                "name": identity.name,
-                "id": identity.id,
-            }),
-        )?;
-        return Ok(());
-    };
-    verify_docker_network_identity(&network, identity, &manifest.cluster_prefix)?;
-    let output = Command::new("docker").args(["network", "rm", &identity.id]).output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "failed to remove owned Docker network {}: {}",
-            identity.name,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    if inspect_docker_network(&identity.name)?.is_some() {
-        return Err(format!("owned Docker network {} remains after removal", identity.name).into());
-    }
-    record_signals_event(
-        &manifest.evidence_dir,
-        &serde_json::json!({
-            "event": "network-removed",
-            "timestamp": format_utc_iso(),
-            "name": identity.name,
-            "id": identity.id,
-            "subnet": identity.subnet,
-        }),
-    )?;
-    Ok(())
-}
-
-/// Return one Docker network as JSON, or `None` only when the exact name is absent.
-fn inspect_docker_network(name: &str) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
-    let output = Command::new("docker")
-        .args(["network", "inspect", "--format", "{{json .}}", name])
-        .output()?;
-    if output.status.success() {
-        return Ok(Some(serde_json::from_slice(&output.stdout)?));
-    }
-    let listing = Command::new("docker")
-        .args(["network", "ls", "--format", "{{.Name}}"])
-        .output()?;
-    if !listing.status.success() {
-        return Err(format!(
-            "Docker network inventory failed while checking {name}: {}",
-            String::from_utf8_lossy(&listing.stderr).trim()
-        )
-        .into());
-    }
-    if String::from_utf8_lossy(&listing.stdout)
-        .lines()
-        .any(|line| line.trim() == name)
-    {
-        return Err(format!(
-            "Docker network {name} exists but inspect failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(None)
-}
-
-/// Collect every IPv4 subnet currently assigned to a Docker network.
-fn docker_network_subnets() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let listing = Command::new("docker").args(["network", "ls", "-q"]).output()?;
-    if !listing.status.success() {
-        return Err(format!(
-            "Docker network listing failed: {}",
-            String::from_utf8_lossy(&listing.stderr)
-        )
-        .into());
-    }
-    let listing_text = String::from_utf8_lossy(&listing.stdout);
-    let ids = listing_text
-        .lines()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .collect::<Vec<_>>();
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let output = Command::new("docker")
-        .arg("network")
-        .arg("inspect")
-        .args(ids)
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "Docker network inspection failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    let networks: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
-    Ok(networks
-        .iter()
-        .filter_map(|network| network.pointer("/IPAM/Config").and_then(serde_json::Value::as_array))
-        .flatten()
-        .filter_map(|config| config.get("Subnet").and_then(serde_json::Value::as_str))
-        .filter(|subnet| !subnet.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
-
-/// Collect host interface and route prefixes so the Docker bridge cannot shadow host networking.
-fn host_ipv4_subnets() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let addresses = Command::new("ip").args(["-j", "-4", "addr", "show"]).output()?;
-    if !addresses.status.success() {
-        return Err(format!(
-            "host IPv4 address inventory failed: {}",
-            String::from_utf8_lossy(&addresses.stderr)
-        )
-        .into());
-    }
-    let routes = Command::new("ip")
-        .args(["-j", "-4", "route", "show", "table", "all"])
-        .output()?;
-    if !routes.status.success() {
-        return Err(format!(
-            "host IPv4 route inventory failed: {}",
-            String::from_utf8_lossy(&routes.stderr)
-        )
-        .into());
-    }
-    let mut subnets = Vec::new();
-    let address_data: Vec<serde_json::Value> = serde_json::from_slice(&addresses.stdout)?;
-    for address in &address_data {
-        if let Some(entries) = address.pointer("/addr_info").and_then(serde_json::Value::as_array) {
-            for entry in entries {
-                if entry.get("family").and_then(serde_json::Value::as_str) != Some("inet") {
-                    continue;
-                }
-                if let (Some(local), Some(prefix)) = (
-                    entry.get("local").and_then(serde_json::Value::as_str),
-                    entry.get("prefixlen").and_then(serde_json::Value::as_u64),
-                ) {
-                    subnets.push(format!("{local}/{prefix}"));
-                }
-            }
-        }
-    }
-    let route_data: Vec<serde_json::Value> = serde_json::from_slice(&routes.stdout)?;
-    for route in &route_data {
-        if let Some(destination) = route.get("dst").and_then(serde_json::Value::as_str)
-            && destination != "default"
-        {
-            subnets.push(if destination.contains('/') {
-                destination.to_owned()
-            } else {
-                format!("{destination}/32")
-            });
-        }
-    }
-    Ok(subnets)
-}
-
-/// Choose the first free /24 from a reserved RFC1918 range outside Kind defaults.
-fn choose_signals_network_subnet(used: &[String]) -> Result<String, Box<dyn std::error::Error>> {
-    let mut occupied = used
-        .iter()
-        .map(|cidr| ipv4_range(cidr))
-        .collect::<Result<Vec<_>, _>>()?;
-    occupied.extend([ipv4_range("10.96.0.0/12")?, ipv4_range("10.244.0.0/16")?]);
-    for second in 224..=239 {
-        for third in 0..=255 {
-            let candidate = format!("10.{second}.{third}.0/24");
-            let range = ipv4_range(&candidate)?;
-            if !occupied.iter().any(|existing| ipv4_ranges_overlap(*existing, range)) {
-                return Ok(candidate);
-            }
-        }
-    }
-    Err("no free non-overlapping /24 remains in the signals Docker-network allocation range 10.224.0.0/12".into())
-}
-
-/// Parse an IPv4 CIDR into inclusive network and broadcast address integers.
-fn ipv4_range(cidr: &str) -> Result<(u32, u32), Box<dyn std::error::Error>> {
-    let (address, prefix) = cidr
-        .split_once('/')
-        .ok_or_else(|| format!("invalid IPv4 CIDR {cidr:?}"))?;
-    let address: Ipv4Addr = address.parse()?;
-    let prefix: u32 = prefix.parse()?;
-    if prefix > 32 {
-        return Err(format!("invalid IPv4 prefix length in {cidr:?}").into());
-    }
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
-    let network = u32::from(address) & mask;
-    Ok((network, network | !mask))
-}
-
-/// Return whether two inclusive IPv4 network ranges intersect.
-fn ipv4_ranges_overlap(left: (u32, u32), right: (u32, u32)) -> bool {
-    left.0 <= right.1 && right.0 <= left.1
-}
-
-/// Verify a provisioned Docker network against the exact recorded ownership identity.
-fn verify_signals_network(identity: &SignalsNetworkIdentity) -> Result<(), Box<dyn std::error::Error>> {
-    let network = inspect_docker_network(&identity.name)?.ok_or("run-owned Docker network disappeared")?;
-    verify_docker_network_identity(&network, identity, identity.name.trim_end_matches("-net"))
-}
-
-/// Compare Docker inspect output with the persisted ID, subnet, and labels.
-fn verify_docker_network_identity(
-    network: &serde_json::Value,
-    identity: &SignalsNetworkIdentity,
-    environment: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let id = network
-        .get("Id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let labels = network.pointer("/Labels");
-    let managed = labels
-        .and_then(|value| value.get("forge.managed"))
-        .and_then(serde_json::Value::as_str);
-    let forge_environment = labels
-        .and_then(|value| value.get("forge.environment"))
-        .and_then(serde_json::Value::as_str);
-    let (creation_key, creation_value) = identity
-        .creation_label
-        .split_once('=')
-        .ok_or("recorded Docker network creation label is malformed")?;
-    let creation = labels
-        .and_then(|value| value.get(creation_key))
-        .and_then(serde_json::Value::as_str);
-    let subnet_matches = network
-        .pointer("/IPAM/Config")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry.get("Subnet").and_then(serde_json::Value::as_str) == Some(identity.subnet.as_str()))
-        });
-    if id != identity.id
-        || managed != Some("true")
-        || forge_environment != Some(environment)
-        || creation != Some(creation_value)
-        || !subnet_matches
-    {
-        return Err(format!(
-            "Docker network {} no longer matches its recorded run ownership",
-            identity.name
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Verify that a cleanup manifest describes only its matching run-owned resources.
-fn validate_signals_manifest(
-    manifest: &SignalsRunManifest,
-    manifest_path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    validate_signals_run_id(&manifest.run_id)?;
-    let expected_prefix = format!("grid-signals-{}", manifest.run_id);
-    if manifest.schema_version != "1" || manifest.cluster_prefix != expected_prefix {
-        return Err("manifest schema or cluster prefix is not a recognized signals run".into());
-    }
-    let expected_clusters = CLUSTERS
-        .iter()
-        .map(|site| format!("{expected_prefix}-{site}"))
-        .collect::<Vec<_>>();
-    if manifest.cluster_names != expected_clusters {
-        return Err("manifest cluster names do not match the run-owned cluster prefix".into());
-    }
-    if let Some(network) = &manifest.network {
-        let expected_name = format!("{expected_prefix}-net");
-        let expected_label = format!("grid.praxis.dev/signals-run={}", manifest.run_id);
-        if network.name != expected_name
-            || network.id.len() != 64
-            || !network.id.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || network.creation_label != expected_label
-        {
-            return Err("manifest Docker network identity does not match the run-owned prefix".into());
-        }
-        ipv4_range(&network.subnet)?;
-    }
-    let evidence_dir = manifest_path.parent().ok_or("manifest has no parent directory")?;
-    if evidence_dir != manifest.evidence_dir.canonicalize()? {
-        return Err("manifest evidence directory does not match its on-disk location".into());
-    }
-    let expected_config = evidence_dir.join("forge-resolved.yaml");
-    if expected_config != manifest.resolved_forge_config.canonicalize()? {
-        return Err("resolved Forge config is outside this run's evidence directory".into());
-    }
-    let expected_state = super::forge_config::state_dir_for_config(&expected_config)?;
-    if expected_state != manifest.forge_state_dir.canonicalize()? {
-        return Err("Forge state directory is outside this run's resolved-config state path".into());
-    }
-    let config: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&expected_config)?)?;
-    let config_name = config
-        .get("metadata")
-        .and_then(|value| value.get("name"))
-        .and_then(serde_yaml::Value::as_str);
-    let config_prefix = config
-        .get("spec")
-        .and_then(|value| value.get("runtime"))
-        .and_then(|value| value.get("clusterPrefix"))
-        .and_then(serde_yaml::Value::as_str);
-    if config_name != Some(expected_prefix.as_str()) || config_prefix != Some(expected_prefix.as_str()) {
-        return Err("resolved Forge config ownership does not match the manifest".into());
-    }
-    Ok(())
-}
-
-/// Save bounded cluster diagnostics without deleting any resources.
-fn capture_signals_diagnostics(
-    evidence_dir: &Path,
-    cluster_names: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut diagnostics = serde_json::Map::new();
-    for (site, cluster) in CLUSTERS.iter().zip(cluster_names) {
-        let context = format!("kind-{cluster}");
-        let output = Command::new("timeout")
-            .args([
-                "20s",
-                "kubectl",
-                "--context",
-                &context,
-                "get",
-                "pods,svc,endpointslices,gridsites,gridnetworks,inferenceproviders",
-                "-A",
-                "-o",
-                "json",
-            ])
-            .output()?;
-        diagnostics.insert(
-            (*site).to_owned(),
-            serde_json::json!({
-                "exitCode": output.status.code(),
-                "stdout": String::from_utf8_lossy(&output.stdout),
-                "stderr": String::from_utf8_lossy(&output.stderr),
-            }),
-        );
-    }
-    write_json_file(&evidence_dir.join("failure-diagnostics.json"), &diagnostics)?;
-    Ok(())
-}
-
 /// Return the Kind cluster name corresponding to a Forge site.
 fn combined_kind_cluster_name(site: &str) -> String {
-    let prefix = SIGNAL_RUN_PREFIX.get().map_or("grid-combined", String::as_str);
-    format!("{prefix}-{site}")
+    format!("grid-combined-{site}")
 }
 
 /// Return the kubectl context corresponding to a Forge site.
@@ -11402,7 +8080,7 @@ fn capture_deployment_image(
     deployment: &str,
     container_name: &str,
 ) {
-    let context = combined_kubectl_context(cluster);
+    let context = format!("kind-grid-combined-{cluster}");
     match read_deployment_image(context.as_str(), deployment, container_name) {
         Ok(image) => {
             collection.images.insert(format!("{cluster}_{key}"), image);
@@ -11462,41 +8140,6 @@ fn collect_external_provider_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn signals_vcr_infra_selects_separate_backend_manifest_and_provider_kind() {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/e2e/topologies/grid-signals-combined-site/forge.yaml");
-        let mut config: serde_yaml::Value = serde_yaml::from_slice(&fs::read(source).unwrap()).unwrap();
-        configure_vcr_signals_backend(&mut config).unwrap();
-        let encoded = serde_yaml::to_string(&config).unwrap();
-        assert!(encoded.contains("resources/common/vllm-vcr.yaml"));
-        assert!(!encoded.contains("resources/common/llmd-sim.yaml"));
-        assert_eq!(encoded.matches("providerKind: vllm-vcr").count(), 3);
-        assert!(!encoded.contains("providerKind: llm-d-inference-sim"));
-    }
-
-    #[test]
-    fn released_signals_vcr_default_requires_the_qualified_digest() -> Result<(), Box<dyn std::error::Error>> {
-        let image = SignalsImageLockEntry {
-            role: "simulator".to_owned(),
-            reference: DEFAULT_SIGNALS_VCR_IMAGE.to_owned(),
-            image_id: "sha256:config-id".to_owned(),
-            platform: "linux/amd64".to_owned(),
-            repo_digests: vec![format!("ghcr.io/neuralmagic/vllm-vcr@{DEFAULT_SIGNALS_VCR_DIGEST}")],
-            source_revision: Some("22e64afcd7021da06a9ee3616574a2c03d380180".to_owned()),
-        };
-        verify_default_signals_vcr_digest(&image)?;
-
-        let mismatched = SignalsImageLockEntry {
-            repo_digests: vec!["ghcr.io/neuralmagic/vllm-vcr@sha256:unexpected".to_owned()],
-            ..image
-        };
-        if verify_default_signals_vcr_digest(&mismatched).is_ok() {
-            return Err("the released default must fail closed if its registry digest changes".into());
-        }
-        Ok(())
-    }
 
     #[test]
     fn default_gateway_image_is_the_published_qualification_image() {
@@ -11725,278 +8368,6 @@ mod tests {
     fn cluster_constants() {
         assert_eq!(CLUSTERS.len(), 3);
         assert_eq!(CLUSTERS, &["west", "central", "east"]);
-    }
-
-    #[test]
-    fn signals_run_id_is_lowercase_dns_safe_and_bounded() {
-        validate_signals_run_id("run-20261109-1234").unwrap();
-        assert_eq!(
-            validate_signals_run_id("Uppercase").unwrap_err().to_string(),
-            "--run-id must be 1–32 lowercase ASCII letters, digits, or internal dashes"
-        );
-        assert_eq!(
-            validate_signals_run_id("-leading").unwrap_err().to_string(),
-            "--run-id must be 1–32 lowercase ASCII letters, digits, or internal dashes"
-        );
-        assert_eq!(
-            validate_signals_run_id("trailing-").unwrap_err().to_string(),
-            "--run-id must be 1–32 lowercase ASCII letters, digits, or internal dashes"
-        );
-        assert_eq!(
-            validate_signals_run_id(&"a".repeat(33)).unwrap_err().to_string(),
-            "--run-id must be 1–32 lowercase ASCII letters, digits, or internal dashes"
-        );
-    }
-
-    #[test]
-    fn signals_network_allocator_skips_used_and_kubernetes_ranges() {
-        assert_eq!(
-            choose_signals_network_subnet(&[]).unwrap(),
-            "10.224.0.0/24",
-            "first free private /24 should be deterministic"
-        );
-        assert_eq!(
-            choose_signals_network_subnet(&["10.224.0.0/24".to_owned()]).unwrap(),
-            "10.224.1.0/24",
-            "an existing /24 should be skipped"
-        );
-        assert_eq!(
-            choose_signals_network_subnet(&["10.224.0.0/16".to_owned()]).unwrap(),
-            "10.225.0.0/24",
-            "an existing /16 should reserve all contained /24s"
-        );
-        assert_eq!(
-            choose_signals_network_subnet(&["10.0.0.0/8".to_owned()])
-                .unwrap_err()
-                .to_string(),
-            "no free non-overlapping /24 remains in the signals Docker-network allocation range 10.224.0.0/12",
-            "an overlapping host route covering the allocation pool must fail closed"
-        );
-    }
-
-    #[test]
-    fn ipv4_overlap_uses_inclusive_network_bounds() {
-        assert!(ipv4_ranges_overlap(
-            ipv4_range("10.224.0.0/16").unwrap(),
-            ipv4_range("10.224.7.0/24").unwrap()
-        ));
-        assert!(!ipv4_ranges_overlap(
-            ipv4_range("10.224.0.0/24").unwrap(),
-            ipv4_range("10.224.1.0/24").unwrap()
-        ));
-        assert_eq!(
-            ipv4_range("10.224.0.0/33").unwrap_err().to_string(),
-            "invalid IPv4 prefix length in \"10.224.0.0/33\""
-        );
-    }
-
-    #[test]
-    fn signals_run_scope_rewrites_only_environment_identity_values() {
-        let mut config: serde_yaml::Value = serde_yaml::from_str(
-            "metadata: {name: old}\nspec:\n  runtime: {clusterPrefix: old}\n  network: {dnsZone: old.test}\n  clusters:\n    - name: west\n      properties: {context: kind-grid-signals-west}\n",
-        )
-        .unwrap();
-        apply_signals_run_scope(&mut config, "grid-signals-check-1").unwrap();
-        assert_eq!(
-            config
-                .get("metadata")
-                .and_then(|value| value.get("name"))
-                .and_then(serde_yaml::Value::as_str),
-            Some("grid-signals-check-1")
-        );
-        assert_eq!(
-            config
-                .get("spec")
-                .and_then(|value| value.get("runtime"))
-                .and_then(|value| value.get("clusterPrefix"))
-                .and_then(serde_yaml::Value::as_str),
-            Some("grid-signals-check-1")
-        );
-        assert_eq!(
-            config
-                .get("spec")
-                .and_then(|value| value.get("network"))
-                .and_then(|value| value.get("dnsZone"))
-                .and_then(serde_yaml::Value::as_str),
-            Some("grid-signals-check-1.test")
-        );
-        assert_eq!(
-            config
-                .get("spec")
-                .and_then(|value| value.get("clusters"))
-                .and_then(serde_yaml::Value::as_sequence)
-                .and_then(|clusters| clusters.first())
-                .and_then(|value| value.get("properties"))
-                .and_then(|value| value.get("context"))
-                .and_then(serde_yaml::Value::as_str),
-            Some("kind-grid-signals-check-1-west")
-        );
-    }
-
-    #[test]
-    fn signals_forge_assets_are_staged_beside_the_resolved_config() -> Result<(), Box<dyn std::error::Error>> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/e2e/topologies/grid-signals-combined-site")
-            .canonicalize()?;
-        let evidence = tempfile::tempdir()?;
-
-        stage_signals_forge_assets(&root, evidence.path())?;
-
-        for relative in [
-            "resources/common/grid-system-namespace.yaml",
-            "resources/common/llmd-sim.yaml",
-            "resources/common/vcr-provider-network-policy.yaml",
-            "configs/consumer/praxis.yaml",
-            "configs/provider/praxis.yaml",
-        ] {
-            let staged = evidence.path().join(relative);
-            assert!(
-                staged.is_file(),
-                "Forge input asset was not staged: {}",
-                staged.display()
-            );
-            assert_eq!(
-                fs::read(&staged)?,
-                fs::read(root.join(relative))?,
-                "staged Forge assets must match source files"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn signals_simulator_container_satisfies_restricted_pod_security() -> Result<(), Box<dyn std::error::Error>> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/e2e/topologies/grid-signals-combined-site/resources/common/llmd-sim.yaml");
-        let source = fs::read_to_string(path)?;
-        for document in serde_yaml::Deserializer::from_str(&source) {
-            let manifest = serde_yaml::Value::deserialize(document)?;
-            if manifest.get("kind").and_then(serde_yaml::Value::as_str) != Some("Deployment") {
-                continue;
-            }
-            let pod_spec = manifest
-                .get("spec")
-                .and_then(|value| value.get("template"))
-                .and_then(|value| value.get("spec"))
-                .ok_or("simulator Deployment has no Pod spec")?;
-            let pod_security = pod_spec
-                .get("securityContext")
-                .ok_or("simulator Pod must declare a restricted security context")?;
-            assert_eq!(
-                pod_security.get("runAsNonRoot").and_then(serde_yaml::Value::as_bool),
-                Some(true),
-                "simulator Pod must run as a non-root user"
-            );
-            assert_eq!(
-                pod_security
-                    .get("seccompProfile")
-                    .and_then(|value| value.get("type"))
-                    .and_then(serde_yaml::Value::as_str),
-                Some("RuntimeDefault"),
-                "simulator Pod must use the RuntimeDefault seccomp profile"
-            );
-            let container = pod_spec
-                .get("containers")
-                .and_then(serde_yaml::Value::as_sequence)
-                .and_then(|items| items.first())
-                .ok_or("simulator Deployment has no container")?;
-            let security = container
-                .get("securityContext")
-                .ok_or("simulator container must declare a restricted security context")?;
-            assert_eq!(
-                security
-                    .get("allowPrivilegeEscalation")
-                    .and_then(serde_yaml::Value::as_bool),
-                Some(false),
-                "simulator container must disable privilege escalation"
-            );
-            assert_eq!(
-                security
-                    .get("capabilities")
-                    .and_then(|value| value.get("drop"))
-                    .and_then(serde_yaml::Value::as_sequence)
-                    .and_then(|items| items.first())
-                    .and_then(serde_yaml::Value::as_str),
-                Some("ALL"),
-                "simulator container must drop all Linux capabilities"
-            );
-            return Ok(());
-        }
-        Err("simulator topology must contain a Deployment manifest".into())
-    }
-
-    #[test]
-    fn signals_image_split_supports_registry_ports_and_digests() {
-        fn mapping_string<'mapping>(values: &'mapping serde_yaml::Mapping, key: &str) -> Option<&'mapping str> {
-            values
-                .get(serde_yaml::Value::String(key.to_owned()))
-                .and_then(serde_yaml::Value::as_str)
-        }
-
-        let mut values = serde_yaml::Mapping::new();
-        set_forge_image_repo_tag(&mut values, "tagged", "registry.example:5443/org/operator:v0.3.0");
-        assert_eq!(
-            mapping_string(&values, "taggedRepo"),
-            Some("registry.example:5443/org/operator")
-        );
-        assert_eq!(mapping_string(&values, "taggedTag"), Some("v0.3.0"));
-        assert_eq!(mapping_string(&values, "taggedDigest"), Some(""));
-        set_forge_image_repo_tag(&mut values, "pinned", "registry.example/org/operator@sha256:abc123");
-        assert_eq!(
-            mapping_string(&values, "pinnedRepo"),
-            Some("registry.example/org/operator")
-        );
-        assert_eq!(mapping_string(&values, "pinnedDigest"), Some("sha256:abc123"));
-    }
-
-    #[test]
-    fn signals_pressure_overlay_requires_a_ranked_changed_winner() {
-        let make = |site: &str, rank: u64, score: f64| serde_json::json!({"site":site,"rank":rank,"score":score});
-        let baseline = SignalOverlaySnapshot {
-            site: "west".to_owned(),
-            resource_version: "1".to_owned(),
-            semantic_revision: "base".to_owned(),
-            local_site: "west".to_owned(),
-            candidates: vec![make("west", 0, 1.0), make("central", 1, 0.8), make("east", 2, 0.7)],
-        };
-        let pressured = SignalOverlaySnapshot {
-            site: "west".to_owned(),
-            resource_version: "2".to_owned(),
-            semantic_revision: "pressure".to_owned(),
-            local_site: "west".to_owned(),
-            candidates: vec![make("central", 0, 0.8), make("east", 1, 0.7), make("west", 2, 0.2)],
-        };
-        assert_eq!(overlay_first_candidate(&baseline).unwrap(), "west");
-        assert_eq!(overlay_first_candidate(&pressured).unwrap(), "central");
-        assert!(
-            overlay_candidate_score(&pressured, "west").unwrap() < overlay_candidate_score(&baseline, "west").unwrap()
-        );
-        assert!(overlay_candidate_rank(&pressured, "west").unwrap() > 0);
-    }
-
-    #[test]
-    fn epp_metric_parser_requires_the_selected_pool_label() {
-        let metrics =
-            "# HELP llm_d_epp_average_queue_size queue\nllm_d_epp_average_queue_size{name=\"pool-b\"} 7 123\n";
-        assert!(
-            (epp_metric_for_pool(metrics, "llm_d_epp_average_queue_size", "pool-b").unwrap() - 7.0).abs()
-                < f64::EPSILON
-        );
-        assert_eq!(
-            epp_metric_for_pool(metrics, "llm_d_epp_average_queue_size", "pool-a")
-                .unwrap_err()
-                .to_string(),
-            "EPP metrics do not contain llm_d_epp_average_queue_size labeled for pool pool-a"
-        );
-    }
-
-    #[test]
-    fn simulator_metric_restore_compares_all_supported_fake_metric_fields() {
-        let original = serde_json::json!({"waiting-requests":0,"running-requests":2,"kv-cache-usage":0.25});
-        let restored = serde_json::json!({"waiting-requests":0.0,"running-requests":2.0,"kv-cache-usage":0.250_000_1});
-        let changed = serde_json::json!({"waiting-requests":1,"running-requests":2,"kv-cache-usage":0.25});
-        assert!(fake_metrics_equal(&original, &restored));
-        assert!(!fake_metrics_equal(&original, &changed));
     }
 
     fn test_overlay(sites: &[&str]) -> OverlayData {
@@ -12645,7 +9016,7 @@ overlay reloaded accepted_revision="new" serving_revision="new" previous_serving
         drop((deploy_name, provider_name));
         let routing_cluster = format!("vcr-{site}-provider");
         let label = GRIDSITE_PROVIDER_LABEL;
-        let vcr_image = DEFAULT_SIGNALS_VCR_IMAGE;
+        let vcr_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
         let image_pull_policy = "Never";
         let deployment = format!(
             "apiVersion: apps/v1
@@ -12681,50 +9052,6 @@ spec:
             "pod label must match VCR app name for NetworkPolicy coverage",
         );
         drop((routing_cluster, label, vcr_image, image_pull_policy));
-    }
-
-    #[test]
-    fn vcr_network_policy_allows_epp_to_scrape_model_metrics() {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../tests/e2e/topologies/grid-signals-combined-site/resources/common/vcr-provider-network-policy.yaml",
-        );
-        let policy: serde_yaml::Value = serde_yaml::from_slice(&fs::read(source).unwrap()).unwrap();
-        let ingress = policy
-            .get("spec")
-            .and_then(|spec| spec.get("ingress"))
-            .and_then(serde_yaml::Value::as_sequence)
-            .expect("VCR NetworkPolicy must define ingress rules");
-
-        let epp_metrics_allowed = ingress.iter().any(|rule| {
-            let epp_source = rule
-                .get("from")
-                .and_then(serde_yaml::Value::as_sequence)
-                .is_some_and(|sources| {
-                    sources.iter().any(|source| {
-                        source
-                            .get("podSelector")
-                            .and_then(|selector| selector.get("matchLabels"))
-                            .and_then(|labels| labels.get("app.kubernetes.io/name"))
-                            .and_then(serde_yaml::Value::as_str)
-                            == Some("llmd-epp")
-                    })
-                });
-            let model_metrics_port_allowed =
-                rule.get("ports")
-                    .and_then(serde_yaml::Value::as_sequence)
-                    .is_some_and(|ports| {
-                        ports.iter().any(|port| {
-                            port.get("protocol").and_then(serde_yaml::Value::as_str) == Some("TCP")
-                                && port.get("port").and_then(serde_yaml::Value::as_u64) == Some(8000)
-                        })
-                    });
-            epp_source && model_metrics_port_allowed
-        });
-
-        assert!(
-            epp_metrics_allowed,
-            "EPP must be allowed to poll VCR /metrics on TCP 8000 or provider readiness remains zero"
-        );
     }
 
     #[test]

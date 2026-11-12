@@ -67,7 +67,7 @@ const OVERLAY_CONFIGMAP: &str = "grid-overlay-grid-llmd-pool-metrics-consumer-ga
 const OUTPUT_RULE: &str = "===============================================================================";
 
 /// Evidence JSON schema version.
-const EVIDENCE_SCHEMA_VERSION: &str = "1";
+const EVIDENCE_SCHEMA_VERSION: &str = "2";
 
 /// Number of setup phases in mTLS mode.
 const SETUP_PHASES_MTLS: usize = 11;
@@ -119,6 +119,15 @@ const KV_CACHE_PRESSURE_THRESHOLD: f64 = 0.1;
 /// phase-detection threshold. Extracted from the original inline literal.
 const RECOVERY_QUEUE_THRESHOLD: f64 = 3.0;
 
+/// Number of concurrent customer-shaped requests in each bounded VCR pressure burst.
+const VCR_PRESSURE_CONCURRENCY: usize = 12;
+
+/// Number of repeated bursts needed to span multiple operator signal refresh intervals.
+const VCR_PRESSURE_ROUNDS: usize = 8;
+
+/// VCR response length used to keep the bounded request burst observable to EPP.
+const VCR_PRESSURE_MAX_TOKENS: u32 = 128;
+
 /// Deterministic simulator Deployments representing the pool endpoints.
 const SIMULATOR_DEPLOYMENTS: &[&str] = &["vcr-1", "vcr-2"];
 /// Persistent simulator ConfigMaps keyed by their Deployment.
@@ -162,11 +171,61 @@ const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.1
 /// Default deterministic llm-d-sim image reference required by this demo.
 const DEFAULT_VCR_IMAGE: &str = "llm-d-inference-sim:deterministic";
 
+/// Immutable CPU-only VCR image previously qualified with this topology.
+const DEFAULT_VLLM_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:0.2.5-vllm0.31";
+
+/// Expected immutable digest for the validated VCR release tag.
+const DEFAULT_VLLM_VCR_DIGEST: &str = "sha256:f9f8523a00f2cb9ca8d273a28730a86655be60871e6864554971cb2e9757f0de";
+
+/// Platform manifest and image-config digests for the validated VCR release.
+/// Kubernetes container image IDs report the platform image config digest on
+/// containerd, not the multi-platform registry index digest above.
+const DEFAULT_VLLM_VCR_AMD64_DIGESTS: &[&str] = &[
+    DEFAULT_VLLM_VCR_DIGEST,
+    "sha256:d8c99332621996319033ad31d11dfdab2391e075f241ee82f1d4beb270b3f8ca",
+    "sha256:aa8624af955b52c2d603c689adcc1167a10ae4a0abc8c2ccf2a860a8bce968d6",
+];
+
+/// ARM64 platform manifest and image-config digests for the validated VCR release.
+const DEFAULT_VLLM_VCR_ARM64_DIGESTS: &[&str] = &[
+    DEFAULT_VLLM_VCR_DIGEST,
+    "sha256:560dfbb8108d6b8596bbe2ea9afe65600496d801cc0d7b418987fc52375ccb6a",
+    "sha256:e3f51d302af55923fc2eab1319df7f85533f1b08f69446b44a96b8d5146e1f93",
+];
+
+/// OCI source revision corresponding to the immutable VCR image above.
+const DEFAULT_VLLM_VCR_SOURCE: &str = "22e64afcd7021da06a9ee3616574a2c03d380180";
+
 /// Default overlay-sync sidecar image tag.
 const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "ghcr.io/praxis-proxy/grid-overlay-sync:v0.1.4";
 
 /// Default nginx image for the metrics TLS reverse proxy sidecar.
 const DEFAULT_NGINX_IMAGE: &str = "docker.io/library/nginx:1.27.4-alpine";
+
+/// Backend workload used by the pool-metrics topology.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum PoolMetricsWorkload {
+    /// Deterministic upstream simulator with persistent fake-metric controls.
+    #[default]
+    LlmdSim,
+    /// CPU-only VCR backend with real request-driven metrics.
+    VllmVcr,
+}
+
+impl PoolMetricsWorkload {
+    /// Stable workload name used in logs and evidence.
+    fn label(self) -> &'static str {
+        match self {
+            Self::LlmdSim => "llm-d-sim",
+            Self::VllmVcr => "vllm-vcr",
+        }
+    }
+
+    /// Whether this run uses the request-driven VCR backend.
+    fn is_vcr(self) -> bool {
+        self == Self::VllmVcr
+    }
+}
 
 /// Metrics TLS CA common name (separate from gateway CA).
 const METRICS_CA_CN: &str = "Grid Metrics Test CA";
@@ -289,6 +348,27 @@ struct DemoContext {
     metrics_transport: MetricsTransport,
     /// Selected scoring flavor (which signal drives routing).
     scoring_flavor: ScoringFlavor,
+    /// Selected backend workload.
+    workload: PoolMetricsWorkload,
+    /// Whether the run stops after infrastructure and attributed smoke qualification.
+    infra_only: bool,
+    /// Unique run identifier used for cluster and evidence ownership.
+    run_id: String,
+    /// Run-owned evidence directory.
+    evidence_dir: PathBuf,
+}
+
+/// Signal and workload selection for one pool-metrics demo run.
+#[derive(Clone, Copy)]
+pub(crate) struct PoolMetricsRunOptions {
+    /// Protect EPP metrics scraping with the mTLS proxy.
+    pub(crate) metrics_mtls: bool,
+    /// Score routing with KV-cache pressure instead of queue depth.
+    pub(crate) kv_cache: bool,
+    /// Backend selected for both sites.
+    pub(crate) workload: PoolMetricsWorkload,
+    /// Stop after infrastructure readiness and attributed Gateway smoke.
+    pub(crate) infra_only: bool,
 }
 
 /// Resolved container image references.
@@ -320,6 +400,14 @@ struct Evidence {
     schema_version: String,
     /// Demo mode.
     mode: String,
+    /// Selected backend workload.
+    workload: String,
+    /// Whether this run intentionally stopped at infrastructure qualification.
+    infra_only: bool,
+    /// Synthetic pressure proofs are not run for the VCR infrastructure-only mode.
+    synthetic_pressure_proofs: String,
+    /// Exact source identity of the xtask invocation.
+    source: serde_json::Value,
     /// Metrics transport: "direct-http" or "mtls-proxy".
     metrics_transport: String,
     /// Scoring strategy: "queue-depth" or "kv-cache-pressure".
@@ -347,6 +435,27 @@ struct SetupEvidence {
     clusters: Vec<String>,
     /// Image tags used.
     images: BTreeMap<String, String>,
+    /// Exact Kind context names for each run-owned cluster.
+    contexts: BTreeMap<String, String>,
+    /// Runtime image identities observed in ready workload pods.
+    runtime_images: Vec<RuntimeImageIdentity>,
+    /// Runtime identity collection error, if collection was incomplete.
+    runtime_image_error: Option<String>,
+}
+
+/// Container image identity observed from a running Pod.
+#[derive(Serialize)]
+struct RuntimeImageIdentity {
+    /// Cluster identity.
+    cluster: String,
+    /// Pod name.
+    pod: String,
+    /// Container name.
+    container: String,
+    /// Requested image reference.
+    image: String,
+    /// Runtime-reported immutable image ID.
+    image_id: String,
 }
 
 /// Single proof scenario result.
@@ -420,6 +529,23 @@ struct InferenceResponse {
     demo_attribution: String,
 }
 
+/// Candidate and signal state required to qualify return to the idle route preference.
+#[derive(Clone, Copy)]
+struct VcrRecoveryState {
+    /// Current EPP average queue per endpoint.
+    queue_size: f64,
+    /// Current rank of pool A.
+    rank_a: i64,
+    /// Current rank of pool B.
+    rank_b: i64,
+    /// Number of eligible candidates in the published overlay.
+    candidate_count: usize,
+    /// Current score for pool A.
+    score_a: f64,
+    /// Current score for pool B.
+    score_b: f64,
+}
+
 /// Captured response and transport diagnostics from one curl probe.
 struct CurlProbeOutput {
     /// HTTP status returned by curl, with zero representing no HTTP response.
@@ -443,12 +569,22 @@ struct CurlProbeOutput {
 /// # Errors
 ///
 /// Returns an error when setup, proof scenarios, or teardown fail.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "the top-level command coordinates setup, proofs, cleanup, and evidence for two explicit workloads"
+)]
 pub(crate) fn run(
     forge_config: &Path,
     options: &GlbDemoOptions,
-    metrics_mtls: bool,
-    kv_cache: bool,
+    run_options: PoolMetricsRunOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let PoolMetricsRunOptions {
+        metrics_mtls,
+        kv_cache,
+        workload,
+        infra_only,
+    } = run_options;
+    validate_run_options(options, workload, infra_only)?;
     let mode = options.mode();
     let metrics_transport = if metrics_mtls {
         MetricsTransport::MtlsProxy
@@ -470,7 +606,16 @@ pub(crate) fn run(
     let demo_root = super::demo_root(forge_config);
     eprintln!("{OUTPUT_RULE}");
     eprintln!("Grid llm-d Pool-Metrics Routing Demo");
-    eprintln!("Mode: {}", if mode == DemoMode::Quick { "quick" } else { "full" });
+    eprintln!(
+        "Mode: {}",
+        if infra_only {
+            "infrastructure-only"
+        } else if mode == DemoMode::Quick {
+            "quick"
+        } else {
+            "full"
+        }
+    );
     eprintln!("Metrics transport: {}", metrics_transport.label());
     eprintln!("Scoring strategy:  {}", scoring_flavor.label());
     eprintln!("Forge config: {}", forge_config.display());
@@ -484,18 +629,41 @@ pub(crate) fn run(
         metrics_transport,
         scoring_flavor,
         mode,
+        workload,
+        infra_only,
+        &evidence_dir,
     )?;
     let mut teardown_success = false;
     let mut run_error: Option<String> = None;
+    let mut runtime_images = Vec::new();
+    let mut runtime_image_error = None;
 
     let proof_results = match deploy_setup(&context) {
         Ok(()) => {
+            match collect_runtime_image_evidence(&context) {
+                Ok(identities) if !identities.is_empty() => runtime_images = identities,
+                Ok(_) => runtime_image_error = Some("no ready runtime containers were found".to_owned()),
+                Err(error) => runtime_image_error = Some(error.to_string()),
+            }
             eprintln!();
             eprintln!("{OUTPUT_RULE}");
-            eprintln!("ENVIRONMENT READY - Starting proof scenarios");
+            eprintln!(
+                "ENVIRONMENT READY - {}",
+                if context.infra_only {
+                    "Running infrastructure proofs"
+                } else {
+                    "Starting proof scenarios"
+                }
+            );
             eprintln!("{OUTPUT_RULE}");
 
-            let results = run_proof_scenarios(&context, mode);
+            let mut results = run_proof_scenarios(&context, mode);
+            if let Some(error) = &runtime_image_error {
+                results.insert(
+                    "runtime_image_identity".to_owned(),
+                    failed_proof("Runtime image identity collection", error.clone()),
+                );
+            }
 
             let failed: Vec<&str> = results
                 .iter()
@@ -511,6 +679,13 @@ pub(crate) fn run(
                     }
                 }
                 run_error = Some(format!("proofs failed: {}", failed.join(", ")));
+            }
+
+            if context.infra_only
+                && run_error.is_none()
+                && let Err(error) = write_gridzilla_handoff(&context)
+            {
+                run_error = Some(format!("could not write Gridzilla handoff: {error}"));
             }
 
             if options.teardown && (run_error.is_none() || !options.keep_on_failure) {
@@ -566,12 +741,44 @@ pub(crate) fn run(
 
     let wall_secs = wall_start.elapsed().as_secs_f64();
     let images = collect_image_evidence(&context.images)?;
+    if runtime_images.is_empty() && runtime_image_error.is_none() {
+        match collect_runtime_image_evidence(&context) {
+            Ok(identities) => runtime_images = identities,
+            Err(error) => runtime_image_error = Some(error.to_string()),
+        }
+    }
     let success = run_error.is_none();
 
-    write_transition_timeline(&evidence_dir, &proof_results, context.scoring_flavor, wall_secs)?;
+    write_transition_timeline(
+        &evidence_dir,
+        &proof_results,
+        context.scoring_flavor,
+        context.workload,
+        context.infra_only,
+        wall_secs,
+    )?;
     let evidence = Evidence {
         schema_version: EVIDENCE_SCHEMA_VERSION.to_owned(),
-        mode: format!("{mode:?}").to_lowercase(),
+        mode: if infra_only {
+            "infra-only".to_owned()
+        } else {
+            format!("{mode:?}").to_lowercase()
+        },
+        workload: workload.label().to_owned(),
+        infra_only,
+        synthetic_pressure_proofs: match (workload, mode, infra_only) {
+            (_, _, true) | (PoolMetricsWorkload::LlmdSim, DemoMode::Quick, false) => "NOT_RUN",
+            (PoolMetricsWorkload::LlmdSim, DemoMode::Full, false) => {
+                let pressure_ok = proof_results
+                    .get("pressure_and_flip")
+                    .is_some_and(|proof| proof.success);
+                let recovery_ok = proof_results.get("recovery").is_some_and(|proof| proof.success);
+                if pressure_ok && recovery_ok { "PASS" } else { "FAIL" }
+            },
+            (PoolMetricsWorkload::VllmVcr, _, false) => "NOT_APPLICABLE",
+        }
+        .to_owned(),
+        source: source_identity(workload)?,
         metrics_transport: metrics_transport.label().to_owned(),
         scoring_strategy: scoring_flavor.label().to_owned(),
         started_at,
@@ -579,8 +786,11 @@ pub(crate) fn run(
         success,
         error: run_error.clone(),
         setup: SetupEvidence {
-            clusters: CLUSTERS.iter().map(|s| (*s).to_owned()).collect(),
+            clusters: run_cluster_names(),
             images,
+            contexts: run_cluster_contexts(),
+            runtime_images,
+            runtime_image_error,
         },
         proofs: proof_results,
         lifecycle: LifecycleRecord {
@@ -615,16 +825,78 @@ pub(crate) fn run(
     }
 }
 
+/// Reject workload/mode combinations before any evidence or cluster is created.
+fn validate_run_options(
+    options: &GlbDemoOptions,
+    workload: PoolMetricsWorkload,
+    infra_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if infra_only && !workload.is_vcr() {
+        return Err("--infra-only requires --workload vllm-vcr".into());
+    }
+    if infra_only
+        && (options.teardown
+            || options.keep_on_failure
+            || options.mode_options.quick
+            || options.mode_options.full
+            || options.external_provider.is_some())
+    {
+        return Err(
+            "--infra-only cannot be combined with --quick, --full, --teardown, --keep-on-failure, or external-provider options"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Write one machine-readable record per deterministic phase. The detailed
 /// observations remain in `evidence.json`; this JSONL companion makes phase
 /// ordering and requested simulator values easy to consume without parsing
 /// human output.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "these values define one evidence record and are not a reusable options object"
+)]
 fn write_transition_timeline(
     evidence_dir: &Path,
     proofs: &BTreeMap<String, ProofResult>,
     scoring_flavor: ScoringFlavor,
+    workload: PoolMetricsWorkload,
+    infra_only: bool,
     wall_secs: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if workload.is_vcr() {
+        let phases = if infra_only {
+            vec![("baseline", "baseline")]
+        } else {
+            vec![
+                ("baseline", "baseline"),
+                ("request_pressure", "request_pressure_and_flip"),
+                ("recovery", "request_pressure_recovery"),
+            ]
+        };
+        let lines = phases
+            .into_iter()
+            .map(|(phase, proof_name)| {
+                let proof = proofs.get(proof_name);
+                serde_json::json!({
+                    "phase": phase,
+                    "pressure_source": if phase == "request_pressure" { "bounded OpenAI-compatible requests" } else { "none" },
+                    "synthetic_pressure": "NOT_USED",
+                    "proof_status": proof.map_or("NOT_RUN", |result| if result.success { "PASS" } else { "FAIL" }),
+                    "wall_elapsed_seconds": wall_secs,
+                    "observations": proof.map_or_else(Vec::new, |result| result.observations.clone()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let content = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(evidence_dir.join("timeline.jsonl"), format!("{content}\n"))?;
+        return Ok(());
+    }
     let phases = [
         ("baseline", 0_u32, "baseline"),
         ("pressure", 9_u32, "pressure_and_flip"),
@@ -668,8 +940,11 @@ fn prepare_setup(
     metrics_transport: MetricsTransport,
     scoring_flavor: ScoringFlavor,
     mode: DemoMode,
+    workload: PoolMetricsWorkload,
+    infra_only: bool,
+    evidence_dir: &Path,
 ) -> Result<DemoContext, Box<dyn std::error::Error>> {
-    let images = resolve_images(metrics_transport, mode == DemoMode::Full)?;
+    let images = resolve_images(metrics_transport, mode == DemoMode::Full && !infra_only, workload)?;
     verify_images(&images)?;
 
     let resolved_config = materialize_config_with_images(
@@ -677,6 +952,7 @@ fn prepare_setup(
         &MaterializeConfigOptions {
             metrics_transport,
             scoring_flavor,
+            workload,
             nginx_image: images.nginx.as_deref(),
             images: Some(&images),
             run_id: Some(run_id),
@@ -694,6 +970,10 @@ fn prepare_setup(
         images,
         metrics_transport,
         scoring_flavor,
+        workload,
+        infra_only,
+        run_id: run_id.to_owned(),
+        evidence_dir: evidence_dir.to_path_buf(),
     })
 }
 
@@ -701,6 +981,7 @@ fn prepare_setup(
 fn resolve_images(
     metrics_transport: MetricsTransport,
     include_grid_gateway: bool,
+    workload: PoolMetricsWorkload,
 ) -> Result<ResolvedImages, Box<dyn std::error::Error>> {
     let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let grid_gateway = include_grid_gateway.then(|| {
@@ -708,7 +989,14 @@ fn resolve_images(
     });
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| DEFAULT_OPERATOR_IMAGE.to_owned());
     let epp = std::env::var("GRID_XTASK_EPP_IMAGE").unwrap_or_else(|_| DEFAULT_EPP_IMAGE.to_owned());
-    let vcr = std::env::var("GRID_XTASK_SIM_IMAGE").unwrap_or_else(|_| DEFAULT_VCR_IMAGE.to_owned());
+    let vcr = match workload {
+        PoolMetricsWorkload::LlmdSim => {
+            std::env::var("GRID_XTASK_SIM_IMAGE").unwrap_or_else(|_| DEFAULT_VCR_IMAGE.to_owned())
+        },
+        PoolMetricsWorkload::VllmVcr => {
+            std::env::var("GRID_XTASK_VCR_IMAGE").unwrap_or_else(|_| DEFAULT_VLLM_VCR_IMAGE.to_owned())
+        },
+    };
     let overlay_sync =
         std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_OVERLAY_SYNC_IMAGE.to_owned());
     let nginx = (metrics_transport == MetricsTransport::MtlsProxy)
@@ -721,7 +1009,10 @@ fn resolve_images(
     }
     eprintln!("    operator:     {operator}");
     eprintln!("    epp:          {epp}");
-    eprintln!("    vcr:          {vcr}");
+    eprintln!(
+        "    {}: {vcr}",
+        if workload.is_vcr() { "vllm-vcr" } else { "llm-d-sim" }
+    );
     eprintln!("    overlay-sync: {overlay_sync}");
     if let Some(n) = &nginx {
         eprintln!("    nginx:        {n}");
@@ -757,7 +1048,19 @@ fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Erro
         ("gateway", &images.gateway, "GATEWAY"),
         ("operator", &images.operator, "OPERATOR"),
         ("epp", &images.epp, "EPP"),
-        ("vcr", &images.vcr, "VCR"),
+        (
+            if images.vcr.contains("neuralmagic/vllm-vcr") {
+                "vllm-vcr"
+            } else {
+                "llm-d-sim"
+            },
+            &images.vcr,
+            if images.vcr.contains("neuralmagic/vllm-vcr") {
+                "VCR"
+            } else {
+                "SIM"
+            },
+        ),
         ("overlay-sync", &images.overlay_sync, "OVERLAY_SYNC"),
     ];
     if let Some(grid_gateway) = &images.grid_gateway {
@@ -795,7 +1098,14 @@ fn tag_images_for_forge(images: &ResolvedImages) -> Result<(), Box<dyn std::erro
         (&images.gateway, "praxis-ai:llmd-pool-metrics-demo"),
         (&images.operator, "grid-operator:llmd-pool-metrics-demo"),
         (&images.epp, "llm-d-epp:llmd-pool-metrics-demo"),
-        (&images.vcr, "llm-d-inference-sim:deterministic"),
+        (
+            &images.vcr,
+            if images.vcr.contains("neuralmagic/vllm-vcr") {
+                "vllm-vcr:pool-metrics-demo"
+            } else {
+                "llm-d-inference-sim:deterministic"
+            },
+        ),
         (&images.overlay_sync, "grid-overlay-sync:llmd-pool-metrics-demo"),
     ];
     for (source, target) in forge_expected {
@@ -911,9 +1221,10 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
     // Phase 7/8: Deploy VCR backends and EPP
     eprintln!();
     eprintln!(
-        "[SETUP {}/{}] Deploying deterministic llm-d-sim backends and EPP",
+        "[SETUP {}/{}] Deploying {} backends and EPP",
         next(),
-        total
+        total,
+        context.workload.label()
     );
     for cluster in CLUSTERS {
         let llmd_stack = format!("llmd-{cluster}");
@@ -965,32 +1276,38 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
 
     // Proof 1: Provenance (image digests and config verification)
-    results.insert("provenance".to_owned(), proof_provenance(mtls));
+    results.insert("provenance".to_owned(), proof_provenance(context));
 
     // Proof 2: Baseline (early state scorecard with production scores)
     results.insert("baseline".to_owned(), proof_baseline(context));
 
-    if mode == DemoMode::Full {
+    if mode == DemoMode::Full && !context.infra_only {
         let table_start = Instant::now();
+        if context.workload.is_vcr() {
+            results.insert(
+                "request_pressure_and_flip".to_owned(),
+                proof_vcr_request_pressure(context, table_start),
+            );
+            results.insert(
+                "request_pressure_recovery".to_owned(),
+                proof_vcr_request_recovery(context, table_start),
+            );
+        } else {
+            // Preserve the existing deterministic simulator qualification.
+            results.insert(
+                "pressure_and_flip".to_owned(),
+                proof_pressure_and_flip(context, table_start),
+            );
+            results.insert("recovery".to_owned(), proof_recovery(context, table_start));
 
-        // Proof 3: Pressure via consumer gateway (live table with attribution)
-        results.insert(
-            "pressure_and_flip".to_owned(),
-            proof_pressure_and_flip(context, table_start),
-        );
-
-        // Proof 4: Recovery (measured queue drain with live table)
-        results.insert("recovery".to_owned(), proof_recovery(context, table_start));
-
-        // Proof 5: EPP metrics cross the operator poll relay and drive the
-        // embedded Grid Gateway's live site route without a gateway restart.
-        results.insert("cross_site_signal_poll".to_owned(), cross_site::proof(context));
-        // Proof 6: llm-d sites are read by their saturation and weighed by ready units.
-        results.insert("site_saturation".to_owned(), site_saturation::proof(context));
+            // EPP signals drive the embedded Grid Gateway's live site route.
+            results.insert("cross_site_signal_poll".to_owned(), cross_site::proof(context));
+            results.insert("site_saturation".to_owned(), site_saturation::proof(context));
+        }
     }
 
     // TLS proof stages, only in mTLS mode
-    if mtls {
+    if mtls && !context.infra_only && !context.workload.is_vcr() {
         let tls_results = run_tls_proof_stages();
         results.extend(tls_results);
     }
@@ -999,21 +1316,29 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
 }
 
 /// Proof 1: Image digests and VCR configuration verification.
-fn proof_provenance(mtls: bool) -> ProofResult {
+fn proof_provenance(context: &DemoContext) -> ProofResult {
     let mut observations = Vec::new();
     let mut success = true;
 
     for cluster in CLUSTERS {
         let ctx = kind_context(cluster);
+        let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
         let mut metrics_ok = false;
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Ok(metrics_text) = kubectl_exec_epp_metrics(cluster, mtls) {
                 let has_kv = any_metric_present(&metrics_text, EPP_KV_CACHE_METRICS);
-                let has_queue = any_metric_present(&metrics_text, EPP_QUEUE_SIZE_METRICS);
-                let has_ready = any_metric_present(&metrics_text, EPP_READY_METRICS);
-                if has_kv && has_queue && has_ready {
-                    observations.push(format!("{cluster}: all 3 EPP pool metrics present"));
+                let ready_endpoints = first_prom_value(&metrics_text, EPP_READY_METRICS);
+                let queue = first_prom_value(&metrics_text, EPP_QUEUE_SIZE_METRICS);
+                if has_kv
+                    && queue.is_some_and(f64::is_finite)
+                    && ready_endpoints.is_some_and(|ready| ready.is_finite() && ready > 0.0)
+                {
+                    observations.push(format!(
+                        "{cluster}: live EPP queue={:.3}, ready endpoints={:.0}, and KV-cache metrics present",
+                        queue.unwrap_or_default(),
+                        ready_endpoints.unwrap_or_default()
+                    ));
                     metrics_ok = true;
                     break;
                 }
@@ -1036,15 +1361,326 @@ fn proof_provenance(mtls: bool) -> ProofResult {
             },
             Err(e) => {
                 observations.push(format!("{cluster}: cannot read VCR env: {e}"));
+                success = false;
             },
         }
+
+        if context.workload.is_vcr() {
+            match verify_vcr_runtime_and_config(cluster, &context.images.vcr) {
+                Ok(image_id) => observations.push(format!(
+                    "{cluster}: VCR request-driven config and runtime image verified ({image_id})"
+                )),
+                Err(error) => {
+                    observations.push(format!("{cluster}: VCR workload verification failed: {error}"));
+                    success = false;
+                },
+            }
+
+            let candidates = read_overlay_candidates(cluster);
+            let scored = candidates.len() >= 2
+                && candidates.iter().all(|candidate| {
+                    candidate.fresh
+                        && candidate.score.is_finite()
+                        && candidate.score > 0.0
+                        && candidate.breakdown.is_some()
+                        && candidate.admission_state == "new_and_existing"
+                });
+            if scored {
+                observations.push(format!(
+                    "{cluster}: {} current candidates have scores, fresh metrics, and new-request admission",
+                    candidates.len()
+                ));
+            } else {
+                observations.push(format!(
+                    "{cluster}: overlay candidates lack fresh scores or new-request admission"
+                ));
+                success = false;
+            }
+        }
+
+        if context.workload.is_vcr() {
+            match wait_for_overlay_and_gateway_revision(cluster, DATA_PLANE_WAIT) {
+                Ok((revision, candidate_count)) => observations.push(format!(
+                    "{cluster}: nonempty overlay revision {revision} is mounted and accepted/serving by Praxis AI ({candidate_count} candidates)"
+                )),
+                Err(error) => {
+                    observations.push(format!("{cluster}: Gateway overlay verification failed: {error}"));
+                    success = false;
+                },
+            }
+        }
+    }
+
+    match collect_runtime_image_evidence(context) {
+        Ok(identities) if !identities.is_empty() => {
+            observations.push(format!(
+                "captured {} ready runtime container image IDs",
+                identities.len()
+            ));
+        },
+        Ok(_) => {
+            observations.push("no ready runtime container image IDs were captured".to_owned());
+            success = false;
+        },
+        Err(error) => {
+            observations.push(format!("runtime image identity collection failed: {error}"));
+            success = false;
+        },
     }
 
     ProofResult {
         success,
-        description: "Provenance: EPP metrics live, VCR model verified".to_owned(),
+        description: "Provenance: live EPP metrics, workload config/image, and current Gateway overlay verified"
+            .to_owned(),
         observations,
     }
+}
+
+/// Confirm a VCR Deployment uses request-driven configuration and the requested running image.
+fn verify_vcr_runtime_and_config(cluster: &str, expected_image: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    for name in ["vcr-1", "vcr-2"] {
+        let config = get_configmap_data_key(&context, GRID_SYSTEM_NS, &format!("{name}-config"), "config.yaml")?;
+        if config.contains("fake-metrics:") {
+            return Err(format!("configmap/{name}-config still configures fake-metrics").into());
+        }
+        if !config.contains("force-dummy-tokenizer: true") {
+            return Err(format!("configmap/{name}-config is missing force-dummy-tokenizer").into());
+        }
+        let deployment = kubectl_json(
+            &context,
+            &["get", "deployment", name, "-n", GRID_SYSTEM_NS, "-o", "json"],
+        )?;
+        let configured = deployment
+            .pointer("/spec/template/spec/containers/0/image")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("deployment/{name} is missing its container image"))?;
+        if configured != expected_image {
+            return Err(format!("deployment/{name} uses {configured}, expected {expected_image}").into());
+        }
+    }
+    let identities = collect_runtime_image_evidence_for_cluster(cluster)?;
+    let vcr_ids = identities
+        .iter()
+        .filter(|identity| identity.container == "vcr")
+        .collect::<Vec<_>>();
+    if vcr_ids.len() < 2 {
+        return Err(format!("expected two ready VCR containers, found {}", vcr_ids.len()).into());
+    }
+    for identity in &vcr_ids {
+        if identity.image != expected_image {
+            return Err(format!(
+                "{} uses image {}, expected {expected_image}",
+                identity.pod, identity.image
+            )
+            .into());
+        }
+        if expected_image == DEFAULT_VLLM_VCR_IMAGE {
+            let architecture = cluster_architecture(&context)?;
+            let expected_digests = default_vcr_digests_for_architecture(&architecture)
+                .ok_or_else(|| format!("unsupported node architecture for VCR identity check: {architecture}"))?;
+            if !expected_digests
+                .iter()
+                .any(|digest| identity.image_id.ends_with(digest))
+            {
+                return Err(format!(
+                    "{} runtime image ID {} does not match the validated {architecture} VCR registry, platform-manifest, or image-config digest",
+                    identity.pod, identity.image_id
+                )
+                .into());
+            }
+        }
+    }
+    Ok(vcr_ids
+        .iter()
+        .map(|identity| format!("{}={}", identity.pod, identity.image_id))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+/// Wait for a nonempty published overlay to be mounted and accepted by Praxis AI.
+fn wait_for_overlay_and_gateway_revision(
+    cluster: &str,
+    timeout: Duration,
+) -> Result<(String, usize), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last = "overlay not observed".to_owned();
+    while Instant::now() < deadline {
+        match read_overlay_revision_and_candidate_count(cluster) {
+            Ok((revision, candidate_count)) if candidate_count > 0 => {
+                if gateway_consumed_revision(cluster, &revision)? {
+                    return Ok((revision, candidate_count));
+                }
+                last = format!("Gateway has not mounted, accepted, and served published revision {revision}");
+            },
+            Ok((revision, _count)) => last = format!("published overlay {revision} has no candidates"),
+            Err(error) => last = error.to_string(),
+        }
+        std::thread::sleep(DATA_PLANE_INTERVAL);
+    }
+    Err(format!("{cluster}: Gateway did not consume a current nonempty overlay within {timeout:?}: {last}").into())
+}
+
+/// Check mounted, accepted, and serving overlay revisions against the published value.
+fn gateway_consumed_revision(cluster: &str, expected: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let mounted = Command::new("timeout")
+        .args([
+            "10s",
+            "kubectl",
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "deployment/consumer-gateway",
+            "-c",
+            "overlay-sync",
+            "--",
+            "cat",
+            "/etc/praxis/routing/routing-overlay.json",
+        ])
+        .output()?;
+    if !mounted.status.success() {
+        return Ok(false);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&mounted.stdout)?;
+    let mounted_revision = value
+        .pointer("/revision/value")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let logs = Command::new("timeout")
+        .args([
+            "15s",
+            "kubectl",
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "logs",
+            "deployment/consumer-gateway",
+            "-c",
+            "praxis",
+            "--tail=500",
+        ])
+        .output()?;
+    if !logs.status.success() {
+        return Ok(false);
+    }
+    let logs_text = String::from_utf8_lossy(&logs.stdout);
+    let accepted = ai_revision_from_logs(&logs_text, "accepted_revision");
+    let serving = ai_revision_from_logs(&logs_text, "serving_revision");
+    Ok(mounted_revision == expected && accepted.as_deref() == Some(expected) && serving.as_deref() == Some(expected))
+}
+
+/// Return the published semantic revision and candidate count for one cluster.
+fn read_overlay_revision_and_candidate_count(cluster: &str) -> Result<(String, usize), Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let overlay = kubectl_json(
+        &context,
+        &[
+            "get",
+            "configmap",
+            OVERLAY_CONFIGMAP,
+            "-n",
+            GRID_SYSTEM_NS,
+            "-o",
+            "json",
+        ],
+    )?;
+    let revision = overlay
+        .pointer("/metadata/annotations/grid.praxis.fast~1overlay-revision")
+        .and_then(serde_json::Value::as_str)
+        .filter(|revision| !revision.is_empty())
+        .ok_or("published overlay has no semantic revision")?
+        .to_owned();
+    let routing_config = overlay
+        .pointer("/data/routing-config.json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("published overlay has no routing-config.json")?;
+    let routing: serde_json::Value = serde_json::from_str(routing_config)?;
+    let candidates = routing
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("routing config has no candidate list")?;
+    Ok((revision, candidates.len()))
+}
+
+/// Parse the latest exact field from Praxis overlay reload log messages.
+fn ai_revision_from_logs(logs: &str, field: &str) -> Option<String> {
+    let logs = strip_ansi_csi(logs);
+    logs.lines()
+        .filter_map(|line| {
+            let start = line.find(field)? + field.len();
+            let value = line[start..]
+                .trim_start()
+                .strip_prefix('=')?
+                .trim_start()
+                .trim_start_matches([' ', '\t', '"'])
+                .split([' ', '\t', ',', '"'])
+                .next()?;
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+        .next_back()
+}
+
+/// Remove terminal CSI control sequences before reading structured log fields.
+fn strip_ansi_csi(text: &str) -> String {
+    let mut chars = text.chars().peekable();
+    let mut output = String::with_capacity(text.len());
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for sequence_char in chars.by_ref() {
+                    if ('@'..='~').contains(&sequence_char) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        output.push(ch);
+    }
+    output
+}
+
+/// Return one supported immutable VCR digest set for a node architecture.
+fn default_vcr_digests_for_architecture(architecture: &str) -> Option<&'static [&'static str]> {
+    match architecture {
+        "amd64" => Some(DEFAULT_VLLM_VCR_AMD64_DIGESTS),
+        "arm64" => Some(DEFAULT_VLLM_VCR_ARM64_DIGESTS),
+        _ => None,
+    }
+}
+
+/// Read the run cluster's node architecture and reject mixed-architecture nodes.
+fn cluster_architecture(context: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let nodes = kubectl_json(context, &["get", "nodes", "-o", "json"])?;
+    let items = nodes
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("node list response omitted items")?;
+    let architectures = items
+        .iter()
+        .filter_map(|node| {
+            node.pointer("/status/nodeInfo/architecture")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect::<BTreeSet<_>>();
+    if architectures.len() != 1 {
+        return Err(format!(
+            "expected one node architecture in run-owned cluster, found {}",
+            architectures.into_iter().collect::<Vec<_>>().join(", ")
+        )
+        .into());
+    }
+    Ok(architectures
+        .iter()
+        .next()
+        .copied()
+        .ok_or("node list contains no architecture")?
+        .to_owned())
 }
 
 /// Proof 2: Confirm pool-a preferred at idle, send attributed request
@@ -1076,7 +1712,20 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
         let candidates = read_overlay_candidates("pool-a");
         let rank_a = overlay_rank_for_cluster(&candidates, "pool-a");
 
-        if rank_a == 0 && epp_a.queue_size < 3.0 && last_request.elapsed() >= Duration::from_secs(5) {
+        let selected = candidates.iter().find(|candidate| candidate.cluster.contains("pool-a"));
+        let selected_is_usable = !context.workload.is_vcr()
+            || selected.is_some_and(|candidate| {
+                candidate.fresh
+                    && candidate.score.is_finite()
+                    && candidate.score > 0.0
+                    && candidate.breakdown.is_some()
+                    && candidate.admission_state == "new_and_existing"
+            });
+        if rank_a == 0
+            && selected_is_usable
+            && epp_a.queue_size < 3.0
+            && last_request.elapsed() >= Duration::from_secs(5)
+        {
             last_request = Instant::now();
             eprintln!(
                 "  [BASELINE] Pool A is preferred (rank=0, queue={:.1}); sending verification traffic",
@@ -1141,6 +1790,669 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
         description: "Baseline: pool-a preferred at idle, pool-a attribution confirmed".to_owned(),
         observations,
     }
+}
+
+/// Generate bounded real traffic through the Gateway and verify EPP/Grid react to VCR metrics.
+fn proof_vcr_request_pressure(context: &DemoContext, started: Instant) -> ProofResult {
+    let mut observations = Vec::new();
+    let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
+    let before = read_overlay_revision_and_candidate_count("pool-a");
+    let Ok((baseline_revision, candidate_count)) = before else {
+        return failed_proof(
+            "VCR pressure: baseline overlay unavailable",
+            format!("could not read baseline overlay: {}", before.unwrap_err()),
+        );
+    };
+    if candidate_count < 2 {
+        return failed_proof(
+            "VCR pressure: both providers must be eligible before pressure",
+            format!("baseline overlay has {candidate_count} candidates"),
+        );
+    }
+
+    let mut peak_queue = 0.0_f64;
+    let mut requested = 0_usize;
+    let mut succeeded = 0_usize;
+    let mut rows = Vec::new();
+    let pressure_session = format!("grid-vcr-pressure-{}", context.run_id);
+    let mut shifted_revision = None;
+    let mut shifted_route = None;
+    let mut pressure_probe_revision = None;
+    let mut last = "no route shift observed".to_owned();
+    let mut last_gateway_revision_check = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let mut last_reconcile_trigger = Instant::now();
+    let pressure_deadline = Instant::now() + Duration::from_secs(150);
+    eprintln!(
+        "  [VCR PRESSURE] Sending at most {} requests in {} bounded bursts through the consumer Gateway",
+        VCR_PRESSURE_CONCURRENCY * VCR_PRESSURE_ROUNDS,
+        VCR_PRESSURE_ROUNDS
+    );
+
+    for round in 0..VCR_PRESSURE_ROUNDS {
+        let context_name = kind_context("pool-a");
+        let mut handles = Vec::with_capacity(VCR_PRESSURE_CONCURRENCY);
+        for request in 0..VCR_PRESSURE_CONCURRENCY {
+            let context_name = context_name.clone();
+            let session = pressure_session.clone();
+            handles.push(std::thread::spawn(move || {
+                send_inference_request_with_tokens_and_session(
+                    &context_name,
+                    VCR_MODEL,
+                    &format!("vcr-pressure-{round}-{request}"),
+                    Some(VCR_PRESSURE_MAX_TOKENS),
+                    Some(&session),
+                )
+                .map_err(|error| error.to_string())
+            }));
+        }
+        requested += VCR_PRESSURE_CONCURRENCY;
+
+        while handles.iter().any(|handle| !handle.is_finished()) && Instant::now() < pressure_deadline {
+            if last_reconcile_trigger.elapsed() >= Duration::from_secs(5) {
+                trigger_gridnetwork_reconcile("pool-a");
+                last_reconcile_trigger = Instant::now();
+            }
+            match kubectl_exec_epp_metrics("pool-a", mtls) {
+                Ok(metrics_text) => {
+                    let parsed = parse_epp_metrics(&metrics_text);
+                    peak_queue = peak_queue.max(parsed.queue_size);
+                    let (revision, count) = match read_overlay_revision_and_candidate_count("pool-a") {
+                        Ok(value) => value,
+                        Err(error) => {
+                            observations.push(format!("overlay sample failed during burst {round}: {error}"));
+                            std::thread::sleep(Duration::from_millis(500));
+                            continue;
+                        },
+                    };
+                    let candidates = read_overlay_candidates("pool-a");
+                    let rank_a = overlay_rank_for_cluster(&candidates, "pool-a");
+                    let rank_b = overlay_rank_for_cluster(&candidates, "pool-b");
+                    let score_a = overlay_score_for_cluster(&candidates, "pool-a");
+                    let score_b = overlay_score_for_cluster(&candidates, "pool-b");
+                    let pool_a = candidates.iter().find(|candidate| candidate.cluster.contains("pool-a"));
+                    let pool_b = candidates.iter().find(|candidate| candidate.cluster.contains("pool-b"));
+                    rows.push(serde_json::json!({
+                        "capturedAtUtc": format_utc_iso(),
+                        "eppQueueAveragePerEndpoint": parsed.queue_size,
+                        "eppKvCacheUtilization": parsed.kv_cache,
+                        "overlayRevision": revision,
+                        "overlayCandidateCount": count,
+                        "poolARank": rank_a,
+                        "poolBRank": rank_b,
+                        "poolAScore": score_a,
+                        "poolBScore": score_b,
+                        "poolAFresh": pool_a.map(|candidate| candidate.fresh),
+                        "poolBFresh": pool_b.map(|candidate| candidate.fresh),
+                        "poolAAdmissionState": pool_a.map(|candidate| candidate.admission_state.as_str()),
+                        "poolBAdmissionState": pool_b.map(|candidate| candidate.admission_state.as_str()),
+                    }));
+                    if rank_b == 0
+                        && rank_a > 0
+                        && score_b > score_a
+                        && revision != baseline_revision
+                        && pressure_probe_revision.as_deref() != Some(revision.as_str())
+                        && last_gateway_revision_check.elapsed() >= Duration::from_secs(1)
+                    {
+                        last_gateway_revision_check = Instant::now();
+                        match probe_pressure_revision(&revision) {
+                            Ok(Some(response)) => {
+                                observations.push(format!(
+                                    "pool-a Gateway accepted and served pressure overlay revision {revision} while the request burst was active"
+                                ));
+                                pressure_probe_revision = Some(revision.clone());
+                                if response.provider_gateway.contains("pool-b")
+                                    && response.demo_attribution.contains("pool-b")
+                                {
+                                    shifted_revision = Some(revision.clone());
+                                    shifted_route = Some(response.provider_gateway.clone());
+                                    observations.push(format!(
+                                        "during-pressure probe reached {} with pool-b attribution; scores pool-a={score_a:.4}, pool-b={score_b:.4}",
+                                        response.provider_gateway
+                                    ));
+                                } else {
+                                    last = format!(
+                                        "during-pressure probe selected {} / {} under revision {revision}",
+                                        response.provider_gateway, response.demo_attribution
+                                    );
+                                }
+                            },
+                            Ok(None) => {
+                                last = format!(
+                                    "published pressure revision {revision} is not yet the Gateway serving revision"
+                                );
+                            },
+                            Err(error) => {
+                                last = format!("during-pressure probe failed under revision {revision}: {error}");
+                            },
+                        }
+                    }
+                },
+                Err(error) => observations.push(format!("EPP sample unavailable during request load: {error}")),
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        let mut successful = 0_usize;
+        let mut provider_receipts = BTreeMap::<String, usize>::new();
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(response)) => {
+                    successful += 1;
+                    succeeded += 1;
+                    *provider_receipts.entry(response.provider_gateway.clone()).or_default() += 1;
+                },
+                Ok(Err(error)) => observations.push(format!("round {round} request failed: {error}")),
+                Err(_) => observations.push(format!("round {round} request worker panicked")),
+            }
+        }
+        observations.push(format!(
+            "round {round}: {successful}/{VCR_PRESSURE_CONCURRENCY} HTTP 200; gateway provider attribution {provider_receipts:?}"
+        ));
+        if successful != VCR_PRESSURE_CONCURRENCY {
+            observations.push(format!("round {round} had failed requests; preserving the failure instead of treating partial traffic as pressure proof"));
+            break;
+        }
+        if Instant::now() >= pressure_deadline {
+            observations.push("bounded request-pressure deadline reached".to_owned());
+            break;
+        }
+        if shifted_route.is_some() {
+            break;
+        }
+    }
+
+    match serde_json::to_vec_pretty(&rows)
+        .map_err(|error| error.to_string())
+        .and_then(|content| {
+            fs::write(context.evidence_dir.join("vcr-pressure-metrics.json"), content)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(()) => {},
+        Err(error) => observations.push(format!("could not save VCR pressure samples: {error}")),
+    }
+    observations.push(format!("baseline overlay revision: {baseline_revision}"));
+    observations.push(format!("peak EPP queue average per endpoint: {peak_queue:.3}"));
+
+    let deadline = Instant::now() + DATA_PLANE_WAIT;
+    while shifted_route.is_none() && Instant::now() < deadline {
+        trigger_gridnetwork_reconcile("pool-a");
+        let candidates = read_overlay_candidates("pool-a");
+        let rank_a = overlay_rank_for_cluster(&candidates, "pool-a");
+        let rank_b = overlay_rank_for_cluster(&candidates, "pool-b");
+        if rank_b == 0 && rank_a > 0 {
+            let (revision, count) = match read_overlay_revision_and_candidate_count("pool-a") {
+                Ok(value) => value,
+                Err(error) => {
+                    last = format!("overlay read failed after pressure: {error}");
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                },
+            };
+            let score_a = overlay_score_for_cluster(&candidates, "pool-a");
+            let score_b = overlay_score_for_cluster(&candidates, "pool-b");
+            if revision != baseline_revision && count >= 2 && score_b > score_a {
+                match gateway_consumed_revision("pool-a", &revision) {
+                    Ok(true) => observations.push(format!(
+                        "pool-a Gateway accepted and serves pressure overlay revision {revision}"
+                    )),
+                    Ok(false) => {
+                        last =
+                            format!("published pressure revision {revision} is not yet the Gateway serving revision");
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    },
+                    Err(error) => {
+                        last = format!("could not verify Gateway pressure revision: {error}");
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    },
+                }
+                shifted_revision = Some(revision.clone());
+                match send_inference_request(&kind_context("pool-a"), VCR_MODEL, "vcr-pressure-shift") {
+                    Ok(response)
+                        if response.provider_gateway.contains("pool-b")
+                            && response.demo_attribution.contains("pool-b") =>
+                    {
+                        shifted_route = Some(response.provider_gateway.clone());
+                        observations.push(format!("post-pressure scores pool-a={score_a:.4}, pool-b={score_b:.4}; revision={revision}; attributed probe reached {}", response.provider_gateway));
+                        break;
+                    },
+                    Ok(response) => {
+                        last = format!(
+                            "post-pressure probe was attributed to {} / {}",
+                            response.provider_gateway, response.demo_attribution
+                        );
+                    },
+                    Err(error) => last = format!("post-pressure probe failed: {error}"),
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    if let Some(revision) = shifted_revision.as_ref() {
+        observations.push(format!("pressure overlay revision: {revision}"));
+    }
+    observations.push(format!("elapsed: {:.1}s", started.elapsed().as_secs_f64()));
+
+    let success = peak_queue > 0.0
+        && requested > 0
+        && succeeded == requested
+        && shifted_revision.is_some()
+        && shifted_route.is_some();
+    observations.push(format!(
+        "bounded request pressure: {succeeded}/{requested} requests returned HTTP 200 with provider attribution"
+    ));
+    if !success {
+        observations.push(format!("pressure-to-route proof incomplete: {last}"));
+    }
+    ProofResult {
+        success,
+        description: "Bounded customer-shaped VCR requests raised real EPP metrics, changed Grid scoring/overlay, and routed a fresh request to the preferred provider".to_owned(),
+        observations,
+    }
+}
+
+/// Verify that the consumer Gateway serves a pressure revision and issue one correlated route probe.
+fn probe_pressure_revision(revision: &str) -> Result<Option<InferenceResponse>, String> {
+    match gateway_consumed_revision("pool-a", revision) {
+        Ok(true) => send_inference_request(&kind_context("pool-a"), VCR_MODEL, "vcr-pressure-shift")
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        Ok(false) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Wait for request-driven VCR metrics and routing to recover after the bounded burst.
+fn proof_vcr_request_recovery(context: &DemoContext, started: Instant) -> ProofResult {
+    let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
+    let deadline = Instant::now() + DATA_PLANE_WAIT;
+    let mut observations = Vec::new();
+    let mut rows = Vec::new();
+    let mut last = "no EPP metrics observed".to_owned();
+    while Instant::now() < deadline {
+        trigger_gridnetwork_reconcile("pool-a");
+        match kubectl_exec_epp_metrics("pool-a", mtls) {
+            Ok(metrics_text) => {
+                let metrics = parse_epp_metrics(&metrics_text);
+                let candidates = read_overlay_candidates("pool-a");
+                let rank_a = overlay_rank_for_cluster(&candidates, "pool-a");
+                let rank_b = overlay_rank_for_cluster(&candidates, "pool-b");
+                let (revision, count) = match read_overlay_revision_and_candidate_count("pool-a") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        last = format!("overlay read failed during recovery: {error}");
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    },
+                };
+                let score_a = overlay_score_for_cluster(&candidates, "pool-a");
+                let score_b = overlay_score_for_cluster(&candidates, "pool-b");
+                last = format!(
+                    "queue={:.3}, scores pool-a={score_a:.4}/pool-b={score_b:.4}, ranks pool-a={rank_a}/pool-b={rank_b}, revision={revision}, candidates={count}",
+                    metrics.queue_size
+                );
+                rows.push(serde_json::json!({
+                    "capturedAtUtc": format_utc_iso(),
+                    "eppQueueAveragePerEndpoint": metrics.queue_size,
+                    "eppKvCacheUtilization": metrics.kv_cache,
+                    "overlayRevision": revision,
+                    "overlayCandidateCount": count,
+                    "poolARank": rank_a,
+                    "poolBRank": rank_b,
+                    "poolAScore": score_a,
+                    "poolBScore": score_b,
+                }));
+                if vcr_recovery_state_met(&VcrRecoveryState {
+                    queue_size: metrics.queue_size,
+                    rank_a,
+                    rank_b,
+                    candidate_count: count,
+                    score_a,
+                    score_b,
+                }) {
+                    match gateway_consumed_revision("pool-a", &revision) {
+                        Ok(true) => observations.push(format!(
+                            "pool-a Gateway accepted and serves recovery overlay revision {revision}"
+                        )),
+                        Ok(false) => {
+                            last = format!(
+                                "published recovery revision {revision} is not yet the Gateway serving revision"
+                            );
+                            std::thread::sleep(Duration::from_secs(1));
+                            continue;
+                        },
+                        Err(error) => {
+                            last = format!("could not verify Gateway recovery revision: {error}");
+                            std::thread::sleep(Duration::from_secs(1));
+                            continue;
+                        },
+                    }
+                    match send_inference_request(&kind_context("pool-a"), VCR_MODEL, "vcr-recovery") {
+                        Ok(response)
+                            if response.provider_gateway.contains("pool-a")
+                                && response.demo_attribution.contains("pool-a") =>
+                        {
+                            observations.push(last);
+                            observations.push(format!("recovery request attributed to {}", response.provider_gateway));
+                            observations.push(format!("recovery completed in {:.1}s", started.elapsed().as_secs_f64()));
+                            match serde_json::to_vec_pretty(&rows)
+                                .map_err(|error| error.to_string())
+                                .and_then(|content| {
+                                    fs::write(context.evidence_dir.join("vcr-recovery-metrics.json"), content)
+                                        .map_err(|error| error.to_string())
+                                }) {
+                                Ok(()) => {},
+                                Err(error) => {
+                                    observations.push(format!("could not save VCR recovery samples: {error}"));
+                                },
+                            }
+                            return ProofResult {
+                                success: true,
+                                description: "VCR request queue drained, Grid restored the baseline overlay preference, and Gateway attribution recovered".to_owned(),
+                                observations,
+                            };
+                        },
+                        Ok(response) => {
+                            last = format!(
+                                "recovery probe selected {} / {}",
+                                response.provider_gateway, response.demo_attribution
+                            );
+                        },
+                        Err(error) => last = format!("recovery probe failed: {error}"),
+                    }
+                }
+            },
+            Err(error) => last = format!("EPP scrape failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    if let Ok(content) = serde_json::to_vec_pretty(&rows)
+        && let Err(error) = fs::write(context.evidence_dir.join("vcr-recovery-metrics.json"), content)
+    {
+        observations.push(format!("could not save VCR recovery samples: {error}"));
+    }
+    observations.push(format!(
+        "VCR recovery did not converge within {DATA_PLANE_WAIT:?}: {last}"
+    ));
+    ProofResult {
+        success: false,
+        description: "VCR request-driven queue and baseline route recovery".to_owned(),
+        observations,
+    }
+}
+
+/// Whether real VCR pressure has drained and the deterministic idle preference is back.
+fn vcr_recovery_state_met(state: &VcrRecoveryState) -> bool {
+    state.queue_size.is_finite()
+        && state.queue_size < RECOVERY_QUEUE_THRESHOLD
+        && state.rank_a == 0
+        && state.rank_b > 0
+        && state.candidate_count >= 2
+        && state.score_a.is_finite()
+        && state.score_b.is_finite()
+        && state.score_a >= state.score_b
+}
+
+/// Construct a failed proof with one concise diagnostic.
+fn failed_proof(description: &str, detail: String) -> ProofResult {
+    ProofResult {
+        success: false,
+        description: description.to_owned(),
+        observations: vec![detail],
+    }
+}
+
+/// Write the Gridzilla generic-endpoint configuration and a run-scoped handoff.
+fn write_gridzilla_handoff(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
+    let gateway_ip = consumer_gateway_ip("pool-a")?;
+    let endpoint_config_path = context.evidence_dir.join("gridzilla-endpoint.json");
+    let cleanup_script_path = context.evidence_dir.join("cleanup.sh");
+    let endpoint_url = format!("http://{gateway_ip}:8080/v1/chat/completions");
+    let endpoint_config = serde_json::json!({
+        "id": format!("grid-llmd-pool-metrics-{}", context.run_id),
+        "name": format!("Grid llm-d pool-metrics VCR {}", context.run_id),
+        "url": endpoint_url,
+        "requestTemplate": {
+            "model": VCR_MODEL,
+            "messages": [{"role": "user", "content": "Gridzilla VCR request-driven metrics smoke"}],
+            "max_tokens": 16
+        },
+        "padJsonPointer": "/messages/0/content",
+        "expectedStatuses": [200],
+        "responseHeaderDimensions": {
+            "provider_site": {
+                "header": "X-Grid-LlmD-Provider-Gateway",
+                "allowedValues": ["pool-a", "pool-b"]
+            },
+            "demo_provider_site": {
+                "header": "x-ai-demo-provider-gateway",
+                "allowedValues": ["pool-a", "pool-b"]
+            }
+        }
+    });
+    fs::write(&endpoint_config_path, serde_json::to_vec_pretty(&endpoint_config)?)?;
+
+    let kubeconfig = std::env::var_os("KUBECONFIG")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".kube/config")))
+        .unwrap_or_else(|| PathBuf::from("~/.kube/config"));
+    let source = source_identity(context.workload)?;
+    let runtime_images = collect_runtime_image_evidence(context)?;
+    let handoff = serde_json::json!({
+        "schemaVersion": "gridzilla.generic-endpoint-handoff/v1",
+        "runId": context.run_id,
+        "scenario": "generic-endpoint",
+        "workload": context.workload.label(),
+        "status": "INFRASTRUCTURE_SMOKE_PASS",
+        "qualification": {
+            "kind": "VCR request-driven routing smoke",
+            "result": "PASS",
+            "throughput": "NOT_QUALIFIED",
+            "syntheticPressureProofs": "NOT_RUN",
+            "boundedRealRequestPressureProof": "NOT_RUN"
+        },
+        "createdAtUtc": format_utc_iso(),
+        "source": source,
+        "images": {
+            "referencesAndLocalImageIds": collect_image_evidence(&context.images)?,
+            "runningContainers": runtime_images
+        },
+        "clusters": run_cluster_names(),
+        "kubecontexts": run_cluster_contexts(),
+        "kubeconfig": kubeconfig,
+        "endpointConfig": endpoint_config_path,
+        "cleanup": {
+            "command": format!("bash {}", cleanup_script_path.display()),
+            "script": cleanup_script_path,
+            "forgeConfig": context.resolved_config,
+            "forgeStateDirectory": context.forge_state_dir,
+            "clusters": run_cluster_names()
+        }
+    });
+    let handoff_path = context.evidence_dir.join("gridzilla-handoff.json");
+    fs::write(&handoff_path, serde_json::to_vec_pretty(&handoff)?)?;
+
+    let script = format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nFORGE_BIN={}\nFORGE_CONFIG={}\nFORGE_STATE_DIR={}\nexport FORGE_STATE_DIR\n\"$FORGE_BIN\" --config \"$FORGE_CONFIG\" --non-interactive --state-dir \"$FORGE_STATE_DIR\" down\n",
+        shell_quote(&context.forge_bin.display().to_string()),
+        shell_quote(&context.resolved_config.display().to_string()),
+        shell_quote(&context.forge_state_dir.display().to_string()),
+    );
+    fs::write(&cleanup_script_path, script)?;
+    set_executable_permissions(&cleanup_script_path)?;
+    eprintln!(
+        "[HANDOFF] Gridzilla endpoint config: {}",
+        endpoint_config_path.display()
+    );
+    eprintln!("[HANDOFF] Gridzilla run handoff: {}", handoff_path.display());
+    eprintln!(
+        "[HANDOFF] cleanup only this run: bash {}",
+        cleanup_script_path.display()
+    );
+    Ok(())
+}
+
+/// Resolve a run-owned cluster's consumer Gateway LoadBalancer address.
+fn consumer_gateway_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let service = kubectl_json(
+        &context,
+        &["get", "service", "consumer-gateway", "-n", GRID_SYSTEM_NS, "-o", "json"],
+    )?;
+    service
+        .pointer("/status/loadBalancer/ingress/0/ip")
+        .and_then(serde_json::Value::as_str)
+        .filter(|ip| !ip.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{cluster}: consumer-gateway has no LoadBalancer IP for Gridzilla").into())
+}
+
+/// Capture immutable runtime image IDs from all ready workload containers in one cluster.
+fn collect_runtime_image_evidence_for_cluster(
+    cluster: &str,
+) -> Result<Vec<RuntimeImageIdentity>, Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let pods = kubectl_json(&context, &["get", "pods", "-n", GRID_SYSTEM_NS, "-o", "json"])?;
+    let items = pods
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("pod list response omitted items")?;
+    let mut identities = Vec::new();
+    for pod in items {
+        let ready = pod
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|conditions| {
+                conditions.iter().any(|condition| {
+                    condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+                        && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
+                })
+            });
+        if !ready {
+            continue;
+        }
+        let pod_name = pod
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let containers = pod
+            .pointer("/status/containerStatuses")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("{cluster}/{pod_name}: ready pod has no containerStatuses"))?;
+        for container in containers {
+            let image_id = container
+                .get("imageID")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("{cluster}/{pod_name}: container imageID is missing"))?;
+            identities.push(RuntimeImageIdentity {
+                cluster: cluster.to_owned(),
+                pod: pod_name.to_owned(),
+                container: container
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                image: container
+                    .get("image")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                image_id: image_id.to_owned(),
+            });
+        }
+    }
+    Ok(identities)
+}
+
+/// Capture ready runtime images across both run-owned clusters.
+fn collect_runtime_image_evidence(
+    _context: &DemoContext,
+) -> Result<Vec<RuntimeImageIdentity>, Box<dyn std::error::Error>> {
+    let mut identities = Vec::new();
+    for cluster in CLUSTERS {
+        identities.extend(collect_runtime_image_evidence_for_cluster(cluster)?);
+    }
+    Ok(identities)
+}
+
+/// Produce a stable source and working-tree fingerprint for evidence.
+fn source_identity(workload: PoolMetricsWorkload) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let revision = Command::new("git")
+        .args(["-C", &repository.display().to_string(), "rev-parse", "HEAD"])
+        .output()?;
+    if !revision.status.success() {
+        return Err("could not resolve Grid source revision".into());
+    }
+    let status = Command::new("git")
+        .args([
+            "-C",
+            &repository.display().to_string(),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ])
+        .output()?;
+    if !status.status.success() {
+        return Err("could not inspect Grid working-tree status".into());
+    }
+    let diff = Command::new("git")
+        .args(["-C", &repository.display().to_string(), "diff", "--binary", "HEAD"])
+        .output()?;
+    if !diff.status.success() {
+        return Err("could not fingerprint Grid source diff".into());
+    }
+    let mut digest = Sha256::new();
+    digest.update(&diff.stdout);
+    for line in String::from_utf8_lossy(&status.stdout).lines() {
+        let path = line.get(3..).unwrap_or_default();
+        let path = repository.join(path);
+        if path.is_file() {
+            digest.update(fs::read(path)?);
+        }
+    }
+    let fingerprint = format!("sha256:{}", hex::encode(digest.finalize()));
+    let workload_image_source = match workload {
+        PoolMetricsWorkload::LlmdSim => std::env::var("GRID_XTASK_SIM_SOURCE_SHA").ok(),
+        PoolMetricsWorkload::VllmVcr => {
+            let selected = std::env::var("GRID_XTASK_VCR_IMAGE").unwrap_or_else(|_| DEFAULT_VLLM_VCR_IMAGE.to_owned());
+            if selected == DEFAULT_VLLM_VCR_IMAGE {
+                Some(DEFAULT_VLLM_VCR_SOURCE.to_owned())
+            } else {
+                std::env::var("GRID_XTASK_VCR_SOURCE_SHA").ok()
+            }
+        },
+    };
+    Ok(serde_json::json!({
+        "revision": String::from_utf8_lossy(&revision.stdout).trim(),
+        "dirty": !status.stdout.is_empty(),
+        "workingTreeSha256": fingerprint,
+        "workloadImageSourceRevision": workload_image_source
+    }))
+}
+
+/// Quote a value for a constant shell assignment.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Mark the run-owned cleanup helper executable on Unix hosts.
+#[cfg(unix)]
+fn set_executable_permissions(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_executable_permissions(_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
 }
 
 /// Proof 3: Scale up pressure through the consumer gateway, wait for
@@ -2103,7 +3415,7 @@ fn read_overlay_candidates(cluster: &str) -> Vec<OverlayCandidate> {
             #[expect(clippy::cast_possible_truncation, reason = "rank is always small")]
             let rank = c.get("rank").and_then(serde_json::Value::as_u64).unwrap_or(99) as u32;
             let score = c.get("score").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-            let fresh = c.get("fresh").and_then(serde_json::Value::as_bool).unwrap_or(true);
+            let fresh = c.get("fresh").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let admission = c
                 .get("admission_state")
                 .and_then(serde_json::Value::as_str)
@@ -2257,14 +3569,41 @@ fn send_inference_request(
     model: &str,
     phase: &str,
 ) -> Result<InferenceResponse, Box<dyn std::error::Error>> {
-    let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"test"}}]}}"#,);
-    let session_id = format!("probe-{}", format_utc_timestamp());
+    send_inference_request_with_tokens_and_session(kube_context, model, phase, None, None)
+}
+
+/// Send a request with an optional completion length and explicit session key.
+fn send_inference_request_with_tokens_and_session(
+    kube_context: &str,
+    model: &str,
+    phase: &str,
+    max_tokens: Option<u32>,
+    session_override: Option<&str>,
+) -> Result<InferenceResponse, Box<dyn std::error::Error>> {
+    let mut request = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "bounded VCR routing qualification request"}],
+    });
+    if let Some(max_tokens) = max_tokens {
+        request
+            .as_object_mut()
+            .ok_or("generated inference request must be a JSON object")?
+            .insert("max_tokens".to_owned(), serde_json::Value::from(max_tokens));
+    }
+    let body = serde_json::to_string(&request)?;
+    let sequence = CURL_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let session_id = session_override.map_or_else(
+        || format!("probe-{phase}-{}-{sequence}", format_utc_timestamp()),
+        str::to_owned,
+    );
+    let request_id = format!("grid-{phase}-{}-{sequence}", format_utc_timestamp());
     let curl_cmd = format!(
         "curl -sS -o /dev/null \
          -w 'STATUS:%{{http_code}}\\nPROVIDER_GW:%header{{X-Grid-LlmD-Provider-Gateway}}\\nDEMO_ATTRIB:%header{{x-ai-demo-provider-gateway}}\\n' \
          -X POST http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions \
          -H 'Content-Type: application/json' \
          -H 'X-Session-Id: {session_id}' \
+         -H 'X-Request-ID: {request_id}' \
          -d '{body}' 2>/tmp/curl.stderr > /tmp/curl.stdout
          curl_exit=$?
          curl_stdout=$(cat /tmp/curl.stdout)
@@ -2278,7 +3617,7 @@ fn send_inference_request(
     );
     let raw = kubectl_exec_curl_raw(kube_context, &curl_cmd).map_err(|error| {
         format!(
-            "inference probe command failed: phase={phase}; observed_at={}; request_id={session_id}; {error}",
+            "inference probe command failed: phase={phase}; observed_at={}; request_id={request_id}; {error}",
             format_utc_iso()
         )
     })?;
@@ -2288,7 +3627,7 @@ fn send_inference_request(
             curl_probe_diagnostics(&CurlProbeDiagnostic {
                 phase,
                 observed_at: &format_utc_iso(),
-                request_id: &session_id,
+                request_id: &request_id,
                 http_status: None,
                 curl_exit_code: None,
                 curl_stderr: &format!("kubectl stderr: {}; raw stdout: {:?}", raw.stderr, raw.stdout),
@@ -2307,7 +3646,7 @@ fn send_inference_request(
             curl_probe_diagnostics(&CurlProbeDiagnostic {
                 phase,
                 observed_at: &format_utc_iso(),
-                request_id: &session_id,
+                request_id: &request_id,
                 http_status: Some(probe.status),
                 curl_exit_code: Some(probe.curl_exit_code),
                 curl_stderr: &probe.curl_stderr,
@@ -2322,7 +3661,7 @@ fn send_inference_request(
             curl_probe_diagnostics(&CurlProbeDiagnostic {
                 phase,
                 observed_at: &format_utc_iso(),
-                request_id: &session_id,
+                request_id: &request_id,
                 http_status: Some(probe.status),
                 curl_exit_code: Some(probe.curl_exit_code),
                 curl_stderr: &probe.curl_stderr,
@@ -2667,6 +4006,23 @@ fn get_configmap_data_key(
         return Err(format!("configmap/{name} key={key} is empty").into());
     }
     Ok(data)
+}
+
+/// Run an explicit-context kubectl command and parse its JSON output.
+fn kubectl_json(context: &str, args: &[&str]) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args(["--context", context])
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl --context {context} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -3241,6 +4597,7 @@ fn materialize_config(
         &MaterializeConfigOptions {
             metrics_transport,
             scoring_flavor,
+            workload: PoolMetricsWorkload::LlmdSim,
             nginx_image,
             images: None,
             run_id: None,
@@ -3260,6 +4617,8 @@ struct MaterializeConfigOptions<'inputs> {
     metrics_transport: MetricsTransport,
     /// Scoring implementation selected by this qualification.
     scoring_flavor: ScoringFlavor,
+    /// Backend workload used to render provider identity and runtime config.
+    workload: PoolMetricsWorkload,
     /// Optional nginx image used by the metrics TLS proxy manifests.
     nginx_image: Option<&'inputs str>,
     /// Optional explicitly resolved image set to materialize.
@@ -3276,6 +4635,7 @@ fn materialize_config_with_images(
     let MaterializeConfigOptions {
         metrics_transport,
         scoring_flavor,
+        workload,
         nginx_image,
         images,
         run_id,
@@ -3330,38 +4690,46 @@ fn materialize_config_with_images(
                 } else {
                     format!("{property}Tag")
                 };
+                let selected_repo = repository;
+                let selected_tag = tag;
                 result = checked_replace(
                     &result,
                     &format!("{repo_property}: \"{default_repository}\""),
-                    &format!("{repo_property}: \"{repository}\""),
+                    &format!("{repo_property}: \"{selected_repo}\""),
                     if role == "overlay-sync" { 1 } else { 2 },
                     &format!("{role} image repository"),
                 )?;
                 result = checked_replace(
                     &result,
                     &format!("{tag_property}: \"{default_tag}\""),
-                    &format!("{tag_property}: \"{tag}\""),
+                    &format!("{tag_property}: \"{selected_tag}\""),
                     if role == "overlay-sync" { 1 } else { 2 },
                     &format!("{role} image tag"),
                 )?;
             }
         }
 
-        // The simulator image is also embedded in the checked-in backend
-        // manifests. Materialize those manifests so an explicit override is
-        // the exact image loaded into Kind; do not rely on a host-only alias.
+        if workload.is_vcr() {
+            result = add_vcr_network_policy_steps(&result)?;
+        }
+
+        // The backend image is embedded in checked-in manifests. Materialize
+        // them so the selected workload and exact image are used by Forge.
         for pool in CLUSTERS {
             let source = dir.join(format!("resources/{pool}/vcr-deployment.yaml"));
             let resolved_name = format!(".forge.resolved.{pool}-vcr-deployment{run_suffix}.yaml");
             let destination = dir.join(&resolved_name);
             let manifest = fs::read_to_string(&source)?;
-            let resolved_manifest = checked_replace(
+            let mut resolved_manifest = checked_replace(
                 &manifest,
                 DEFAULT_VCR_IMAGE,
                 &images.vcr,
                 2,
-                &format!("{pool} simulator image"),
+                &format!("{pool} backend image"),
             )?;
+            if workload.is_vcr() {
+                resolved_manifest = render_vcr_backend_manifest(&resolved_manifest, pool)?;
+            }
             fs::write(&destination, resolved_manifest)?;
             result = checked_replace(
                 &result,
@@ -3369,6 +4737,15 @@ fn materialize_config_with_images(
                 &resolved_name,
                 1,
                 &format!("{pool} simulator deployment path"),
+            )?;
+        }
+        if workload.is_vcr() {
+            result = checked_replace(
+                &result,
+                "providerKind: llm-d-inference-sim",
+                "providerKind: vllm-vcr",
+                2,
+                "VCR provider kind",
             )?;
         }
     }
@@ -3469,6 +4846,45 @@ fn materialize_config_with_images(
 
     fs::write(&resolved, result)?;
     Ok(resolved)
+}
+
+/// Render the existing simulator Deployment/ConfigMaps for the real-metrics VCR image.
+fn render_vcr_backend_manifest(manifest: &str, pool: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let fake_metrics =
+        "    fake-metrics:\n      waiting-requests: 0\n      running-requests: 0\n      kv-cache-usage: 0.0";
+    let without_fake_metrics = checked_replace(
+        manifest,
+        fake_metrics,
+        "    force-dummy-tokenizer: true\n    enable-request-id-headers: true",
+        2,
+        &format!("{pool} VCR request-driven ConfigMap config"),
+    )?;
+    checked_replace(
+        &without_fake_metrics,
+        "args: [\"--config\", \"/config/config.yaml\", \"--logtostderr=true\", \"--force-dummy-tokenizer\"]",
+        "args: [\"--config\", \"/config/config.yaml\", \"--logtostderr=true\"]",
+        2,
+        &format!("{pool} VCR arguments"),
+    )
+}
+
+/// Add the narrow EPP/VCR ingress policy only for VCR workload runs.
+fn add_vcr_network_policy_steps(config: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut rendered = config.to_owned();
+    for pool in CLUSTERS {
+        let anchor = format!("        - type: manifest\n          path: resources/{pool}/vcr-deployment.yaml\n");
+        let replacement = format!(
+            "{anchor}        - type: manifest\n          path: resources/common/vcr-provider-network-policy.yaml\n"
+        );
+        rendered = checked_replace(
+            &rendered,
+            &anchor,
+            &replacement,
+            1,
+            &format!("{pool} VCR NetworkPolicy step"),
+        )?;
+    }
+    Ok(rendered)
 }
 
 /// Scope the Forge prefix, shared Docker network, and explicit `kubectl` contexts to one run.
@@ -3687,6 +5103,22 @@ fn kind_context(cluster: &str) -> String {
 /// Return this invocation's Forge cluster prefix, or the checked-in default in unit tests.
 fn run_cluster_prefix() -> &'static str {
     RUN_CLUSTER_PREFIX.get().map_or(DEFAULT_CLUSTER_PREFIX, String::as_str)
+}
+
+/// Names of the Kind clusters owned by this command invocation.
+fn run_cluster_names() -> Vec<String> {
+    CLUSTERS
+        .iter()
+        .map(|cluster| format!("{}-{cluster}", run_cluster_prefix()))
+        .collect()
+}
+
+/// Explicit kubecontext names for this invocation's Kind clusters.
+fn run_cluster_contexts() -> BTreeMap<String, String> {
+    CLUSTERS
+        .iter()
+        .map(|cluster| ((*cluster).to_owned(), kind_context(cluster)))
+        .collect()
 }
 
 /// Annotate the GridNetwork to trigger operator re-reconciliation.
@@ -4853,6 +6285,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ai_revision_parser_accepts_ansi_between_field_and_equals() {
+        let logs = concat!(
+            "INFO accepted_revision\u{1b}[0m = \"rev-old\" serving_revision=rev-old\n",
+            "INFO accepted_revision\u{1b}[0m = \"rev-current\" serving_revision\u{1b}[0m = \"rev-current\"\n",
+        );
+
+        assert_eq!(
+            ai_revision_from_logs(logs, "accepted_revision").as_deref(),
+            Some("rev-current"),
+            "the latest accepted revision must be parsed after ANSI escapes are removed"
+        );
+        assert_eq!(
+            ai_revision_from_logs(logs, "serving_revision").as_deref(),
+            Some("rev-current"),
+            "the latest serving revision must be parsed after ANSI escapes are removed"
+        );
+    }
+
+    #[test]
+    fn default_vcr_digest_set_matches_supported_platform_identity() {
+        assert_eq!(
+            default_vcr_digests_for_architecture("amd64"),
+            Some(DEFAULT_VLLM_VCR_AMD64_DIGESTS)
+        );
+        assert_eq!(
+            default_vcr_digests_for_architecture("arm64"),
+            Some(DEFAULT_VLLM_VCR_ARM64_DIGESTS)
+        );
+        assert_eq!(
+            default_vcr_digests_for_architecture("s390x"),
+            None,
+            "unsupported architectures must fail closed"
+        );
+        assert!(
+            DEFAULT_VLLM_VCR_AMD64_DIGESTS
+                .iter()
+                .any(|digest| digest.ends_with("aa8624af955b52c2d603c689adcc1167a10ae4a0abc8c2ccf2a860a8bce968d6")),
+            "the amd64 set must include the verified runtime image-config digest"
+        );
+    }
+
+    #[test]
+    fn vcr_recovery_accepts_equal_idle_scores_when_locality_ranks_pool_a_first() {
+        let baseline = VcrRecoveryState {
+            queue_size: 0.0,
+            rank_a: 0,
+            rank_b: 1,
+            candidate_count: 2,
+            score_a: 1.0,
+            score_b: 1.0,
+        };
+        assert!(
+            vcr_recovery_state_met(&baseline),
+            "idle pools can have equal scores while the deterministic locality tie-break ranks pool-a first"
+        );
+        assert!(
+            !vcr_recovery_state_met(&VcrRecoveryState {
+                queue_size: 5.0,
+                ..baseline
+            }),
+            "a non-drained VCR queue must not pass recovery"
+        );
+        assert!(
+            !vcr_recovery_state_met(&VcrRecoveryState {
+                rank_a: 1,
+                rank_b: 0,
+                ..baseline
+            }),
+            "a pressure preference for pool-b must not pass recovery"
+        );
+        assert!(
+            !vcr_recovery_state_met(&VcrRecoveryState {
+                candidate_count: 1,
+                ..baseline
+            }),
+            "recovery requires both scored providers to remain in the overlay"
+        );
+    }
+
+    #[test]
     fn curl_probe_waits_for_a_terminal_pod_before_reading_logs() -> Result<(), Box<dyn std::error::Error>> {
         let running: serde_json::Value = serde_json::from_str(r#"{"status":{"phase":"Running"}}"#)?;
         assert_eq!(
@@ -5310,8 +6822,12 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     #[test]
     fn evidence_serializes_to_json() {
         let evidence = Evidence {
-            schema_version: "1".to_owned(),
+            schema_version: "2".to_owned(),
             mode: "quick".to_owned(),
+            workload: "llm-d-sim".to_owned(),
+            infra_only: false,
+            synthetic_pressure_proofs: "NOT_APPLICABLE".to_owned(),
+            source: serde_json::json!({}),
             metrics_transport: "direct-http".to_owned(),
             scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -5321,6 +6837,9 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             setup: SetupEvidence {
                 clusters: vec!["pool-a".to_owned(), "pool-b".to_owned()],
                 images: BTreeMap::new(),
+                contexts: BTreeMap::new(),
+                runtime_images: Vec::new(),
+                runtime_image_error: None,
             },
             proofs: BTreeMap::new(),
             lifecycle: LifecycleRecord {
@@ -5550,8 +7069,12 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     #[test]
     fn evidence_records_direct_http_transport() {
         let evidence = Evidence {
-            schema_version: "1".to_owned(),
+            schema_version: "2".to_owned(),
             mode: "quick".to_owned(),
+            workload: "llm-d-sim".to_owned(),
+            infra_only: false,
+            synthetic_pressure_proofs: "NOT_APPLICABLE".to_owned(),
+            source: serde_json::json!({}),
             metrics_transport: MetricsTransport::DirectHttp.label().to_owned(),
             scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -5561,6 +7084,9 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             setup: SetupEvidence {
                 clusters: vec!["pool-a".to_owned()],
                 images: BTreeMap::new(),
+                contexts: BTreeMap::new(),
+                runtime_images: Vec::new(),
+                runtime_image_error: None,
             },
             proofs: BTreeMap::new(),
             lifecycle: LifecycleRecord {
@@ -5577,8 +7103,12 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     #[test]
     fn evidence_records_mtls_proxy_transport() {
         let evidence = Evidence {
-            schema_version: "1".to_owned(),
+            schema_version: "2".to_owned(),
             mode: "quick".to_owned(),
+            workload: "llm-d-sim".to_owned(),
+            infra_only: false,
+            synthetic_pressure_proofs: "NOT_APPLICABLE".to_owned(),
+            source: serde_json::json!({}),
             metrics_transport: MetricsTransport::MtlsProxy.label().to_owned(),
             scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -5588,6 +7118,9 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             setup: SetupEvidence {
                 clusters: vec!["pool-a".to_owned()],
                 images: BTreeMap::new(),
+                contexts: BTreeMap::new(),
+                runtime_images: Vec::new(),
+                runtime_image_error: None,
             },
             proofs: BTreeMap::new(),
             lifecycle: LifecycleRecord {
@@ -5877,7 +7410,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         if std::env::var("GRID_XTASK_NGINX_IMAGE").is_ok() {
             return;
         }
-        let images = resolve_images(MetricsTransport::DirectHttp, false).unwrap();
+        let images = resolve_images(MetricsTransport::DirectHttp, false, PoolMetricsWorkload::LlmdSim).unwrap();
         assert!(images.nginx.is_none(), "direct-HTTP must not resolve nginx image");
         assert!(
             images.grid_gateway.is_none(),
@@ -5887,12 +7420,220 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
     #[test]
     fn nginx_image_present_in_mtls() {
-        let images = resolve_images(MetricsTransport::MtlsProxy, false).unwrap();
+        let images = resolve_images(MetricsTransport::MtlsProxy, false, PoolMetricsWorkload::LlmdSim).unwrap();
         assert!(images.nginx.is_some(), "mTLS must resolve nginx image");
         assert_eq!(images.nginx.unwrap(), DEFAULT_NGINX_IMAGE);
         assert!(
             images.grid_gateway.is_none(),
             "quick-mode inputs must not require Grid Gateway"
         );
+    }
+
+    fn demo_options() -> GlbDemoOptions {
+        GlbDemoOptions {
+            mode_options: super::super::GlbDemoModeOptions {
+                quick: false,
+                full: false,
+                no_ingress: false,
+            },
+            teardown: false,
+            keep_on_failure: false,
+            evidence_dir: None,
+            external_provider: None,
+            external_provider_key_file: None,
+            external_provider_model: None,
+            external_provider_site: None,
+        }
+    }
+
+    #[test]
+    fn vcr_infrastructure_mode_rejects_simulator_and_destructive_options_before_setup() {
+        let mut options = demo_options();
+        assert!(validate_run_options(&options, PoolMetricsWorkload::LlmdSim, true).is_err());
+
+        options.teardown = true;
+        assert!(validate_run_options(&options, PoolMetricsWorkload::VllmVcr, true).is_err());
+        options.teardown = false;
+        options.mode_options.full = true;
+        assert!(validate_run_options(&options, PoolMetricsWorkload::VllmVcr, true).is_err());
+    }
+
+    #[test]
+    fn vcr_rendering_uses_request_driven_metrics_and_removes_simulator_arguments()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for pool in CLUSTERS {
+            let source = match *pool {
+                "pool-a" => include_str!(
+                    "../../../../tests/e2e/topologies/grid-llmd-pool-metrics/resources/pool-a/vcr-deployment.yaml"
+                ),
+                "pool-b" => include_str!(
+                    "../../../../tests/e2e/topologies/grid-llmd-pool-metrics/resources/pool-b/vcr-deployment.yaml"
+                ),
+                _ => unreachable!(),
+            };
+            let rendered = render_vcr_backend_manifest(source, pool)?;
+            assert!(
+                !rendered.contains("fake-metrics:"),
+                "VCR config must not inject simulator metrics"
+            );
+            assert_eq!(rendered.matches("force-dummy-tokenizer: true").count(), 2);
+            assert_eq!(rendered.matches("enable-request-id-headers: true").count(), 2);
+            assert_eq!(rendered.matches("--force-dummy-tokenizer").count(), 0);
+
+            let documents = serde_yaml::Deserializer::from_str(&rendered)
+                .map(serde_yaml::Value::deserialize)
+                .collect::<Result<Vec<_>, _>>()?;
+            let deployments = documents
+                .iter()
+                .filter(|document| document.get("kind").and_then(serde_yaml::Value::as_str) == Some("Deployment"))
+                .count();
+            assert_eq!(
+                deployments, 2,
+                "{pool}: both backend Deployments must remain in the rendered manifest"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vcr_workload_materializes_into_the_existing_two_site_topology() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!(
+            "grid-llmd-vcr-materialize-{}-{}",
+            std::process::id(),
+            CURL_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join("resources/pool-a"))?;
+        fs::create_dir_all(dir.join("resources/pool-b"))?;
+        let topology = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/topologies/grid-llmd-pool-metrics");
+        fs::copy(topology.join("forge.yaml"), dir.join("forge.yaml"))?;
+        for pool in CLUSTERS {
+            fs::copy(
+                topology.join(format!("resources/{pool}/vcr-deployment.yaml")),
+                dir.join(format!("resources/{pool}/vcr-deployment.yaml")),
+            )?;
+        }
+        let images = ResolvedImages {
+            gateway: DEFAULT_GATEWAY_IMAGE.to_owned(),
+            grid_gateway: None,
+            operator: DEFAULT_OPERATOR_IMAGE.to_owned(),
+            epp: DEFAULT_EPP_IMAGE.to_owned(),
+            vcr: DEFAULT_VLLM_VCR_IMAGE.to_owned(),
+            overlay_sync: DEFAULT_OVERLAY_SYNC_IMAGE.to_owned(),
+            nginx: None,
+        };
+        let resolved = materialize_config_with_images(
+            &dir.join("forge.yaml"),
+            &MaterializeConfigOptions {
+                metrics_transport: MetricsTransport::DirectHttp,
+                scoring_flavor: ScoringFlavor::QueueDepth,
+                workload: PoolMetricsWorkload::VllmVcr,
+                nginx_image: None,
+                images: Some(&images),
+                run_id: None,
+            },
+        )?;
+        let forge = fs::read_to_string(resolved)?;
+        assert_eq!(forge.matches("providerKind: vllm-vcr").count(), 2);
+        assert!(!forge.contains("providerKind: llm-d-inference-sim"));
+        assert_eq!(
+            forge
+                .matches("path: resources/common/vcr-provider-network-policy.yaml")
+                .count(),
+            2
+        );
+        for pool in CLUSTERS {
+            let rendered = fs::read_to_string(dir.join(format!(".forge.resolved.{pool}-vcr-deployment.yaml")))?;
+            assert!(
+                !rendered.contains("fake-metrics:"),
+                "{pool} must use request-driven VCR metrics"
+            );
+            assert_eq!(rendered.matches(DEFAULT_VLLM_VCR_IMAGE).count(), 2);
+        }
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vcr_network_policy_is_narrow_and_targets_the_existing_backend_pods() -> Result<(), Box<dyn std::error::Error>> {
+        let policy_source = include_str!(
+            "../../../../tests/e2e/topologies/grid-llmd-pool-metrics/resources/common/vcr-provider-network-policy.yaml"
+        );
+        let policy: serde_yaml::Value = serde_yaml::from_str(policy_source)?;
+        assert_eq!(
+            policy.get("kind").and_then(serde_yaml::Value::as_str),
+            Some("NetworkPolicy")
+        );
+        assert_eq!(
+            policy
+                .get("spec")
+                .and_then(|spec| spec.get("podSelector"))
+                .and_then(|selector| selector.get("matchLabels"))
+                .and_then(|labels| labels.get("app"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("vllm-vcr")
+        );
+        let ingress = policy
+            .get("spec")
+            .and_then(|spec| spec.get("ingress"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .ok_or_else(|| std::io::Error::other("VCR NetworkPolicy must contain ingress rules"))?;
+        let allowed_sources = ingress
+            .iter()
+            .filter_map(|rule| {
+                rule.get("from")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .and_then(|sources| sources.first())
+                    .and_then(|peer| peer.get("podSelector"))
+                    .and_then(|selector| selector.get("matchLabels"))
+                    .and_then(|labels| labels.get("app.kubernetes.io/name"))
+                    .and_then(serde_yaml::Value::as_str)
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(
+            allowed_sources.contains("grid-operator"),
+            "Grid operator must be allowed to scrape VCR"
+        );
+        assert!(
+            allowed_sources.contains("llmd-epp"),
+            "EPP must be allowed to scrape VCR metrics"
+        );
+        assert!(
+            ingress.iter().any(|rule| {
+                rule.get("from")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .and_then(|sources| sources.first())
+                    .and_then(|peer| peer.get("podSelector"))
+                    .and_then(|selector| selector.get("matchLabels"))
+                    .and_then(|labels| labels.get("grid.praxis.fast/backend-access"))
+                    .and_then(serde_yaml::Value::as_str)
+                    == Some("provider-gateway")
+            }),
+            "the provider Gateway must retain backend access"
+        );
+        let ports = ingress
+            .iter()
+            .flat_map(|rule| {
+                rule.get("ports")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|port| port.get("port").and_then(serde_yaml::Value::as_u64))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ports,
+            BTreeSet::from([8000]),
+            "the policy must expose only VCR HTTP/metrics port 8000"
+        );
+
+        let forge = include_str!("../../../../tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml");
+        let rendered = add_vcr_network_policy_steps(forge)?;
+        assert_eq!(
+            rendered
+                .matches("path: resources/common/vcr-provider-network-policy.yaml")
+                .count(),
+            2
+        );
+        Ok(())
     }
 }

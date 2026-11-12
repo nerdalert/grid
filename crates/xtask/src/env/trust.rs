@@ -473,7 +473,7 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 11,
+            checked, 10,
             "every provider fixture must be checked; a different count means one was added without \
              coverage, or one dropped out of it"
         );

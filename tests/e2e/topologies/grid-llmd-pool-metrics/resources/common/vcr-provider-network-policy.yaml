@@ -1,14 +1,14 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: vcr-inference-allow-provider-gateway-only
+  name: vcr-inference-allow-required-scrapers
   namespace: grid-system
   labels:
-    app.kubernetes.io/part-of: grid-signals-combined-site
+    app.kubernetes.io/part-of: grid-llmd-pool-metrics
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: vllm-vcr
+      app: vllm-vcr
   policyTypes:
     - Ingress
   ingress:
@@ -26,8 +26,7 @@ spec:
       ports:
         - protocol: TCP
           port: 8000
-    # EPP polls the model server's /metrics endpoint directly for queue and
-    # endpoint-health signals. Keep that access scoped to the serving port.
+    # EPP polls VCR /metrics directly for queue and endpoint-health signals.
     - from:
         - podSelector:
             matchLabels:
