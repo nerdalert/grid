@@ -944,7 +944,8 @@ fn prepare_setup(
     infra_only: bool,
     evidence_dir: &Path,
 ) -> Result<DemoContext, Box<dyn std::error::Error>> {
-    let images = resolve_images(metrics_transport, mode == DemoMode::Full && !infra_only, workload)?;
+    let include_grid_gateway = mode == DemoMode::Full && !infra_only && !workload.is_vcr();
+    let images = resolve_images(metrics_transport, include_grid_gateway, workload)?;
     verify_images(&images)?;
 
     let resolved_config = materialize_config_with_images(
@@ -2208,6 +2209,7 @@ fn failed_proof(description: &str, detail: String) -> ProofResult {
 /// Write the Gridzilla generic-endpoint configuration and a run-scoped handoff.
 fn write_gridzilla_handoff(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
     let gateway_ip = consumer_gateway_ip("pool-a")?;
+    let forge_config = fs::canonicalize(&context.resolved_config)?;
     let endpoint_config_path = context.evidence_dir.join("gridzilla-endpoint.json");
     let cleanup_script_path = context.evidence_dir.join("cleanup.sh");
     let endpoint_url = format!("http://{gateway_ip}:8080/v1/chat/completions");
@@ -2267,7 +2269,7 @@ fn write_gridzilla_handoff(context: &DemoContext) -> Result<(), Box<dyn std::err
         "cleanup": {
             "command": format!("bash {}", cleanup_script_path.display()),
             "script": cleanup_script_path,
-            "forgeConfig": context.resolved_config,
+            "forgeConfig": forge_config,
             "forgeStateDirectory": context.forge_state_dir,
             "clusters": run_cluster_names()
         }
@@ -2278,7 +2280,7 @@ fn write_gridzilla_handoff(context: &DemoContext) -> Result<(), Box<dyn std::err
     let script = format!(
         "#!/usr/bin/env bash\nset -euo pipefail\nFORGE_BIN={}\nFORGE_CONFIG={}\nFORGE_STATE_DIR={}\nexport FORGE_STATE_DIR\n\"$FORGE_BIN\" --config \"$FORGE_CONFIG\" --non-interactive --state-dir \"$FORGE_STATE_DIR\" down\n",
         shell_quote(&context.forge_bin.display().to_string()),
-        shell_quote(&context.resolved_config.display().to_string()),
+        shell_quote(&forge_config.display().to_string()),
         shell_quote(&context.forge_state_dir.display().to_string()),
     );
     fs::write(&cleanup_script_path, script)?;
@@ -3635,9 +3637,11 @@ fn send_inference_request_with_tokens_and_session(
             })
         )
     })?;
-    if probe.status != 200 {
+    if !probe_transport_succeeded(&probe) {
         let reason = if probe.status == 0 {
             "no HTTP response (HTTP status 000)"
+        } else if probe.curl_exit_code != 0 {
+            "curl failed after receiving HTTP response headers"
         } else {
             "unexpected HTTP response"
         };
@@ -3674,6 +3678,11 @@ fn send_inference_request_with_tokens_and_session(
         provider_gateway: probe.provider_gateway,
         demo_attribution: probe.demo_attribution,
     })
+}
+
+/// An HTTP status alone does not prove that curl received the complete response.
+fn probe_transport_succeeded(probe: &CurlProbeOutput) -> bool {
+    probe.status == 200 && probe.curl_exit_code == 0
 }
 
 /// Context recorded when one inference probe is rejected.
@@ -6467,6 +6476,17 @@ mod tests {
         assert!(output.curl_stderr.is_empty());
         assert_eq!(output.provider_gateway, "pool-a");
         assert_eq!(output.demo_attribution, "pool-a-provider");
+        assert!(probe_transport_succeeded(&output));
+        Ok(())
+    }
+
+    #[test]
+    fn curl_probe_rejects_incomplete_response_after_http_200() -> Result<(), Box<dyn std::error::Error>> {
+        let output = parse_curl_probe_output(
+            "STATUS:200\nPROVIDER_GW:pool-a\nDEMO_ATTRIB:pool-a-provider\nCURL_EXIT:18\nCURL_STDERR_BEGIN\ncurl: (18) transfer closed with outstanding read data\nCURL_STDERR_END\n",
+        )?;
+
+        assert!(!probe_transport_succeeded(&output));
         Ok(())
     }
 

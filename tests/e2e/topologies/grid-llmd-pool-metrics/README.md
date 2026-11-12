@@ -79,10 +79,11 @@ workload before creating clusters. To remove only the infrastructure run,
 execute the `bash <evidence-dir>/.../cleanup.sh` command printed by the xtask.
 Do not run the generated Forge `down` command for another run's evidence.
 
-Quick mode proves the local EPP scrape, score changes, overlay propagation,
-and routing recovery. Full mode also deploys the source-built Grid Gateway and
-proves that each site's EPP signals cross the operator mTLS poll relay, reach
-the Gateway through its local operator, and change live site selection without
+In the default simulator workload, quick mode proves the local EPP scrape,
+score changes, overlay propagation, and routing recovery. Simulator full mode
+also deploys the source-built Grid Gateway and proves that each site's EPP
+signals cross the operator mTLS poll relay, reach the Gateway through its local
+operator, and change live site selection without
 a Gateway restart. It also checks that a stale local signal is excluded while
 SWIM remains connected and that a peer with the wrong pinned identity cannot
 replace an accepted signal.
@@ -103,7 +104,7 @@ cargo xtask env run-grid-llmd-pool-metrics-demo \
   --full --teardown --evidence-dir "$EVIDENCE_DIR"
 ```
 
-Full mode requires source-built Grid images because it exercises the operator's
+Simulator full mode requires source-built Grid images because it exercises the operator's
 signal relay and uses the `gridServing` chart mode with the `grid_site_route`
 filter. The run resolves a unique Kind cluster prefix and a Forge state
 directory under `EVIDENCE_DIR`; do not share Forge state between simultaneous
