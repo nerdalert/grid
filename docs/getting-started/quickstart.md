@@ -19,11 +19,19 @@ instead.
 
 - Linux with Docker. macOS is not verified: the images are `linux/amd64`, and
   kind LoadBalancer addresses are not reachable from a macOS host.
+- On non-amd64 Linux hosts, the script loads the amd64-only VCR simulator image
+  and requires container-runtime emulation.
 - [kind](https://kind.sigs.k8s.io) v0.32.0, kubectl,
   [Helm](https://helm.sh) v3.17.3, Git, curl, and `jq`.
 - Rust from `rust-toolchain.toml`, used to install [Forge](../developing/forge.md),
   the tool that creates the clusters.
 - 4 vCPU, 16 GB memory, and 20 GB of free disk.
+
+The script uses the fixed Kind cluster names `grid-hub-site-hub` and
+`grid-hub-site-site`; the corresponding kubectl contexts are
+`kind-grid-hub-site-hub` and `kind-grid-hub-site-site`. Check `kind get clusters`
+before starting. The `down` command deletes both named clusters, so use these
+names only when they are free and the clusters are owned by this evaluation.
 
 ## Create the grid
 
@@ -99,8 +107,24 @@ curl -sS -D - -H 'Content-Type: application/json' \
 
 A working grid returns HTTP 200 with a `choices` array. The backend is a
 simulator that replays recorded responses, so the content is not a live model
-answer. The `x-grid-provider-site: site-a` response header shows that
-the hub routed the request to the site cluster. Stop the port-forward with Ctrl+C.
+answer. In this example, the `x-grid-provider-site: site-a` and
+`x-grid-backend: vcr` response headers identify the route and simulator.
+Stop the port-forward with Ctrl+C.
+
+## What you just verified
+
+This run exercises the Grid gateway's `grid_site_route` path with serving
+configuration rendered by the operator. The script checks hub and site
+membership, configured peer trust, and a request routed from the hub gateway to
+the site provider gateway and its VCR simulator. It does not exercise Praxis
+AI's separate `intelligent_route` overlay path; see the [routing
+guide](../routing.md) for that integration. The response headers above are
+evidence from this example's gateway and simulator, not headers guaranteed by
+every Grid deployment.
+
+This procedure demonstrates the configured route and response path. It does
+not measure model capacity or inference performance, and signal polling is
+enabled by this quickstart configuration.
 
 ## Clean up
 

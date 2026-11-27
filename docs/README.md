@@ -5,6 +5,16 @@ for a first deployment: get a grid running, install it on your clusters,
 operate and route traffic, understand the design, then look up reference
 material. Contributor material is last.
 
+## Understand the Network
+
+A `GridNetwork` describes participating `GridSite` resources and the provider
+state they exchange. The operator turns accepted state into local gateway
+configuration; it does not create site-to-site network paths or proxy
+inference traffic. Gateways use configured connectivity to reach an eligible
+provider. Grid's `grid_site_route` gateway path and Praxis AI's
+`intelligent_route` overlay path are separate integrations; follow the guide
+for the path you deploy.
+
 ## Getting Started
 
 - [Getting Started](getting-started/README.md): where to begin.
@@ -92,41 +102,9 @@ material. Contributor material is last.
   commands for a hub and one site.
 - [Single Gateway Examples](../examples/helm/praxis-gateway/README.md):
   values for one `praxis-gateway` release, one file per `praxisConfig.source`.
-- [Provider Traffic Selection](../tests/e2e/topologies/grid-provider-traffic/README.md):
-  runnable three-cluster topology for AGN selection groups and request-time
-  round-robin provider choice.
 - [Praxis demos](https://github.com/praxis-proxy/demos): deployable
   examples with automated runtime proofs of routing, failover, security
   boundaries, and provider lifecycle.
-
-## Integration Qualifications
-
-- [Provider Traffic Qualification](../tests/e2e/topologies/grid-provider-traffic/README.md):
-  proves multi-cluster discovery, accepted-overlay delivery, request-time
-  round-robin selection, provider attribution, and stable routing.
-- [Operator-derived Local Routing Qualification](../tests/e2e/topologies/grid-operator-routing/README.md):
-  proves operator-derived local dials reach the embedded Gateway, attributed
-  requests follow those dials, passive health demotes and recovers a failed
-  backend, and endpoint replacement eventually routes to the replacement backend.
-- [Static Weighted Provider Qualification](../tests/e2e/topologies/grid-static-weighted/README.md):
-  proves configured capacity propagation, weighted overlay convergence,
-  proportional request selection, hot reload, and equal-weight recovery. This
-  is the release qualification for `weightedRandom`, static placement, provider
-  capacity, weighted-overlay, or cross-site capacity propagation changes.
-- [Combined-site Lifecycle Qualification](../tests/e2e/topologies/grid-combined-site/README.md):
-  is the release qualification for combined-site routing, provider
-  add/remove/re-add, session fallback, rollout, trust, or lifecycle changes.
-- [Distributed Token Quota Qualification](../tests/e2e/topologies/grid-token-rate-limit/README.md):
-  proves shared identity-scoped quota enforcement across gateway replicas,
-  regional provider selection, expiry, restart persistence, fail-closed state
-  storage, and storage-network isolation.
-- [Single-cluster Multi-gateway Qualification](../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md):
-  proves shared overlay delivery and independent consumer/provider gateway
-  behavior within one Kind cluster and one GridSite.
-
-These integration tests create their environments through Forge and execute
-through first-class Rust `xtask` commands. Their topology READMEs document
-image preparation, execution, evidence, and cleanup.
 
 ## Developing
 
@@ -138,9 +116,19 @@ image preparation, execution, evidence, and cleanup.
   enums, newtypes, and representable states.
 - [Forge Tooling](developing/forge.md): the pinned Forge that creates test
   clusters.
-- [CI Kind E2E](developing/ci-kind-e2e.md): validation tiers, gate sequence,
-  sequencing requirements, and environment dependencies.
+- [CI Kind E2E](developing/ci-kind-e2e.md): validation tiers, the public
+  multi-cluster qualification set, gate sequence, and environment dependencies.
 - [Release Process](developing/release.md): versioning, validation, artifact
   publication, and release workflow.
-- [Unicode Audit](developing/unicode-audit.md): tracked text inventory and
-  intentional Unicode exceptions.
+
+### Qualification Topologies
+
+These public guides document the topology, runner command, evidence, and cleanup
+for each integration qualification:
+
+- [Provider traffic across sites](../tests/e2e/topologies/grid-provider-traffic/README.md)
+- [Operator-derived local routing](../tests/e2e/topologies/grid-operator-routing/README.md)
+- [Static weighted provider selection](../tests/e2e/topologies/grid-static-weighted/README.md)
+- [Combined-site lifecycle](../tests/e2e/topologies/grid-combined-site/README.md)
+- [Distributed token quota](../tests/e2e/topologies/grid-token-rate-limit/README.md)
+- [Single-cluster multi-gateway](../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md)

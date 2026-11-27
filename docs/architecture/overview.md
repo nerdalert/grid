@@ -292,17 +292,17 @@ AGN uses `foca`, a Rust SWIM implementation, for membership gossip. `foca`
 used the Go memberlist model as a reference architecture, but AGN does not use
 memberlist itself.
 
-SWIM answers:
+SWIM tracks which Grid Operators are alive. Operators probe peers and share
+membership changes through gossip. Conflict-free replicated data types (CRDTs)
+let operators merge the site and provider state they receive.
 
-```text
-Which peer AGN Operators are alive?
-```
-
-CRDT state answers:
-
-```text
-What provider and site state has each peer advertised?
-```
+For example, Site A advertises provider revision 2 after publishing revision 1.
+Site B may receive revision 2 before a delayed copy of revision 1. The merge
+keeps revision 2, so the delayed message cannot restore the older provider
+record. As operators receive and merge the same updates, their replicated
+state converges without a central coordinator. Each operator still applies
+its own routing eligibility checks before publishing configuration to its
+gateways.
 
 Neither SWIM nor CRDT is an authorization engine.  Discovery alone does not make
 a site routable.  A provider still has to pass lifecycle, trust, freshness,
